@@ -111,6 +111,7 @@ jobs:
         with:
           tag_name: release
           release_name: Beta Release
+          body: These are automatically updated builds of the latest commit.
           draft: false
           prerelease: false
 
@@ -123,5 +124,5 @@ jobs:
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ github.workspace }}/Application/Dopamine.ipa
-          asset_name: Dopamine.ipa
+          asset_name: Opamine.ipa
           asset_content_type: application/octet-stream
