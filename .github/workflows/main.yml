@@ -1,9 +1,23 @@
 name: "*** build tipa file ***"
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
+  push:
+    branches:
+      - 'roothide'
+    paths-ignore:
+      - ".gitignore"
+  pull_request:
+    branches:
+      - 'roothide'
+    paths-ignore:
+      - ".gitignore"
   workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 1 *'
+    - cron: '0 0 1 4 *'
+    - cron: '0 0 30 6 *'
+    - cron: '0 0 28 9 *'
+    - cron: '0 0 27 12 *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
