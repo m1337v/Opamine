@@ -95,9 +95,9 @@ jobs:
           path: |
             ${{ github.workspace }}/Application/roothide-Dopamine2.tipa
 
-      - name: Create Release
+      - name: Create or Update Release
         id: create_release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -106,8 +106,8 @@ jobs:
           body: These are automatically updated builds of the latest commit.
           draft: false
           prerelease: false
+          overwrite: true  # This will overwrite the existing release
 
-      # New step to upload the artifact to the release
       - name: Upload Release Asset
         id: upload-release-asset
         uses: actions/upload-release-asset@v1
