@@ -87,15 +87,7 @@ jobs:
           mv ./Application/Dopamine.tipa  "./Application/roothide-Dopamine2.tipa"
           echo "tag=${TAG}" >> $GITHUB_ENV
 
-      - name: Upload Artifact
-        id: dopamine-latest-upload
-        uses: actions/upload-artifact@v3
-        with:
-          name: roothide-Dopamine2.tipa
-          path: |
-            ${{ github.workspace }}/Application/roothide-Dopamine2.tipa
-
-      - name: Create or Update Release
+      - name: Create or Update Release and Upload Asset
         id: create_release
         uses: softprops/action-gh-release@v1
         env:
@@ -106,15 +98,5 @@ jobs:
           body: These are automatically updated builds of the latest commit.
           draft: false
           prerelease: false
-          overwrite: true  # This will overwrite the existing release
-
-      - name: Upload Release Asset
-        id: upload-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/Application/roothide-Dopamine2.tipa
-          asset_name: roothide-Dopamine2.tipa
-          asset_content_type: application/octet-stream
+          overwrite: true
+          files: ${{ github.workspace }}/Application/roothide-Dopamine2.tipa
