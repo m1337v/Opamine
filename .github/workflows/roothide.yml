@@ -1,6 +1,16 @@
 name: "*** build tipa file ***"
 
 on:
+  push:
+    branches:
+      - 'roothide'
+    paths-ignore:
+      - ".gitignore"
+  pull_request:
+    branches:
+      - '*'
+    paths-ignore:
+      - ".gitignore"
   schedule:
     - cron: '0 */2 * * *' # every 2 hours
   workflow_dispatch:
