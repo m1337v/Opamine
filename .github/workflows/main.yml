@@ -87,42 +87,20 @@ jobs:
           export THEOS="${BASEDIR}/theos"
           gmake -j$(sysctl -n hw.physicalcpu) NIGHTLY=1
 
-      - name: Upload Artifact
-        id: dopamine-latest-upload
-        uses: actions/upload-artifact@v3
-        with:
-          name: Dopamine
-          path: |
-            ${{ github.workspace }}/Application/Dopamine.ipa
-      
-      - name: Delete old release
-        uses: dev-drprasad/delete-tag-and-release@v0.2.1
-        with:
-          delete_release: true
-          tag_name: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
-      - name: Create Release
+      - name: Rename File for Release
+        run: |
+          mv ${{ github.workspace }}/Application/Dopamine.ipa ${{ github.workspace }}/Application/Opamine.ipa
+
+      - name: Create or Update Release and Upload Asset
         id: create_release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: release
+          tag_name: roothide
           release_name: Opamine Beta Release
           body: These are automatically updated builds of the latest commit.
           draft: false
           prerelease: false
-
-      # New step to upload the artifact to the release
-      - name: Upload Release Asset
-        id: upload-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/Application/Dopamine.ipa
-          asset_name: Opamine.ipa
-          asset_content_type: application/octet-stream
+          overwrite: true
+          files: ${{ github.workspace }}/Application/Opamine.ipa
