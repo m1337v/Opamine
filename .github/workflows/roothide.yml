@@ -26,7 +26,7 @@ jobs:
       - name: Checkout
         run: |
           set -x
-          git clone -b roothide --recursive https://github.com/m1337v/Opamine ${{ github.workspace }}
+          git clone -b palehide --recursive https://github.com/m1337v/Opamine ${{ github.workspace }}
           
       - name: Install Procursus
         uses: dhinakg/procursus-action@main
@@ -80,7 +80,7 @@ jobs:
           plutil -insert items.$DOCreditsCellIndex.names -xml "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" -append ./Application/Dopamine/UI/Settings/Credits.plist
           gmake -j$(sysctl -n hw.physicalcpu)
           TAG=$(git describe --tags --abbrev=0)
-          mv ./Application/Dopamine.tipa  "./Application/Dopamine2-roothide.tipa"
+          mv ./Application/Dopamine.tipa  "./Application/Dopamine2-palehide.tipa"
           echo "tag=${TAG}" >> $GITHUB_ENV
 
       - name: Create or Update Release and Upload Asset
@@ -89,10 +89,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: roothide
-          release_name: Roothide2 Beta Release
+          tag_name: palehide
+          release_name: Palehide Beta Release
           body: These are automatically updated builds of the latest commit.
           draft: false
           prerelease: false
           overwrite: true
-          files: ${{ github.workspace }}/Application/Dopamine2-roothide.tipa
+          files: ${{ github.workspace }}/Application/Dopamine2-palehide.tipa
