@@ -3,7 +3,7 @@ name: "*** build tipa file ***"
 on:
   push:
     branches:
-      - 'roothide'
+      - 'palehide'
     paths-ignore:
       - ".gitignore"
   pull_request:
