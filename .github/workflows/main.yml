@@ -97,7 +97,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: roothide
+          tag_name: opamine
           release_name: Opamine Beta Release
           body: These are automatically updated builds of the latest commit.
           draft: false
