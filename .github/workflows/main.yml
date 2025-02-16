@@ -25,17 +25,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-13
     steps:
       - name: Checkout
         uses: actions/checkout@v3
         with:
             submodules: recursive
-      - name: Use Xcode 16.2
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
-        
-      - name: Verify Xcode Version
-        run: xcodebuild -version
 
       - name: Install Procursus
         uses: dhinakg/procursus-action@main
@@ -62,8 +57,6 @@ jobs:
           set -x
           git clone https://github.com/CRKatri/trustcache
           cd trustcache
-          export CFLAGS="$CFLAGS -I$(brew --prefix openssl@1.1)/include -arch arm64"
-          export LDFLAGS="$LDFLAGS -L$(brew --prefix openssl@1.1)/lib -arch arm64"
           gmake -j$(sysctl -n hw.physicalcpu) OPENSSL=1
           sudo cp trustcache /opt/procursus/bin/
 
@@ -87,11 +80,6 @@ jobs:
             cd Application/Dopamine/Resources
             ./download_bootstraps.sh
             
-      - name: Patch idownloadd Makefile to use Theos iOS16.5 SDK
-        run: |
-          set -x
-          sed -i '' 's/-destination generic\/platform=iOS/-sdk $(THEOS)\/sdks\/iPhoneOS16.5.sdk -destination generic\/platform=iOS/g' BaseBin/idownloadd/Makefile
-
       - name: Build
         run: |
           set -x
