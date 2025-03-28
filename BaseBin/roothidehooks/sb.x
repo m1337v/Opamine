@@ -101,7 +101,7 @@ static const void *kDenyQueryTagKey = &kDenyQueryTagKey;
 
 	if(tag && tag.boolValue) {
 
-		if([bundleIdentifier isEqualToString:@"com.icraze.gtatracker"]) {
+		if([SENSITIVE_APP_LIST containsObject:bundleIdentifier]) {
 			NSLog(@"FBSApplicationLibrary deny query %@", bundleIdentifier);
 			return nil;
 		}
