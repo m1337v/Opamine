@@ -17,3 +17,12 @@ BOOL isBlacklistedApp(NSString* identifier);
 #define	CS_OPS_STATUS		0	/* return status */
 #define CS_PLATFORM_BINARY          0x04000000  /* this is a platform binary */
 int csops(pid_t pid, unsigned int  ops, void * useraddr, size_t usersize);
+
+//These apps may be signed with a (fake) certificate
+#define SENSITIVE_APP_LIST   @[ \
+    @"com.icraze.gtatracker", \
+    @"com.Alfie.TrollInstallerX", \
+    @"com.opa334.Dopamine", \
+    @"com.opa334.Dopamine.roothide", \
+    @"com.opa334.Dopamine-roothide", \
+]
