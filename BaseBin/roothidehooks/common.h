@@ -45,7 +45,6 @@ int csops(pid_t pid, unsigned int  ops, void * useraddr, size_t usersize);
     @"com.roothide.patcher", \
     @"com.roothide.manager", \
     @"com.opa334.CraneApplication", \
-    @"com.opa334.CraneApplication", \
     @"com.ichitaso.powerselectorapp", \
     @"com.sgwc.Ghost", \
     @"com.sgwc.Orbit", \
