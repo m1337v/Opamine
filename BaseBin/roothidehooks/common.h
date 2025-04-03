@@ -25,6 +25,7 @@ int csops(pid_t pid, unsigned int  ops, void * useraddr, size_t usersize);
     @"com.opa334.Dopamine", \
     @"com.opa334.Dopamine.roothide", \
     @"com.opa334.Dopamine-roothide", \
+    @"com.opa334.TrollStore", \
     @"com.netskao.dumpdecrypter", \
     @"com.fiore.trolldecrypt", \
     @"wiki.qaq.TrollFools", \
@@ -42,6 +43,7 @@ int csops(pid_t pid, unsigned int  ops, void * useraddr, size_t usersize);
     @"com.m1337.store", \
     @"dev.mineek.muffinstore", \
     @"org.coolstar.SileoStore", \
+    @"xyz.willy.Zebra", \
     @"com.roothide.patcher", \
     @"com.roothide.manager", \
     @"com.opa334.CraneApplication", \
@@ -49,4 +51,6 @@ int csops(pid_t pid, unsigned int  ops, void * useraddr, size_t usersize);
     @"com.sgwc.Ghost", \
     @"com.sgwc.Orbit", \
     @"com.sgwc.Capture", \
+    @"com.cokepokes.AppStorePlus", \
+    @"com.kahsooa.piqwkk.dummy", \
 ]
