@@ -1314,6 +1314,12 @@ int getCFMajorVersion(void)
     
     [[NSString stringWithFormat:@"%d",DOPAMINE_INSTALL_VERSION] writeToFile:JBROOT_PATH(@"/.installed_dopamine") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     
+    if(jbinfo(palera1n) == 'hide') {
+        [@"" writeToFile:JBROOT_PATH(@"/.installed_palera1n") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } else {
+        [[NSFileManager defaultManager] removeItemAtPath:JBROOT_PATH(@"/.installed_palera1n") error:nil];
+    }
+
     return nil;
 }
 

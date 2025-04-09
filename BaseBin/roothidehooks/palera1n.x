@@ -1,9 +1,12 @@
 #import <Foundation/Foundation.h>
+#include <sys/sysctl.h>
+#include <xpc/xpc.h>
 #import <substrate.h>
 #include <roothide.h>
+#include "common.h"
 
 #ifndef DEBUG
-#define NSLog(args...)	
+// #define NSLog(args...)	
 #endif
 
 #define kMobileKeyBagError (-1)
@@ -14,13 +17,15 @@
 
 %group coreauthd
 
+bool __thread gFakePass = true;
+
 %hookf(int, MKBGetDeviceLockState, CFDictionaryRef options)
 {
 	int ret = %orig;
 
 	NSLog(@"MKBGetDeviceLockState: %@ -> %d", options, ret);
 
-	if(ret == kMobileKeyBagDisabled) {
+	if(gFakePass && ret == kMobileKeyBagDisabled) {
         ret = kMobileKeyBagDeviceIsUnlocked;
 	}
 
@@ -33,7 +38,7 @@
 
 	NSMutableDictionary* newret = ((__bridge NSDictionary*)ret).mutableCopy;
 
-	if([newret[@"ls"] longValue] == kMobileKeyBagDisabled)
+	if(gFakePass && [newret[@"ls"] longValue] == kMobileKeyBagDisabled)
 	{
         newret[@"ls"] = @(kMobileKeyBagDeviceIsUnlocked);
 	}
@@ -43,6 +48,23 @@
 	CFRelease(ret);
 	return CFRetain((__bridge CFDictionaryRef)newret);
 }
+
+%hook Context
+- (void*)evaluatePolicy:(long)policy options:(id)options uiDelegate:(id)delegate originator:(id)originator request:(id)request reply:(void(^)(NSDictionary*,NSError*))reply {
+	NSLog(@"evaluatePolicy: %ld options: %@ uiDelegate: %@ originator: %@ request: %@ reply: %@", policy, options, delegate, originator, request, reply);
+
+	NSNumber* _pid = [originator valueForKey:@"_processId"];
+	pid_t pid = _pid.intValue;
+
+	uint32_t csFlags = 0;
+	csops(pid, CS_OPS_STATUS, &csFlags, sizeof(csFlags));
+
+	gFakePass = (csFlags & CS_PLATFORM_BINARY)==0;
+	void* ret = %orig;
+	gFakePass = true;
+	return ret;
+}
+%end
 
 %end
 
@@ -83,9 +105,33 @@
 
 %end
 
-void palera1nInit(NSString* processName)
+
+%group keybagd
+
+%hook KBXPCService
+- (void)changeSystemSecretfromOldSecret:(id)a3 oldSize:(uint64_t)a4 toNewSecret:(id)a5 newSize:(uint64_t)a6 opaqueData:(id)a7 reply:(id)a8
 {
-    NSLog(@"palera1nInit %@", processName);
+	NSLog(@"KBXPCService:changeSystemSecretfromOldSecret %@ %llu toNewSecret %@ %llu opaqueData %@ reply %@", a3, a4, a5, a6, a7, a8);
+	return;
+}
+%end
+
+%end
+
+
+__attribute__((visibility("default"))) void palera1n()
+{
+	NSString* getProcessName();
+	NSString *processName = getProcessName();
+    NSLog(@"palera1n init %@", processName);
+
+    cpu_subtype_t cpuFamily = 0;
+    size_t cpuFamilySize = sizeof(cpuFamily);
+    sysctlbyname("hw.cpufamily", &cpuFamily, &cpuFamilySize, NULL, 0);
+    if(cpuFamily != CPUFAMILY_ARM_MONSOON_MISTRAL) { //A11 only
+        return;
+    }
+
     if ([processName isEqualToString:@"coreauthd"]) {
 	    MSImageRef MobileKeyBagImage = MSGetImageByName("/System/Library/PrivateFrameworks/MobileKeyBag.framework/MobileKeyBag");
         %init(coreauthd, MKBGetDeviceLockState = MSFindSymbol(MobileKeyBagImage, "_MKBGetDeviceLockState"), MKBGetDeviceLockStateInfo = MSFindSymbol(MobileKeyBagImage, "_MKBGetDeviceLockStateInfo"));
@@ -97,4 +143,7 @@ void palera1nInit(NSString* processName)
 	    MSImageRef SecurityFramework = MSGetImageByName("/System/Library/Frameworks/Security.framework/Security");
         %init(ctkd, SecAccessControlGetProtection = MSFindSymbol(SecurityFramework, "_SecAccessControlGetProtection"));
 	}
+    else if ([processName isEqualToString:@"keybagd"]) {
+        %init(keybagd);
+    }
 }

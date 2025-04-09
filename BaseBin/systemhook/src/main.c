@@ -642,15 +642,26 @@ __attribute__((constructor)) static void initializer(void)
 		// Load rootlesshooks and watchdoghook if neccessary
 		if (!strcmp(gExecutablePath, "/usr/sbin/cfprefsd") ||
 			!strcmp(gExecutablePath, "/System/Library/CoreServices/SpringBoard.app/SpringBoard") ||
-			!strcmp(gExecutablePath, "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreauthd") ||
-			!strcmp(gExecutablePath, "/System/Library/Frameworks/CryptoTokenKit.framework/ctkd") ||
-			!strcmp(gExecutablePath, "/usr/libexec/securityd") ||
 			!strcmp(gExecutablePath, "/usr/libexec/lsd")) {
 			dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
 		}
 		else if (!strcmp(gExecutablePath, "/usr/libexec/watchdogd")) {
 			dlopen(JBROOT_PATH("/basebin/watchdoghook.dylib"), RTLD_NOW);
 		}
+		
+#ifndef __arm64e__
+		if(strcmp(gExecutablePath, "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreauthd")==0
+		|| strcmp(gExecutablePath, "/System/Library/Frameworks/CryptoTokenKit.framework/ctkd")==0
+		|| strcmp(gExecutablePath, "/usr/libexec/securityd")==0
+		|| strcmp(gExecutablePath, "/usr/libexec/keybagd")==0) {
+			if(jbclient_jbsettings_get_bool("palera1n"))
+			{
+				void* roothidehooks = dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
+				void (*palera1n)() = dlsym(roothidehooks, "palera1n");
+				palera1n();
+			}
+		}
+#endif
 
 		// ptrace hook to allow attaching a debugger to processes that systemhook did not inject into
 		// e.g. allows attaching debugserver to an app where tweak injection has been disabled via choicy
