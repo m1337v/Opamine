@@ -1,5 +1,7 @@
 export NIGHTLY ?= 0
 
+export VERSION = 17
+
 ifeq ($(NIGHTLY), 1)
 export COMMIT_HASH = $(shell git rev-parse HEAD)
 endif

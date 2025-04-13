@@ -29,6 +29,7 @@ struct system_info {
 
 	struct {
 		uint64_t usesPACBypass;
+		uint32_t palera1n;
 		uint64_t jbrand;
 		char *rootPath;
 	} jailbreakInfo;
@@ -290,6 +291,7 @@ extern struct system_info gSystemInfo;
 
 #define JAILBREAK_INFO_ITERATE(ctx, iterator) \
 	iterator(ctx, jailbreakInfo.usesPACBypass); \
+	iterator(ctx, jailbreakInfo.palera1n); \
 	iterator(ctx, jailbreakInfo.jbrand); \
 	iterator(ctx, jailbreakInfo.rootPath);
 

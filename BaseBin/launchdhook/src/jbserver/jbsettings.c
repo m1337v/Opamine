@@ -19,6 +19,11 @@ int jbsettings_get(const char *key, xpc_object_t *valueOut)
 		*valueOut = xpc_bool_create(state);
 		return 0;
 	}
+	else if(strcmp(key, "palera1n")==0) {
+		bool palera1n = jbinfo(palera1n) == 'hide';
+		*valueOut = xpc_bool_create(palera1n);
+		return 0;
+	}
 	return -1;
 }
 

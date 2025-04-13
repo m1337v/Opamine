@@ -402,14 +402,29 @@ int __execve_hook(const char *path, char *const argv[], char *const envp[])
 #include <libproc_private.h>
 #include <sys/sysctl.h>
 
-//some process may be killed by sandbox if call systme getppid()
 pid_t __getppid()
 {
-    struct proc_bsdinfo procInfo;
-	if (proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &procInfo, sizeof(procInfo)) <= 0) {
-		return -1;
+	int32_t opt[4] = {
+		CTL_KERN,
+		KERN_PROC,
+		KERN_PROC_PID,
+		getpid(),
+	};
+	struct kinfo_proc info={0};
+	size_t len = sizeof(struct kinfo_proc);
+	if(sysctl(opt, 4, &info, &len, NULL, 0) == 0) {
+		if((info.kp_proc.p_flag & P_TRACED) != 0) {
+			return info.kp_proc.p_oppid;
+		}
 	}
-    return procInfo.pbi_ppid;
+
+    struct proc_bsdinfo procInfo;
+	//some process may be killed by sandbox if call systme getppid() so try this first
+	if (proc_pidinfo(getpid(), PROC_PIDTBSDINFO, 0, &procInfo, sizeof(procInfo)) == sizeof(procInfo)) {
+		return procInfo.pbi_ppid;
+	}
+
+	return getppid();
 }
 
 static uid_t _CFGetSVUID(bool *successful) {
@@ -503,9 +518,12 @@ We just keep this bug:
         homedir = "/var/empty";
     }
 
-    char newhome[PATH_MAX]={0};
-    snprintf(newhome,sizeof(newhome),"%s/%s",rootdir,homedir);
-    setenv("CFFIXED_USER_HOME", newhome, 1);
+	if(homedir[0] == '/') {
+		char newhome[PATH_MAX*2]={0};
+		strlcpy(newhome, rootdir, sizeof(newhome));
+		strlcat(newhome, homedir, sizeof(newhome));
+		setenv("CFFIXED_USER_HOME", newhome, 1);
+	}
 }
 
 void redirect_paths(const char* rootdir)
@@ -517,16 +535,16 @@ void redirect_paths(const char* rootdir)
         if(_NSGetExecutablePath(executablePath, &bufsize) != 0)
             break;
         
-        char realexepath[PATH_MAX];
+        char realexepath[PATH_MAX]={0};
         if(!realpath(executablePath, realexepath))
             break;
             
-        char realjbroot[PATH_MAX];
+        char realjbroot[PATH_MAX+1]={0};
         if(!realpath(rootdir, realjbroot))
             break;
         
-        if(realjbroot[strlen(realjbroot)] != '/')
-            strcat(realjbroot, "/");
+        if(realjbroot[0] && realjbroot[strlen(realjbroot)-1] != '/')
+            strlcat(realjbroot, "/", sizeof(realjbroot));
         
         if(strncmp(realexepath, realjbroot, strlen(realjbroot)) != 0)
             break;
@@ -566,7 +584,7 @@ __attribute__((constructor)) static void initializer(void)
 //////////////////////////////////////////////
 	struct dl_info di={0};
 	dladdr((void*)initializer, &di);
-	strncpy(HOOK_DYLIB_PATH, di.dli_fname, sizeof(HOOK_DYLIB_PATH));
+	strlcpy(HOOK_DYLIB_PATH, di.dli_fname, sizeof(HOOK_DYLIB_PATH));
 /////////////////////////////////////////////////////////////////////////
 
 	// Tell jbserver (in launchd) that this process exists
@@ -642,15 +660,26 @@ __attribute__((constructor)) static void initializer(void)
 		// Load rootlesshooks and watchdoghook if neccessary
 		if (!strcmp(gExecutablePath, "/usr/sbin/cfprefsd") ||
 			!strcmp(gExecutablePath, "/System/Library/CoreServices/SpringBoard.app/SpringBoard") ||
-			!strcmp(gExecutablePath, "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreauthd") ||
-			!strcmp(gExecutablePath, "/System/Library/Frameworks/CryptoTokenKit.framework/ctkd") ||
-			!strcmp(gExecutablePath, "/usr/libexec/securityd") ||
 			!strcmp(gExecutablePath, "/usr/libexec/lsd")) {
 			dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
 		}
 		else if (!strcmp(gExecutablePath, "/usr/libexec/watchdogd")) {
 			dlopen(JBROOT_PATH("/basebin/watchdoghook.dylib"), RTLD_NOW);
 		}
+		
+#ifndef __arm64e__
+		if(strcmp(gExecutablePath, "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreauthd")==0
+		|| strcmp(gExecutablePath, "/System/Library/Frameworks/CryptoTokenKit.framework/ctkd")==0
+		|| strcmp(gExecutablePath, "/usr/libexec/securityd")==0
+		|| strcmp(gExecutablePath, "/usr/libexec/keybagd")==0) {
+			if(jbclient_jbsettings_get_bool("palera1n"))
+			{
+				void* roothidehooks = dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
+				void (*palera1n)() = dlsym(roothidehooks, "palera1n");
+				palera1n();
+			}
+		}
+#endif
 
 		// ptrace hook to allow attaching a debugger to processes that systemhook did not inject into
 		// e.g. allows attaching debugserver to an app where tweak injection has been disabled via choicy
