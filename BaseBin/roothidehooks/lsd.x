@@ -13,6 +13,14 @@ extern char **environ;
   proc_pidpath_audittoken(tokenarg, buffer, size) //_LSCopyExecutableURLForAuditToken 
   */
 
+
+@interface LSApplicationWorkspace : NSObject
++ (LSApplicationWorkspace*)defaultWorkspace;
+- (NSArray*)applicationsAvailableForHandlingURLScheme:(NSString*)scheme;
+- (NSArray*)applicationsAvailableForOpeningURL:(NSURL*)url legacySPI:(BOOL)legacySPI;
+- (NSArray*)applicationsAvailableForOpeningURL:(NSURL*)url;
+@end
+
 BOOL isJailbreakURLScheme(NSString* scheme)
 {
 	NSArray* apps = [[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] applicationsAvailableForHandlingURLScheme:scheme];
@@ -27,13 +35,6 @@ BOOL isJailbreakURLScheme(NSString* scheme)
 	}
 	return NO;
 }
-
-@interface LSApplicationWorkspace : NSObject
-+ (LSApplicationWorkspace*)defaultWorkspace;
-- (NSArray*)applicationsAvailableForHandlingURLScheme:(NSString*)scheme;
-- (NSArray*)applicationsAvailableForOpeningURL:(NSURL*)url legacySPI:(BOOL)legacySPI;
-- (NSArray*)applicationsAvailableForOpeningURL:(NSURL*)url;
-@end
 
 static const void *kBlockSchemeTagKey = &kBlockSchemeTagKey;
 
