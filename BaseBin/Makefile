@@ -83,7 +83,6 @@ jailbreakd: .build .include libjailbreak
 	mkdir -p .build
 	cp -r _external/basebin/* .build
 	cp _external/basebin/.version .build
-	echo "$(shell git -C .. describe --tags --abbrev=0 | grep -E '^[0-9]+$$' || echo 0)" > .build/.version
 
 .include:
 	rm -rf .include
