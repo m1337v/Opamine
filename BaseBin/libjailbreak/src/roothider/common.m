@@ -59,7 +59,7 @@ pid_t proc_get_ppid(pid_t pid)
 }
 
 // #define PROC_PIDPATHINFO_MAXSIZE        (4*MAXPATHLEN)
-char* proc_get_path(pid_t pid, char* buffer)
+char* proc_get_path(pid_t pid, char* buffer[PATH_MAX])
 {
     static char __thread threadbuffer[PATH_MAX];
     if(!buffer) buffer = threadbuffer;
@@ -88,6 +88,37 @@ int proc_get_pidversion(pid_t pid)
         return 0;
 	}
 	return uniqidinfo.p_idversion;
+}
+
+char* proc_get_identifier(pid_t pid, char buffer[255])
+{
+    static char __thread threadbuffer[255];
+    if(!buffer) buffer = threadbuffer;
+    
+    struct csheader {
+        uint32_t magic;
+        uint32_t length;
+    } header = {0};
+    
+    int result = csops(pid, CS_OPS_IDENTITY, &header, sizeof(header));
+    if (result != 0 && errno != ERANGE) {
+        return NULL;
+    }
+    
+    char* csbuffer = malloc(header.length);
+    if (!csbuffer) {
+        return NULL;
+    }
+    
+    result = csops(pid, CS_OPS_IDENTITY, csbuffer, header.length);
+    if (result == 0) {
+        char* identity = csbuffer + sizeof(struct csheader);
+        strlcpy(buffer, identity, 255);
+    }
+    
+    free(csbuffer);
+
+    return buffer;
 }
 
 /* Status values. */
@@ -742,8 +773,11 @@ void check_usreboot_msg(xpc_object_t xmsg)
 	audit_token_t clientToken = {0};
 	xpc_dictionary_get_audit_token(xmsg, &clientToken);
 
-	if(audit_token_to_euid(clientToken) != 0) {
-		JBLogError("usereboot message not from root process?");
+	uint32_t csflags = 0;
+	csops(audit_token_to_pid(clientToken), CS_OPS_STATUS, &csflags, sizeof(csflags));
+
+	if((csflags & CS_PLATFORM_BINARY) == 0) {
+		JBLogError("usereboot message not from platform process?");
 		return;
 	}
 
@@ -772,20 +806,68 @@ void roothide_handler_jbserver_msg(xpc_object_t xmsg)
 {
     check_usreboot_msg(xmsg);
 
+    audit_token_t clientToken = { 0 };
+    xpc_dictionary_get_audit_token(xmsg, &clientToken);
+
 #ifdef ENABLE_LOGS
-
-	if (!xpc_dictionary_get_value(xmsg, "jb-domain")) return;
-	if (!xpc_dictionary_get_value(xmsg, "action")) return;
-
-	audit_token_t clientToken = { 0 };
-	xpc_dictionary_get_audit_token(xmsg, &clientToken);
-
-    const char* desc = NULL;
-    JBLogDebug("jbserver received xpc message from (%d) %s :\n%s", 
-        audit_token_to_pid(clientToken), 
-        proc_get_path(audit_token_to_pid(clientToken),NULL), 
-        (desc=xpc_copy_description(xmsg)));
-    if(desc) free((void*)desc);
-
+	if(xpc_dictionary_get_value(xmsg, "jb-domain") && xpc_dictionary_get_value(xmsg, "action")) {
+		const char* desc = NULL;
+		JBLogDebug("jbserver received xpc message from (%d) %s :\n%s", 
+			audit_token_to_pid(clientToken), 
+			proc_get_path(audit_token_to_pid(clientToken),NULL), 
+			(desc=xpc_copy_description(xmsg)));
+		if(desc) free((void*)desc);
+	}
 #endif
+    
+    if(isBlacklistedToken(&clientToken))
+    {
+        const char* desc = NULL;
+        JBLogDebug("launchd xpc message from blacklisted process(%d) %s :\n%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL), (desc=xpc_copy_description(xmsg)));
+        if(desc) free((void*)desc);
+
+        uint64_t routine = xpc_dictionary_get_uint64(xmsg, "routine");
+        uint64_t subsystem = xpc_dictionary_get_uint64(xmsg, "subsystem");
+        if(subsystem==2 && routine==708) {
+            const char* name = xpc_dictionary_get_string(xmsg, "name");
+            if(name) {
+                char* bundle = NULL;
+                if(string_has_prefix(name, "UIKitApplication:")) {
+                    bundle = name+sizeof("UIKitApplication:")-1;
+                    char* end = strchr(bundle, '[');
+                    if(end) {
+                        asprintf(&bundle, "%.*s", (int)(end - bundle), bundle);
+                    } else {
+                        bundle = strdup(bundle);
+                    }
+                } else {
+                    bundle = strdup(name);
+                }
+
+                char client_identifier[255]={0};
+                proc_get_identifier(audit_token_to_pid(clientToken), client_identifier);
+
+                if(!string_has_prefix(bundle, client_identifier) && !string_has_prefix(bundle, "com.apple."))
+                {
+                    JBLogDebug("hide job (%s) (%s) from blacklisted process(%d) %s", name, bundle, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
+                    xpc_dictionary_set_string(xmsg, "name", "");
+                }
+
+                free((void*)bundle);
+            }
+        }
+        else if(subsystem==6 && routine==301) {
+
+            int pid = xpc_dictionary_get_int64(xmsg, "pid");
+
+            char path[PATH_MAX]={0};
+            if(pid>0 && pid!=audit_token_to_pid(clientToken) && proc_get_path(pid, path)) 
+            {
+                if(hasTrollstoreMarker(path) || isSubPathOf(JBROOT_PATH("/"), path)) {
+                    JBLogDebug("hide pid %d (%s) from blacklisted process(%d) %s", pid, path, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
+                    xpc_dictionary_set_int64(xmsg, "pid", INT_MAX);
+                }
+            }
+        }
+    }
 }

@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: '0 */2 * * *' # every 2 hours
   workflow_dispatch:
+  pull_request:
+  push:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -69,7 +71,7 @@ jobs:
           for ((i=0; i<$itemcount; i++)); do if [ "$(plutil -extract items.$i.headerCellClass raw ./Application/Dopamine/UI/Settings/Credits.plist)" = "DOCreditsCell" ]; then DOCreditsCellIndex=$i; break; fi; done;
           plutil -insert items.$DOCreditsCellIndex.names -xml "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" -append ./Application/Dopamine/UI/Settings/Credits.plist
           gmake -j$(sysctl -n hw.physicalcpu)
-          VERSION=$(cat ./BaseBin/_external/basebin/.version).$(git rev-parse --short HEAD)
+          VERSION=$(cat ./BaseBin/_external/basebin/.version)-$(git rev-parse --short HEAD)
           mv ./Application/Dopamine.tipa  "./Application/roothide-Dopamine-${VERSION}.tipa"
           echo "version=${VERSION}" >> $GITHUB_ENV
 

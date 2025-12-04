@@ -24,7 +24,7 @@ int sandbox_check_by_audit_token_hook(audit_token_t au, const char *operation, i
 
 /************************** roothide specific *******************************/
 if(isBlacklistedToken(&au)) {
-	JBLogDebug("sandbox_check_by_audit_token operation=%s name=%s from %s", operation, name, proc_get_path(audit_token_to_pid(au),NULL));
+	JBLogDebug(strstr(operation, "mach-") ? "sandbox_check_by_audit_token operation=%s name=%s from %s" : "sandbox_check_by_audit_token operation=%s name=%p from %s", operation, name, proc_get_path(audit_token_to_pid(au),NULL));
 } else {
 /************************** roothide specific *******************************/
 		
