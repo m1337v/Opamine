@@ -400,12 +400,113 @@ char* generate_sandbox_extensions(audit_token_t *processToken, bool writable)
     return sandboxExtensionsOut;
 }
 
+struct sysctl_oid {
+	struct sysctl_oid_list *  oid_parent;
+	SLIST_ENTRY(sysctl_oid) oid_link;
+	int             oid_number;
+	int             oid_kind;
+	void            *oid_arg1;
+	int             oid_arg2;
+	const char      *oid_name;
+	int             (*oid_handler)();
+	const char      *oid_fmt;
+	const char      *oid_descr; /* offsetof() field / long description */
+	int             oid_version;
+	int             oid_refcnt;
+};
+
+void oid_remove(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    JBLogDebug("oid_remove: %p %p \n", oid_parent, oid);
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    while(true) {
+        uint64_t current = kread64(pnext);
+        if(!current) break;
+
+        struct sysctl_oid current_oid = {0};
+        kreadbuf(current, &current_oid, sizeof(current_oid));
+
+        char name[64]={0};
+        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        JBLogDebug("oid_remove: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
+        
+        if(current == (uint64_t)oid) {
+            uint64_t next = (uint64_t)current_oid.oid_link.sle_next;
+            JBLogDebug("oid_remove: found@%p remove %p next->%p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide, next-gSystemInfo.kernelConstant.slide);
+            kwrite64(pnext, next);
+            break;
+        }
+
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+}
+void oid_insert(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    JBLogDebug("oid_insert: %p %p \n", oid_parent, oid);
+
+    struct sysctl_oid insert_oid = {0};
+    kreadbuf((uint64_t)oid, &insert_oid, sizeof(insert_oid));
+
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    while(true) {
+        uint64_t current = kread64(pnext);
+        if(!current) {
+            JBLogDebug("oid_insert: insert at end %p\n", pnext-gSystemInfo.kernelConstant.slide);
+            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), 0);
+            kwrite64(pnext, (uint64_t)oid);
+            break;
+        }
+
+        struct sysctl_oid current_oid = {0};
+        kreadbuf(current, &current_oid, sizeof(current_oid));
+
+        char name[64]={0};
+        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        JBLogDebug("oid_insert: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
+        
+        if(insert_oid.oid_number < current_oid.oid_number) {
+            JBLogDebug("oid_insert: insert@%p before %p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide);
+            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), current);
+            kwrite64(pnext, (uint64_t)oid);
+            break;
+        }
+
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+}
+
 void hideDeveloperMode()
 {
-    uint64_t launch_env_logging = kread64(ksymbol(launch_env_logging));
-    uint64_t developer_mode_status = kread64(ksymbol(developer_mode_status));
-    kwrite64(ksymbol(launch_env_logging), developer_mode_status);
-    kwrite64(ksymbol(developer_mode_status), launch_env_logging);
+    uint64_t developer_mode_status_oidp = ksymbol(developer_mode_status)-offsetof(struct sysctl_oid,oid_name);
+    uint64_t launch_env_logging_oidp = ksymbol(launch_env_logging)-offsetof(struct sysctl_oid,oid_name);
+
+    struct sysctl_oid developer_mode_status={0};
+    kreadbuf(developer_mode_status_oidp, &developer_mode_status, sizeof(developer_mode_status));
+
+    struct sysctl_oid launch_env_logging={0};
+    kreadbuf(launch_env_logging_oidp, &launch_env_logging, sizeof(launch_env_logging));
+
+    //detach
+    oid_remove(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
+    oid_remove(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
+
+    //reorder
+    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)launch_env_logging.oid_number);
+    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)developer_mode_status.oid_number);
+
+    //exchange data
+    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)launch_env_logging.oid_name);
+    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)developer_mode_status.oid_name);
+
+    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)launch_env_logging.oid_descr);
+    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)developer_mode_status.oid_descr);
+
+    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)launch_env_logging.oid_kind);
+    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)developer_mode_status.oid_kind);
+
+    //attach
+    oid_insert(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
+    oid_insert(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
 }
 
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
