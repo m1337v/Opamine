@@ -37,6 +37,93 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 	return sysctlbyname_orig(name, oldp, oldlenp, newp, newlen);
 }
 
+xpc_object_t (*orig_xpc_dictionary_create_reply)(xpc_object_t original);
+xpc_object_t new_xpc_dictionary_create_reply(xpc_object_t original)
+{
+	xpc_object_t reply = orig_xpc_dictionary_create_reply(original);
+	if(reply && xpc_get_type(reply)==XPC_TYPE_DICTIONARY)
+	{
+		audit_token_t clientToken={0};
+		xpc_dictionary_get_audit_token(original, &clientToken);
+
+		if(isBlacklistedToken(&clientToken)) {
+			xpc_dictionary_set_value(reply, "roothide-blacklisted-process-request", original);
+		}
+	}
+
+	return reply;
+}
+
+int (*orig_xpc_pipe_routine_reply)(xpc_object_t reply);
+int new_xpc_pipe_routine_reply(xpc_object_t reply)
+{
+	if (xpc_get_type(reply) == XPC_TYPE_DICTIONARY)
+	{
+		xpc_object_t original = xpc_dictionary_get_value(reply, "roothide-blacklisted-process-request");
+		if (original)
+		{
+			xpc_dictionary_set_value(reply, "roothide-blacklisted-process-request", NULL);
+			
+			audit_token_t clientToken={0};
+			xpc_dictionary_get_audit_token(original, &clientToken);
+
+			const char* desc = NULL;
+			JBLogDebug("xpc reply to blacklisted app (%d) %s :\n%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL), (desc=xpc_copy_description(reply)));
+			if(desc) free((void*)desc);
+
+			uint64_t routine = xpc_dictionary_get_uint64(original, "routine");
+			uint64_t subsystem = xpc_dictionary_get_uint64(original, "subsystem");
+
+			/*if(subsystem==2 && routine==708) {
+				int error = xpc_dictionary_get_int64(reply, "error");
+				if(error == 1) {
+					const char* name = xpc_dictionary_get_string(original, "name");
+
+					xpc_dictionary_set_int64(reply, "error", 113);
+				}
+			}
+			else if(subsystem==6 && routine==301) {
+
+				int pid = xpc_dictionary_get_int64(original, "pid");
+				uint64_t outgsk = xpc_dictionary_get_uint64(original, "outgsk");
+				
+				xpc_object_t out = xpc_dictionary_get_value(reply, "out");
+				if(out && xpc_get_type(out)==XPC_TYPE_DICTIONARY) {
+
+					//fake WebContent Instance
+				}
+			}
+			else*/ if(subsystem==3 && routine==829) {
+				int error = xpc_dictionary_get_int64(reply, "error");
+				if(error == 0) {
+					const char* name = xpc_dictionary_get_string(reply, "name");
+					const char* bundle_identifier = xpc_dictionary_get_string(reply, "bundle_identifier");
+
+					const char* bundle = bundle_identifier ? bundle_identifier : name;
+
+					if(bundle) {
+						char client_identifier[255]={0};
+						proc_get_identifier(audit_token_to_pid(clientToken), client_identifier);
+						if(!string_has_prefix(bundle, client_identifier) && !string_has_prefix(bundle, "com.apple."))
+						{
+							JBLogDebug("hide coalition (%s) (%s) from blacklisted process(%d) %s", name, bundle_identifier, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
+					
+							xpc_dictionary_set_value(reply, "cid", NULL);
+							xpc_dictionary_set_value(reply, "name", NULL);
+							xpc_dictionary_set_value(reply, "bundle_identifier", NULL);
+							xpc_dictionary_set_value(reply, "resource-usage-blob", NULL);
+
+							xpc_dictionary_set_int64(reply, "error", 3);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return orig_xpc_pipe_routine_reply(reply);
+}
+
 void roothide_launchd_preinit()
 {
 	JBLogDebug("roothide_launchd_preinit");
@@ -114,6 +201,9 @@ void roothide_launchd_postinit(bool firstLoad)
 			return;
 		}
 	}
+
+	MSHookFunction(&xpc_dictionary_create_reply, (void*)new_xpc_dictionary_create_reply, &orig_xpc_dictionary_create_reply);
+	MSHookFunction(&xpc_pipe_routine_reply, (void*)new_xpc_pipe_routine_reply, &orig_xpc_pipe_routine_reply);
 
 	// load jailbreakd after applying hooks
 	assert(initJailbreakd(firstLoad) == 0);
@@ -244,11 +334,6 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 			return EPERM;
 		}
 	}
-
-	if(launchdhookFirstLoad) {
-		//we should not enable system-wide injection until the jailbreak is finalized (userspace reboot).
-		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
-	}
 	
 	if(string_has_suffix(path, "/basebin/jailbreakd")) {
 		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
@@ -330,6 +415,12 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		return ret;
 	}
 
+	if(launchdhookFirstLoad) 
+	{
+		//we should not enable system-wide injection until the jailbreak is finalized (userspace reboot).
+		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
+	}
+	
 	return __posix_spawn_hook(pidp, path, desc, argv, envp);
 }
 

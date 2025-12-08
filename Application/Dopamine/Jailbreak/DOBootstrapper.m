@@ -892,17 +892,17 @@ Suites: iphoneos-arm64e/%d\n\
 Components: main\n\
 "
 
-#define ALT_SOURCES "\
-Types: deb\n\
-URIs: https://iosjb.top/\n\
-Suites: ./\n\
-Components:\n\
-\n\
-Types: deb\n\
-URIs: https://iosjb.top/procursus\n\
-Suites: iphoneos-arm64e/%d\n\
-Components: main\n\
-"
+// #define ALT_SOURCES "\
+// Types: deb\n\
+// URIs: https://iosjb.top/\n\
+// Suites: ./\n\
+// Components:\n\
+// \n\
+// Types: deb\n\
+// URIs: https://iosjb.top/procursus\n\
+// Suites: iphoneos-arm64e/%d\n\
+// Components: main\n\
+// "
 
 #define ZEBRA_SOURCES "\
 # Zebra Sources List\n\
@@ -930,10 +930,10 @@ int getCFMajorVersion(void)
     
     ASSERT([[NSString stringWithFormat:@(DEFAULT_SOURCES), getCFMajorVersion()] writeToFile:jbrootPrefix(@"/etc/apt/sources.list.d/default.sources") atomically:YES encoding:NSUTF8StringEncoding error:nil]);
     
-    //Users in some regions seem to be unable to access github.io
-    if([NSLocale.currentLocale.countryCode isEqualToString:@"CN"]) {
-        ASSERT([[NSString stringWithFormat:@(ALT_SOURCES), getCFMajorVersion()] writeToFile:jbrootPrefix(@"/etc/apt/sources.list.d/sileo.sources") atomically:YES encoding:NSUTF8StringEncoding error:nil]);
-    }
+    // //Users in some regions seem to be unable to access github.io
+    // if([NSLocale.currentLocale.countryCode isEqualToString:@"CN"]) {
+    //     ASSERT([[NSString stringWithFormat:@(ALT_SOURCES), getCFMajorVersion()] writeToFile:jbrootPrefix(@"/etc/apt/sources.list.d/sileo.sources") atomically:YES encoding:NSUTF8StringEncoding error:nil]);
+    // }
     
     if(![fm fileExistsAtPath:jbrootPrefix(@"/var/mobile/Library/Application Support/xyz.willy.Zebra")])
     {

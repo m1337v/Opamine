@@ -19,7 +19,8 @@ int proc_patch_csflags(pid_t pid);
 pid_t proc_get_ppid(pid_t pid);
 int proc_get_pidversion(pid_t pid);
 int proc_paused(pid_t pid, bool* paused);
-char* proc_get_path(pid_t pid, char* buffer);
+char* proc_get_path(pid_t pid, char* buffer[PATH_MAX]);
+char* proc_get_identifier(pid_t pid, char buffer[255]);
 
 uint64_t show_dyld_regions(mach_port_t task, bool more);
 
