@@ -1,11 +1,19 @@
 name: "*** build tipa file ***"
 
 on:
+  push:
+    branches:
+      - 'roothide'
+    paths-ignore:
+      - ".gitignore"
+  pull_request:
+    branches:
+      - '*'
+    paths-ignore:
+      - ".gitignore"
   schedule:
     - cron: '0 */2 * * *' # every 2 hours
   workflow_dispatch:
-  pull_request:
-  push:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,7 +26,7 @@ jobs:
       - name: Checkout
         run: |
           set -x
-          git clone --recursive https://github.com/roothide/Dopamine2-roothide ${{ github.workspace }}
+          git clone -b roothide --recursive https://github.com/m1337v/Opamine ${{ github.workspace }}
           
       - name: Install Procursus
         uses: dhinakg/procursus-action@main
@@ -71,14 +79,20 @@ jobs:
           for ((i=0; i<$itemcount; i++)); do if [ "$(plutil -extract items.$i.headerCellClass raw ./Application/Dopamine/UI/Settings/Credits.plist)" = "DOCreditsCell" ]; then DOCreditsCellIndex=$i; break; fi; done;
           plutil -insert items.$DOCreditsCellIndex.names -xml "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" -append ./Application/Dopamine/UI/Settings/Credits.plist
           gmake -j$(sysctl -n hw.physicalcpu)
-          VERSION=$(cat ./BaseBin/_external/basebin/.version)-$(git rev-parse --short HEAD)
-          mv ./Application/Dopamine.tipa  "./Application/roothide-Dopamine-${VERSION}.tipa"
+          VERSION=$(cat ./BaseBin/_external/basebin/.version).$(git rev-parse --short HEAD)
+          mv ./Application/Dopamine.tipa  "./Application/Dopamine2-roothide.tipa"
           echo "version=${VERSION}" >> $GITHUB_ENV
 
-      - name: Upload Artifact
-        id: dopamine-latest-upload
-        uses: actions/upload-artifact@v4
+      - name: Create or Update Release and Upload Asset
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          name: roothide-Dopamine-${{ env.version }}.tipa
-          path: |
-            ${{ github.workspace }}/Application/roothide-Dopamine-${{ env.version }}.tipa
+          tag_name: roothide
+          release_name: Roothide2 Beta Release
+          body: These are automatically updated builds of the latest commit.
+          draft: false
+          prerelease: false
+          overwrite: true
+          files: ${{ github.workspace }}/Application/Dopamine2-roothide.tipa
