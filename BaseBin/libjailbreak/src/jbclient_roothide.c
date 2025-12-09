@@ -1,6 +1,4 @@
 #include <dlfcn.h>
-#include <sys/stat.h>
-#include <sys/mount.h>
 #include <mach-o/dyld.h>
 #include "jbclient_xpc.h"
 #include "jbserver.h"
@@ -147,72 +145,27 @@ bool jbclient_blacklist_check_bundle(const char* bundle)
 	return blacklisted;
 }
 
-
-static char *real_load_path(const char *restrict path, char *restrict resolved_path)
-{
-    char* ret = NULL;
-
-	if(!path) return NULL;
-
-	if(path[0] == '@') {
-		strlcpy(resolved_path, path, PATH_MAX);
-		return path;
-	}
-
-    int fd = open(path, O_RDONLY);
-    if(fd < 0) return NULL;
-    
-    if(fcntl(fd, F_GETPATH, resolved_path) == 0) {
-        ret = resolved_path;
-    }
-
-    close(fd);
-    return ret;
-}
-
-bool can_skip_trusting_file(const char *filePath, bool isLibrary, bool isClient)
-{
-	if (!filePath) return true;
-
-	// If it's a library that starts with an @, we don't know the actual location so we need to trust it
-	if (isLibrary && filePath[0] == '@') return false;
-
-	// If this file is in shared cache, we can skip trusting it
-	if (_dyld_shared_cache_contains_path(filePath)) return true;
-
-	// If the file doesn't exist, there is nothing to trust :D
-	if (access(filePath, F_OK) != 0) return true;
-
-	if (!isClient) {
-		// If the file is on rootfs mount point, it doesn't need to be trusted as it should be in static trust cache
-		// Same goes for our /usr/lib bind mount (which is guaranteed to be in dynamic trust cache)
-		// We can't do this in the client because of protobox bullshit where calling statfs crashes some processes
-		struct statfs fs;
-		int sfsret = statfs(filePath, &fs);
-		if (sfsret == 0) {
-			if (!strcmp(fs.f_mntonname, "/") /*|| !strcmp(fs.f_mntonname, "/usr/lib")*/) {
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
 int jbclient_trust_executable_recurse(const char *executablePath, xpc_object_t preferredArchsArray)
 {
 	if (!executablePath) return -1;
 
-	char absolutePath[PATH_MAX];
-	if (real_load_path(executablePath, absolutePath) == NULL) return -1; // posix_spawn/execve does support relative path
-
-	if (can_skip_trusting_file(absolutePath, false, true)) return -1;
+	if(access(executablePath, F_OK) != 0) {
+		return -2;
+	}
 
 	xpc_object_t xargs = xpc_dictionary_create_empty();
-	xpc_dictionary_set_string(xargs, "executable-path", absolutePath);
+	xpc_dictionary_set_string(xargs, "executable-path", executablePath);
+
+	char* cwd = getcwd(NULL, 0);
+	if(cwd) {
+		xpc_dictionary_set_string(xargs, "process-working-dir", cwd);
+		free((void*)cwd);
+	}
+
 	if (preferredArchsArray) {
 		xpc_dictionary_set_value(xargs, "preferred-archs", preferredArchsArray);
 	}
+
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_TRUST_EXECUTABLE_RECURSE, xargs);
 	xpc_release(xargs);
 	if (xreply) {
@@ -229,13 +182,15 @@ int jbclient_trust_library_recurse(const char *libraryPath, void *addressInCalle
 {
 	if (!libraryPath) return -1;
 
-	// If not a dynamic path (@rpath, @executable_path, @loader_path), resolve to absolute path
-	char absoluteLibraryPath[PATH_MAX];
-	if (real_load_path(libraryPath, absoluteLibraryPath) == NULL) return -1;
-
-	if (can_skip_trusting_file(absoluteLibraryPath, true, true)) return -1;
-
-	const char* callerPath = dyld_image_path_containing_address(addressInCaller);
+	if (_dyld_shared_cache_contains_path(libraryPath)) {
+		return -1;
+	}
+	
+	if(libraryPath[0] != '@') {
+		if(access(libraryPath, F_OK) != 0) {
+			return -3;
+		}
+	}
 
 	/* the executable file may be removed from disk at runtime,
 		 			so we need to use the cached path from dyld */
@@ -247,9 +202,22 @@ int jbclient_trust_library_recurse(const char *libraryPath, void *addressInCalle
 	}
 	
 	xpc_object_t xargs = xpc_dictionary_create_empty();
-	xpc_dictionary_set_string(xargs, "library-path", absoluteLibraryPath);
+	xpc_dictionary_set_string(xargs, "library-path", libraryPath);
 	xpc_dictionary_set_string(xargs, "caller-executable-path", executablePath);
-	if (callerPath) xpc_dictionary_set_string(xargs, "caller-library-path", callerPath);
+
+	if(addressInCaller) {
+		const char* callerPath = dyld_image_path_containing_address(addressInCaller);
+		if (callerPath) {
+			xpc_dictionary_set_string(xargs, "caller-library-path", callerPath);
+		}
+	}
+
+	char* cwd = getcwd(NULL, 0);
+	if(cwd) {
+		xpc_dictionary_set_string(xargs, "current-working-dir", cwd);
+		free((void*)cwd);
+	}
+
 
 	xpc_object_t xreply = jbserver_xpc_send(JBS_DOMAIN_ROOTHIDE, JBS_ROOTHIDE_TRUST_LIBRARY_RECURSE, xargs);
 	xpc_release(xargs);

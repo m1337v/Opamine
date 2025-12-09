@@ -8,6 +8,7 @@
 #include <sandbox.h>
 #include <libproc.h>
 #include <xpc/xpc.h>
+#include <sys/proc.h>
 #include <sys/mount.h>
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
@@ -121,12 +122,16 @@ char* proc_get_identifier(pid_t pid, char buffer[255])
     return buffer;
 }
 
-/* Status values. */
-#define SIDL    1               /* Process being created by fork. */
-#define SRUN    2               /* Currently runnable. */
-#define SSLEEP  3               /* Sleeping on an address. */
-#define SSTOP   4               /* Process debugging or suspension. */
-#define SZOMB   5               /* Awaiting collection by parent. */
+#define TASK_IPC_ACTIVE_OFFSET 0x15
+bool proc_task_port_avaliable(pid_t pid)
+{
+	uint64_t proc = proc_find(pid);
+	if (!proc) return false;
+	uint64_t task = proc_task(proc);
+	if(!task) return false;
+	uint8_t ipc_active = kread8(task+TASK_IPC_ACTIVE_OFFSET);
+	return ipc_active==1;
+}
 
 int proc_paused(pid_t pid, bool* paused)
 {
@@ -139,7 +144,12 @@ int proc_paused(pid_t pid, bool* paused)
     }
 
     if (procInfo.pbi_status == SSTOP) {
-        *paused = true;
+        bool task_port_avaliable = proc_task_port_avaliable(pid);
+        JBLogDebug("proc_paused: pid=%d is paused, task_port_avaliable=%d", pid, task_port_avaliable);
+        if(task_port_avaliable)
+        {
+            *paused = true;
+        }
     } else if (procInfo.pbi_status != SRUN) {
         return -1;
     }
@@ -199,12 +209,11 @@ bool dyld_patch_enabled()
 
 int roothide_patch_proc(pid_t pid)
 {
-    if(!dyld_patch_enabled()) {
-        if(!process_force_dyld_patch(proc_get_path(pid,NULL), NULL)) {
-            return proc_patch_csflags(pid);
-        }
+    char path[PATH_MAX]={0};
+    if(dyld_patch_enabled() || process_force_dyld_patch(proc_get_path(pid,path), NULL)) {
+        return proc_patch_dyld(pid);
     }
-    return proc_patch_dyld(pid);
+    return proc_patch_csflags(pid);
 }
 
 int roothide_config_set_spinlock_fix(bool enabled)
@@ -331,7 +340,7 @@ bool hasTrollstoreLiteMarker(const char* path)
 	return ret==0;
 }
 
-bool isSubPathOf(const char* parent, const char* child)
+bool isSubPathOf(const char* child, const char* parent)
 {
 	char real_child[PATH_MAX]={0};
 	char real_parent[PATH_MAX]={0};
@@ -367,10 +376,10 @@ void ensure_jbroot_symlink(const char* filepath)
 		strlcat(jbrootpath, "/", sizeof(jbrootpath));
 	}
 
-	JBLogDebug("%s : %s", realdirpath, jbrootpath);
-
-	if(strncmp(realdirpath, jbrootpath, strlen(jbrootpath)) != 0) 
+	if(strncmp(realdirpath, jbrootpath, strlen(jbrootpath)) != 0) {
+        JBLogDebug("ensure_jbroot_symlink skip path not inside jbroot: %s", realdirpath);
 		return;
+	}
 
 	struct stat jbrootst;
 	assert(stat(jbrootpath, &jbrootst) == 0);
@@ -703,7 +712,10 @@ int exec_cmd_roothide_spawn(pid_t* pidp, const char* path, const posix_spawn_fil
             // will fail before launchdhook injected and dyld patched, eg: opainject...
             if(jbdSpawnPatchChild(pid, should_resume) != 0) {
                 JBLogError("Failed to patch spawned process (%d) %s", pid, path);
-                return 999;
+                //jailbreak internal spawn, just let it hang forever so that we could get a panic log
+                //kill(pid, SIGQUIT); //core dump
+                //kill(pid, SIGKILL);
+                return 202;
             }
         } else {
             if (should_resume) {
@@ -863,7 +875,7 @@ void roothide_handler_jbserver_msg(xpc_object_t xmsg)
             char path[PATH_MAX]={0};
             if(pid>0 && pid!=audit_token_to_pid(clientToken) && proc_get_path(pid, path)) 
             {
-                if(hasTrollstoreMarker(path) || isSubPathOf(JBROOT_PATH("/"), path)) {
+                if(hasTrollstoreMarker(path) || isSubPathOf(path, JBROOT_PATH("/"))) {
                     JBLogDebug("hide pid %d (%s) from blacklisted process(%d) %s", pid, path, audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
                     xpc_dictionary_set_int64(xmsg, "pid", INT_MAX);
                 }

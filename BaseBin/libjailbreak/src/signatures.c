@@ -90,8 +90,22 @@ bool macho_parse_code_signature(MachO *macho, cdhash_t cdhashOut)
 
 void file_collect_untrusted_cdhashes(int fd, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut)
 {
+/*************************************** roothide specfic *************************************/
 static char __thread filepath[PATH_MAX] = {0};
-memset(filepath, 0, sizeof(filepath)); //reset everytime
+if(fcntl(fd, F_GETPATH, filepath) != 0) {
+	JBLogError("Failed to get file path for fd %d", fd);
+	return;
+}
+if(string_has_prefix(filepath, "/private/preboot/Cryptexes/")) {
+	JBLogDebug("Skipping Cryptexes file: %s", filepath);
+	return;
+}
+if(isRemovableBundlePath(filepath) && !hasTrollstoreLiteMarker(filepath)) {
+	// ignore adhoc signed apps(removable system apps or other stuffs) which is not installed via tslite
+	JBLogDebug("ignoring addhoc signed app: %s\n", filepath);
+	return;
+}
+/*************************************** roothide specfic *************************************/
 
 
 	MemoryStream *s = file_stream_init_from_file_descriptor(fd, 0, FILE_STREAM_SIZE_AUTO, 0);
@@ -113,14 +127,8 @@ memset(filepath, 0, sizeof(filepath)); //reset everytime
 
 
 /*************************************** roothide specfic *************************************/
-if(!*filepath) {
-	if(fcntl(fd, F_GETPATH, filepath) != 0) {
-		JBLogError("Failed to get file path for fd %d", fd);
-		return;
-	}
-}
 if(ensure_randomized_cdhash_for_slice(filepath, macho->archDescriptor.offset, cdhash) != 0) {
-	JBLogDebug("Failed to ensure randomized cdhash for %s", filepath);
+	JBLogError("Failed to ensure randomized cdhash for %s", filepath);
 	return;
 }
 /**************************************** roothide specfic *************************************/

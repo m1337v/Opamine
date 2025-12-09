@@ -11,7 +11,7 @@
 #include "common.h"
 #include "log.h"
 
-extern MachO *ljb_fat_find_preferred_slice(Fat* fat);
+extern MachO* fat_find_preferred_slice(Fat* fat);
 
 extern CS_DecodedBlob *csd_superblob_find_best_code_directory(CS_DecodedSuperBlob *decodedSuperblob);
 extern bool csd_code_directory_calculate_page_hash(CS_DecodedBlob *codeDirBlob, MachO *macho, int slot, uint8_t *pageHashOut);
@@ -88,6 +88,8 @@ int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut)
 		it can no longer be executed (EBADMACHO) until the previous process(es) exits.
 2: if an executable is opened with O_RDWR, 
 	it cannot be executed until the file descriptor is closed.
+3: `open(O_RDWR)` on certain binaries(e.g., WebContent) may cause deadlock (krwlock for writing)
+	while `read`/`posix_spawn` happen to be running on the binary.
 */
 int ensure_randomized_cdhash_for_slice(const char* inputPath, uint64_t offset, void* cdhashOut)
 {
@@ -99,7 +101,7 @@ int ensure_randomized_cdhash_for_slice(const char* inputPath, uint64_t offset, v
 		return -1;
 	}
 
-    MachO *macho = (offset==-1) ? ljb_fat_find_preferred_slice(fat) : fat_find_slice_by_offset(fat, offset);
+    MachO *macho = (offset==-1) ? fat_find_preferred_slice(fat) : fat_find_slice_by_offset(fat, offset);
 	if(!macho) {
 		JBLogError("Error: failed to find preferred slice: %s\n", inputPath);
 		fat_free(fat);

@@ -46,16 +46,14 @@ void jailbreakd_received_message(mach_port_t port)
 					pid_t pid = xpc_dictionary_get_int64(message, "pid");
 					bool resume = xpc_dictionary_get_bool(message, "resume");
 					pid_t ppid = proc_get_ppid(pid);
+					JBLogDebug("spinlock fix: client pid=%d, child pid=%d, child's parent pid=%d, child proc=%s", clientPid, pid, ppid, proc_get_path(pid,NULL));
 					if(ppid == clientPid) {
-						JBLogDebug("spinlock fix: client pid=%d, child pid=%d, child's parent pid=%d, child proc=%s", clientPid, pid, ppid, proc_get_path(pid,NULL));
-
 						if(proc_fix_spinlock(pid) == 0) {
 							if(resume) kill(pid, SIGCONT);
 						} else {
 							JBLogError("spinlock fix failed: %d", pid);
 							result = -1;
 						}
-
 					} else {
 						JBLogError("spinlock fix denied: %d", pid);
 						result = -1;
@@ -69,16 +67,14 @@ void jailbreakd_received_message(mach_port_t port)
 					pid_t pid = xpc_dictionary_get_int64(message, "pid");
 					bool resume = xpc_dictionary_get_bool(message, "resume");
 					pid_t ppid = proc_get_ppid(pid);
+					JBLogDebug("spawn patch: client pid=%d, child pid=%d, child's parent pid=%d, child proc=%s", clientPid, pid, ppid, proc_get_path(pid,NULL));
 					if(ppid == clientPid) {
-						JBLogDebug("spawn patch: client pid=%d, child pid=%d, child's parent pid=%d, child proc=%s", clientPid, pid, ppid, proc_get_path(pid,NULL));
-
 						if(roothide_patch_proc(pid) == 0) {
 							if(resume) kill(pid, SIGCONT);
 						} else {
 							JBLogError("spawn patch failed: %d", pid);
 							result = -1;
 						}
-
 					} else {
 						JBLogError("spawn patch denied: %d", pid);
 						result = -1;
@@ -138,7 +134,7 @@ void jailbreakd_received_message(mach_port_t port)
 					}
 					uint64_t tid = xpc_dictionary_get_uint64(message, "tid");
 					const char* log = xpc_dictionary_get_string(message, "log");
-					JBLogFunction(JBLogGetLogFilePath("systemwide", NULL), clientPid, tid, progname ? progname : "(null)", "%s", log);
+					JBLogFunction(JBLogGetLogFilePath("systemwide", NULL, NULL), clientPid, tid, progname ? progname : "(null)", "%s", log);
 					xpc_dictionary_set_int64(reply, "result", 0);
 #else
 					abort();

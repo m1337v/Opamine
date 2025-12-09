@@ -165,6 +165,13 @@ int initJailbreakd(bool firstLoad)
 
 mach_port_t reactiveJailbreakdPort()
 {
+/* restarting jailbreakd may cause it to lose its previous internal state, 
+	so we only use it during development. */
+#ifndef ENABLE_LOGS
+	//launchd_panic("jailbreakd crashed");
+	abort();
+#endif
+
 	assert(getpid() == 1);
 
 	//prevent jailbreakdClientPort from calling before initJailbreakd

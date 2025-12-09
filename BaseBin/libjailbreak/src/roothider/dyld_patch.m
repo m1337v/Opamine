@@ -703,7 +703,7 @@ int proc_patch_dyld_internal(pid_t pid, bool spinlockFixOnly)
 
     for(int i=0; i<threadCount; i++)
     {
-        JBLogDebug("allThreads[%d]=%x", i, allThreads[i]);
+        JBLogDebug("allThreads[%d/%d]=%x", i, threadCount, allThreads[i]);
 
         arm_thread_state64_t threadState={0};
         mach_msg_type_number_t threadStateCount = ARM_THREAD_STATE64_COUNT;
