@@ -1,18 +1,12 @@
 name: "*** build tipa file ***"
 
 on:
+<<<<<<< HEAD
   push:
     branches:
       - 'roothide'
     paths-ignore:
       - ".gitignore"
-  pull_request:
-    branches:
-      - '*'
-    paths-ignore:
-      - ".gitignore"
-  schedule:
-    - cron: '0 */2 * * *' # every 2 hours
   workflow_dispatch:
 
 concurrency:
@@ -55,7 +49,7 @@ jobs:
           cd trustcache
           export CFLAGS="$CFLAGS -I$(brew --prefix openssl)/include -arch arm64"
           export LDFLAGS="$LDFLAGS -L$(brew --prefix openssl)/lib -arch arm64"
-          gmake -j$(sysctl -n hw.logicalcpu) OPENSSL=1
+          gmake -j$(sysctl -n hw.physicalcpu) OPENSSL=1
           sudo cp trustcache /opt/procursus/bin/
 
       - name: Set Environment Variables
@@ -80,6 +74,7 @@ jobs:
           typeset itemcount=$(plutil -extract items raw -expect array ./Application/Dopamine/UI/Settings/Credits.plist)
           for ((i=0; i<$itemcount; i++)); do if [ "$(plutil -extract items.$i.headerCellClass raw ./Application/Dopamine/UI/Settings/Credits.plist)" = "DOCreditsCell" ]; then DOCreditsCellIndex=$i; break; fi; done;
           plutil -insert items.$DOCreditsCellIndex.names -xml "<dict><key>name</key><string>${{ github.actor }}</string><key>link</key><string>https://github.com/${{ github.repository }}</string></dict>" -append ./Application/Dopamine/UI/Settings/Credits.plist
+          rm -rf $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc.modulemap
           gmake -j$(sysctl -n hw.physicalcpu)
           VERSION=$(cat ./BaseBin/_external/basebin/.version).$(git rev-parse --short HEAD)
           mv ./Application/Dopamine.tipa  "./Application/Dopamine2-roothide.tipa"
