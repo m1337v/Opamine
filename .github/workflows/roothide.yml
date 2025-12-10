@@ -1,7 +1,6 @@
 name: "*** build tipa file ***"
 
 on:
-<<<<<<< HEAD
   push:
     branches:
       - 'roothide'
