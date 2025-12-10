@@ -5,6 +5,9 @@
 
 #define PROC_PIDPATHINFO_MAXSIZE        (4*MAXPATHLEN)
 
+extern pid_t xpc_connection_get_pid(xpc_connection_t connection)
+    __attribute__((weak_import));
+
 pid_t __thread gCurrentClientPid = 0;
 
 BOOL preferencePlistNeedsRedirection(NSString *plistPath)
