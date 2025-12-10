@@ -50,11 +50,14 @@ jobs:
 
       - name: Build and Install trustcache
         run: |
-          brew install openssl@3
           set -x
           git clone https://github.com/CRKatri/trustcache
           cd trustcache
-          gmake -j$(sysctl -n hw.physicalcpu) OPENSSL=1
+          OPENSSL_PREFIX=$(brew --prefix openssl@3)
+          gmake -j"$(sysctl -n hw.physicalcpu)" OPENSSL=1 \
+            CFLAGS="-I${OPENSSL_PREFIX}/include" \
+            LDFLAGS="-L${OPENSSL_PREFIX}/lib"
+          sudo mkdir -p /opt/procursus/bin
           sudo cp trustcache /opt/procursus/bin/
 
       - name: Set Environment Variables
