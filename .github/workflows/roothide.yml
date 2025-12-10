@@ -53,11 +53,9 @@ jobs:
           set -x
           git clone https://github.com/CRKatri/trustcache
           cd trustcache
-          OPENSSL_PREFIX=$(brew --prefix openssl@3)
-          gmake -j"$(sysctl -n hw.physicalcpu)" OPENSSL=1 \
-            CFLAGS="-I${OPENSSL_PREFIX}/include" \
-            LDFLAGS="-L${OPENSSL_PREFIX}/lib"
-          sudo mkdir -p /opt/procursus/bin
+          export CFLAGS="$CFLAGS -I$(brew --prefix openssl)/include -arch arm64"
+          export LDFLAGS="$LDFLAGS -L$(brew --prefix openssl)/lib -arch arm64"
+          gmake -j$(sysctl -n hw.logicalcpu) OPENSSL=1
           sudo cp trustcache /opt/procursus/bin/
 
       - name: Set Environment Variables
