@@ -50,6 +50,7 @@ jobs:
 
       - name: Build and Install trustcache
         run: |
+          brew install openssl@3
           set -x
           git clone https://github.com/CRKatri/trustcache
           cd trustcache
