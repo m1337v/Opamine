@@ -185,13 +185,25 @@ int systemwide_trust_file(audit_token_t *processToken, int rfd, struct siginfo *
 
 
 /******************************************* roothide specfic ****************************************/
-char filepath[PATH_MAX] = {0};
-if(fcntl(fd, F_GETPATH, filepath) != 0) {
-	JBLogError("Failed to get file path for fd %d", fd);
-} else {
+do {
+	char filepath[PATH_MAX] = {0};
+	if(fcntl(fd, F_GETPATH, filepath) != 0) {
+		JBLogError("Failed to get file path for fd %d", fd);
+		break;
+	}
+	if(string_has_prefix(filepath, "/private/preboot/Cryptexes/")) {
+		JBLogDebug("Skipping Cryptexes file: %s", filepath);
+		break;
+	}
+	if(isRemovableBundlePath(filepath) && !hasTrollstoreLiteMarker(filepath)) {
+		// ignore adhoc signed apps(removable system apps or other stuffs) which is not installed via tslite
+		JBLogDebug("ignoring addhoc signed app: %s\n", filepath);
+		break;
+	}
 	if(ensure_randomized_cdhash_for_slice(filepath, siginfo->signature.fs_file_start, cdhash) != 0) {
-		JBLogDebug("Failed to ensure randomized cdhash for %s", filepath);
-	} else {
+		JBLogError("Failed to ensure randomized cdhash for %s", filepath);
+		break;
+	}
 /******************************************* roothide specfic ****************************************/
 
 
@@ -201,8 +213,7 @@ if(fcntl(fd, F_GETPATH, filepath) != 0) {
 
 
 /**********/
-	}
-}
+} while(0);
 /********/
 
 
@@ -287,7 +298,7 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 	}
 
 	bool fullyDebugged = false;
-	if (isRemovableBundlePath(procPath) || isSubPathOf(JBROOT_PATH("/Applications"), procPath)) {
+	if (isRemovableBundlePath(procPath) || isSubPathOf(procPath, JBROOT_PATH("/Applications"))) {
 /*************************************** roothide specific *********************************/
 		
 		// This is an app, enable CS_DEBUGGED based on user preference

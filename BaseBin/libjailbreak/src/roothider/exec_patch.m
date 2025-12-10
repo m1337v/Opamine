@@ -33,6 +33,9 @@ void execPatchTimer() {
                     if (should_resume) kill(pid, SIGCONT);
                 } else {
                     JBLogError("[execPatch] failed to patch for process: %d", pid);
+                    //we hosted the spawned(SETEXEC) process so we have to deal with it if patching failed
+                    kill(pid, SIGQUIT); //core dump
+                    kill(pid, SIGKILL);
                 }
 
                 [gExecPatchArray removeObjectForKey:processId];

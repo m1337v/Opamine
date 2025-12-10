@@ -22,17 +22,17 @@ bool roothide_domain_allowed(audit_token_t clientToken)
 	return true;
 }
 
-extern void recurse_collect_untrusted_cdhashes(const char *path, const char *callerImagePath, const char *callerExecutablePath, uint32_t *preferredArchTypes, uint32_t *preferredArchSubtypes, size_t preferredArchCount, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut);
+typedef struct {
+	uint32_t Count;
+	uint32_t* Types;
+	uint32_t* Subtypes;
+} preferredArchInfo;
+void recurse_collect_untrusted_cdhashes(const char *path, const char *callerImagePath, const char *callerExecutablePath, const char *workingDir, preferredArchInfo* preferredArch, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut);
 
-static int trust_macho_recurse(const char *machoPath, const char *dlopenCallerImagePath, const char *dlopenCallerExecutablePath, xpc_object_t preferredArchsArray)
+static int trust_macho_recurse(const char *machoPath, const char *dlopenCallerImagePath, const char *dlopenCallerExecutablePath, const char *workingDir, xpc_object_t preferredArchsArray)
 {
-	// Shared logic between client and server, implemented in client
-	// This should essentially mean these files never reach us in the first place
-	// But you know, never trust the client :D
-	extern bool can_skip_trusting_file(const char *machoPath, bool isLibrary, bool isClient);
-
-	if (can_skip_trusting_file(machoPath, (dlopenCallerExecutablePath != NULL), false)) return -1;
-
+	if(!machoPath || !dlopenCallerExecutablePath) return -1;
+	
 	size_t preferredArchCount = 0;
 	if (preferredArchsArray) preferredArchCount = xpc_array_get_count(preferredArchsArray);
 	uint32_t preferredArchTypes[preferredArchCount];
@@ -46,10 +46,12 @@ static int trust_macho_recurse(const char *machoPath, const char *dlopenCallerIm
 			preferredArchSubtypes[i] = xpc_dictionary_get_uint64(arch, "subtype");
 		}
 	}
+	
+	preferredArchInfo preferredArch = {preferredArchCount, preferredArchTypes, preferredArchSubtypes};
 
 	cdhash_t *cdhashes = NULL;
 	uint32_t cdhashesCount = 0;
-	recurse_collect_untrusted_cdhashes(machoPath, dlopenCallerImagePath, dlopenCallerExecutablePath, preferredArchTypes, preferredArchSubtypes, preferredArchCount, &cdhashes, &cdhashesCount);
+	recurse_collect_untrusted_cdhashes(machoPath, dlopenCallerImagePath, dlopenCallerExecutablePath, workingDir, &preferredArch, &cdhashes, &cdhashesCount);
 	if (cdhashes && cdhashesCount > 0) {
 		jb_trustcache_add_cdhashes(cdhashes, cdhashesCount);
 		free(cdhashes);
@@ -57,18 +59,18 @@ static int trust_macho_recurse(const char *machoPath, const char *dlopenCallerIm
 	return 0;
 }
 
-int roothide_trust_executable_recurse(const char *executablePath, xpc_object_t preferredArchsArray)
+int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray)
 {
-	return trust_macho_recurse(executablePath, NULL, NULL, preferredArchsArray);
+	return trust_macho_recurse(executablePath, NULL, executablePath, processWorkingDir, preferredArchsArray);
 }
 
-static int roothide_trust_library_recurse(const char *libraryPath, const char *callerLibraryPath, const char *callerExecutablePath)
+static int roothide_trust_library_recurse(const char *libraryPath, const char *callerLibraryPath, const char *callerExecutablePath, const char *currentWorkingDir)
 {
 	// When trusting a library that's dlopened at runtime, we need to pass the caller path
 	// This is to support dlopen("@executable_path/whatever", RTLD_NOW) and stuff like that
 	// (Yes that is a thing >.<)
 	// Also we need to pass the path of the image that called dlopen due to @loader_path, sigh...
-	return trust_macho_recurse(libraryPath, callerLibraryPath, callerExecutablePath, NULL);
+	return trust_macho_recurse(libraryPath, callerLibraryPath, callerExecutablePath, currentWorkingDir, NULL);
 }
 
 static int roothide_jailbroken_check(audit_token_t *callerToken, bool* jailbroken)
@@ -237,6 +239,7 @@ struct jbserver_domain gRootHideDomain = {
 				{ .name = "library-path", .type = JBS_TYPE_STRING, .out = false },
 				{ .name = "caller-library-path", .type = JBS_TYPE_STRING, .out = false },
 				{ .name = "caller-executable-path", .type = JBS_TYPE_STRING, .out = false },
+				{ .name = "current-working-dir", .type = JBS_TYPE_STRING, .out = false },
 				{ 0 },
 			},
 		},
@@ -245,6 +248,7 @@ struct jbserver_domain gRootHideDomain = {
 			.handler = roothide_trust_executable_recurse,
 			.args = (jbserver_arg[]){
 				{ .name = "executable-path", .type = JBS_TYPE_STRING, .out = false },
+				{ .name = "process-working-dir", .type = JBS_TYPE_STRING, .out = false },
 				{ .name = "preferred-archs", .type = JBS_TYPE_ARRAY, .out = false },
 				{ 0 },
 			},

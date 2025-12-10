@@ -36,7 +36,7 @@ const char *JBLogGetProcessName(void) {
     return processName;
 }
 
-char* JBLogGetLogFilePath(const char* logname, char* buffer)
+char* JBLogGetLogFilePath(const char* logname, const char* suffix, char buffer[PATH_MAX])
 {
     static char __thread logFilePath[PATH_MAX] = {0};
     if(!buffer) buffer = logFilePath;
@@ -46,7 +46,7 @@ char* JBLogGetLogFilePath(const char* logname, char* buffer)
     struct timeval t={0};
     gettimeofday(&t, NULL);
 
-    snprintf(buffer, PATH_MAX, "%s/%s-%lu.%d-%d.log", LOGGING_DIR, logname, t.tv_sec, t.tv_usec, getpid());
+    snprintf(buffer, PATH_MAX, "%s/%s-%lu.%d-%d%s.log", LOGGING_DIR, logname, t.tv_sec, t.tv_usec, getpid(), suffix ? suffix : "");
 
     return buffer;
 }
@@ -57,7 +57,7 @@ const char* JBLogGetDefaultLogFilePath()
 
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        JBLogGetLogFilePath(JBLogGetProcessName(), logFilePath);
+        JBLogGetLogFilePath(JBLogGetProcessName(), NULL, logFilePath);
     });
     return logFilePath;
 }
@@ -120,6 +120,15 @@ void JBLogErrorFunction(const char *format, ...) {
     pthread_threadid_np(pthread_self(), &tid);
 
     JBDLogV(JBLogGetDefaultLogFilePath(), getpid(), tid, "ERROR", format, va);
+	
+    static char errorLogFilePath[PATH_MAX] = {0};
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        JBLogGetLogFilePath(JBLogGetProcessName(), "-error", errorLogFilePath);
+    });
+	
+    JBDLogV(errorLogFilePath, getpid(), tid, "ERROR", format, va);
     
     va_end(va);
 }

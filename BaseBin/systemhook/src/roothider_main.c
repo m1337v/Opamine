@@ -309,6 +309,8 @@ int roothide_systemhook___posix_spawn_posthook(pid_t *restrict pidp, const char 
 	} else if (ret == 0 && pid > 0) {
 		if (should_suspend) {
 			if(jbdSpawnPatchChild(pid, should_resume) != 0) { // jdb fault? kill
+				//just kill it instead of letting it hang forever, and the requester decides what to do later
+				kill(pid, SIGQUIT); //core dump
 				kill(pid, SIGKILL);
 				return 202;
 			}

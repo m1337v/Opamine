@@ -209,10 +209,10 @@ void roothide_launchd_postinit(bool firstLoad)
 	assert(initJailbreakd(firstLoad) == 0);
 }
 
-extern int roothide_trust_executable_recurse(const char *executablePath, xpc_object_t preferredArchsArray);
+int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray);
 int roothide_launchd_trust_executable(const char* path)
 {
-	return dyld_patch_enabled() ? systemwide_trust_file_by_path(path) : roothide_trust_executable_recurse(path, NULL);
+	return dyld_patch_enabled() ? systemwide_trust_file_by_path(path) : roothide_trust_executable_recurse(path, "/", NULL);
 }
 
 int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict])
@@ -259,7 +259,13 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 
 	if (ret == 0 && pid > 0) {
 		if(should_suspend) {
-			jbdSpawnPatchChild(pid, should_resume);
+			if(jbdSpawnPatchChild(pid, should_resume) != 0) {
+				JBLogError("Failed to patch spawned process (%d) %s", pid, path);
+				//just kill it instead of letting it hang forever so that launchd can respawn it later
+				kill(pid, SIGQUIT); //core dump
+				kill(pid, SIGKILL);
+				ret = 202;
+			}
 		}
 	} else {
 		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
@@ -287,7 +293,13 @@ int roothide_launchd___posix_spawn__spinlock_fix_only(pid_t *restrict pidp, cons
 	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
 
 	if (ret == 0 && pid > 0) {
-		jbdSpinlockFixOnly(pid, should_resume);
+		if(jbdSpinlockFixOnly(pid, should_resume)  != 0) {
+			JBLogError("Failed to patch(spinlock fix) spawned process (%d) %s", pid, path);
+			//just kill it instead of letting it hang forever so that launchd can respawn it later
+			kill(pid, SIGQUIT); //core dump
+			kill(pid, SIGKILL);
+			ret = 202;
+		}
 	} else {
 		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
 	}

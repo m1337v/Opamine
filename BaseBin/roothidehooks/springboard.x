@@ -8,7 +8,7 @@
 		char filePath[PATH_MAX];
 		if (fcntl(fildes, F_GETPATH, filePath) != -1) {
 			// Skip setting protection class on jailbreak apps, this doesn't work and causes snapshots to not be saved correctly
-			if (isSubPathOf(jbroot("/var/mobile/Library/SplashBoard/Snapshots/"), filePath)) {
+			if (isSubPathOf(filePath, jbroot("/var/mobile/Library/SplashBoard/Snapshots/"))) {
 				return 0;
 			}
 		}
