@@ -78,8 +78,9 @@ NSString* resolveRpaths(NSString *loadPath, NSString *mainExecutablePath, NSArra
 						JBLogDebug("Skipping relative rpath: %s -> %s", loadPath.fileSystemRepresentation, possiblePath.fileSystemRepresentation);
 						return;
 					}
-					if (possiblePath && [[NSFileManager defaultManager] fileExistsAtPath:possiblePath]) {
-						rpathResolvedPath = possiblePath.copy; //autoreleasepool?!
+					if (_dyld_shared_cache_contains_path(possiblePath.fileSystemRepresentation)
+					 || [[NSFileManager defaultManager] fileExistsAtPath:possiblePath]) {
+						rpathResolvedPath = possiblePath;
 						*stop = true;
 					}
 				});
@@ -154,14 +155,18 @@ static void recurse_handler(NSString *loadPath, NSString *loaderPath, NSString *
 
 	NSString *resolvedLoadPath = resolveLoadPath(loadPath, loaderPath, mainExecutablePath, workingDir, rpathStack);
 	if(!resolvedLoadPath) {
-		JBLogError("Failed to resolve dependency path for %s (loader: %s, mainExecutable: %s)", loadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation, mainExecutablePath.fileSystemRepresentation);
+		JBLogError("Failed to resolve dependency library for %s (loader: %s, mainExecutable: %s)", loadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation, mainExecutablePath.fileSystemRepresentation);
+		return;
+	}
+
+	if(_dyld_shared_cache_contains_path(resolvedLoadPath.fileSystemRepresentation)) {
 		return;
 	}
 
 	char realfilepath[PATH_MAX] = {0};
 	int fd = open(resolvedLoadPath.fileSystemRepresentation, O_RDONLY);
 	if (fd < 0) {
-		JBLogError("Failed to open binary at path: %s", resolvedLoadPath.fileSystemRepresentation);
+		JBLogError("Failed to open binary at path: %s (loader: %s)", resolvedLoadPath.fileSystemRepresentation, loaderPath.fileSystemRepresentation);
 		return;
 	}
 	if(fcntl(fd, F_GETPATH, realfilepath) != 0) {
@@ -270,9 +275,6 @@ static void recurse_handler(NSString *loadPath, NSString *loaderPath, NSString *
 
 	// Recurse this block on all dependencies
 	macho_enumerate_dependencies(macho, ^(const char *pathCStr, uint32_t cmd, struct dylib* dylib, bool *stop) {
-		if (_dyld_shared_cache_contains_path(pathCStr)) {
-			return;
-		}
 
 		NSMutableArray* nextChain = rpathStack.mutableCopy;
 		[nextChain addObject:realLoadPath]; //Loading dependencies, add current macho itself to the rpath stack
