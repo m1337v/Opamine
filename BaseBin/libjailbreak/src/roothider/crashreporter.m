@@ -472,7 +472,7 @@ void signal_handler(int signo, siginfo_t *info, void *context)
         crashreporter_save_outfile(f);
     }
     
-    ABORT("Unexcept signal %d on thread %d, A detailed report has been written to the file %s.", signo, tid, name ? name : "(null)");
+    ABORT("Unexpected signal %d on thread %d, A detailed report has been written to the file %s.", signo, tid, name ? name : "(null)");
 }
 
 int sigcatch[] = {

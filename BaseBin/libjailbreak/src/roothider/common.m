@@ -122,17 +122,6 @@ char* proc_get_identifier(pid_t pid, char buffer[255])
     return buffer;
 }
 
-#define TASK_IPC_ACTIVE_OFFSET 0x15
-bool proc_task_port_avaliable(pid_t pid)
-{
-	uint64_t proc = proc_find(pid);
-	if (!proc) return false;
-	uint64_t task = proc_task(proc);
-	if(!task) return false;
-	uint8_t ipc_active = kread8(task+TASK_IPC_ACTIVE_OFFSET);
-	return ipc_active==1;
-}
-
 int proc_paused(pid_t pid, bool* paused)
 {
     *paused = false;
@@ -144,12 +133,7 @@ int proc_paused(pid_t pid, bool* paused)
     }
 
     if (procInfo.pbi_status == SSTOP) {
-        bool task_port_avaliable = proc_task_port_avaliable(pid);
-        JBLogDebug("proc_paused: pid=%d is paused, task_port_avaliable=%d", pid, task_port_avaliable);
-        if(task_port_avaliable)
-        {
-            *paused = true;
-        }
+        *paused = true;
     } else if (procInfo.pbi_status != SRUN) {
         return -1;
     }
@@ -166,6 +150,8 @@ int unrestrict(pid_t pid, int (*callback)(pid_t), bool resume)
 			return -1;
 		}
 		if(paused) {
+			//wait for process to be fully initialized (new task ipc enabling, csflags updating, etc.)
+			usleep(100*1000);
 			break;
 		}
         usleep(10*1000);
@@ -560,6 +546,10 @@ int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
     }
     for(NSURL* fileURL in directoryEnumerator)
     {
+        NSNumber* isFile = nil;
+        [fileURL getResourceValue:&isFile forKey:NSURLIsRegularFileKey error:nil];
+        if(!isFile || !isFile.boolValue) continue;
+
         cdhash_t cdhash={0};
         if(ensure_randomized_cdhash(fileURL.path.fileSystemRepresentation, cdhash) == 0) {
             basebins_cdhashes = realloc(basebins_cdhashes, (basebins_cdhashesCount+1) * sizeof(cdhash_t));

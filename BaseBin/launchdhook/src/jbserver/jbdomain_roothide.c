@@ -88,12 +88,13 @@ static int roothide_palehide_present(audit_token_t *callerToken, bool* palehide)
 		if(jbinfo(palera1n)=='hide') {
 			result = true;
 		} else {
-			mach_port_t tfp0 = MACH_PORT_NULL;
-			kern_return_t kr = task_for_pid(mach_task_self(), 0, &tfp0);
-			if(kr == KERN_SUCCESS && MACH_PORT_VALID(tfp0)) {
-				mach_port_deallocate(mach_task_self(), tfp0);
-				result = true;
-			}
+			// hang forver on iphone7p ios15.8.2
+			// mach_port_t tfp0 = MACH_PORT_NULL;
+			// kern_return_t kr = task_for_pid(mach_task_self(), 0, &tfp0);
+			// if(kr == KERN_SUCCESS && MACH_PORT_VALID(tfp0)) {
+			// 	mach_port_deallocate(mach_task_self(), tfp0);
+			// 	result = true;
+			// }
 		}
 	});
 
