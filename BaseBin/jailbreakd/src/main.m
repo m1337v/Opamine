@@ -14,14 +14,10 @@ void jailbreakd_received_message(mach_port_t port);
 int posix_spawnattr_setspecialport_np(posix_spawnattr_t *attr, mach_port_t new_port, int which);
 int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t * __restrict attr, mach_port_t portarray[], uint32_t count);
 
-void setJetsamEnabled(bool enabled)
+void setJetsamLimit(uint32_t sizeInMB, bool is_fatal_limit)
 {
-	pid_t me = getpid();
-	int priorityToSet = -1;
-	if (enabled) {
-		priorityToSet = 10;
-	}
-	int rc = memorystatus_control(MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK, me, priorityToSet, NULL, 0);
+	uint32_t cmd = is_fatal_limit ? MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT : MEMORYSTATUS_CMD_SET_JETSAM_HIGH_WATER_MARK;
+	int rc = memorystatus_control(cmd, getpid(), sizeInMB, NULL, 0);
 	if (rc < 0) { perror ("memorystatus_control"); exit(rc);}
 }
 
@@ -31,6 +27,8 @@ int main(int argc, char* argv[])
 {
 	crashreporter_start();
 
+	setJetsamLimit(50, false);
+
 #ifdef ENABLE_LOGS
 	enableXPCLog(JBLogDebugFunction, JBLogErrorFunction);
 	enableJBDLog(JBLogDebugFunction, JBLogErrorFunction);
@@ -39,7 +37,6 @@ int main(int argc, char* argv[])
 	JBLogDebug("Hello from jailbrakd! uid=%d pid=%d ppid=%d", getuid(), getpid(), getppid());
 
 	@autoreleasepool {
-		setJetsamEnabled(true);
 
 		mach_port_t *registeredPorts=NULL;
 		mach_msg_type_number_t registeredPortsCount = 0;

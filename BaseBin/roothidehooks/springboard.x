@@ -71,7 +71,7 @@ static const void *kDenyQueryTagKey = &kDenyQueryTagKey;
 
 	if(tag && tag.boolValue) {
 
-		if([SENSITIVE_APP_LIST containsObject:bundleIdentifier]) {
+		if(is_sensitive_app_identifier(bundleIdentifier.UTF8String)) {
 			NSLog(@"FBSApplicationLibrary deny query %@", bundleIdentifier);
 			return nil;
 		}
