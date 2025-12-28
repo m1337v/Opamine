@@ -87,5 +87,24 @@ bool is_apple_internal_identifier(const char* identifier);
     @"com.opa334.Dopamine",\
     @"com.opa334.Dopamine.roothide",\
     @"com.opa334.Dopamine-roothide",\
+    @"com.opa334.TrollStore", \
+    @"com.netskao.dumpdecrypter", \
+    @"com.fiore.trolldecrypt", \
+    @"wiki.qaq.TrollFools", \
+    @"com.AppInstalleriOS.TrollSign", \
+    @"Liliana.Violyn", \
+    @"com.apple.terminal", \
+    @"com.tigisoftware.filza", \
+    @"com.m1337.Filzer", \
+    @"com.m1337.varCleanRH", \
+    @"com.m1337.store", \
+    @"com.ofcc.rhjailed", \
+    @"com.82flex.reveil", \
+    @"com.82flex.TrollVNCApp", \
+    @"com.resonance.store", \
+    @"com.mika.LocationSimulation", \
+    @"dev.mineek.muffinstore", \
+    @"com.kahsooa.piqwkk.dummy", \
 ]
 
+// CocoaTop, Derootifier, ESign, Flex3, Geranium, Postbox
