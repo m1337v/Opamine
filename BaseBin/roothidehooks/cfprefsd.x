@@ -19,11 +19,8 @@ BOOL preferencePlistNeedsRedirection(NSString *plistPath)
 
 	NSString *plistName = plistPath.lastPathComponent;
 
-	NSArray* appleInternalPlistNames = @[
-		@"com.apple.Terminal.plist",
-	];
-
-	if ([appleInternalPlistNames containsObject:plistName])
+	NSString* identifier = [plistName hasSuffix:@".plist"] ? plistName.stringByDeletingPathExtension : plistName;
+	if(is_apple_internal_identifier(identifier.UTF8String))
 		return YES;
 
 	if ([plistName hasPrefix:@"com.apple."]

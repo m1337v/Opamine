@@ -9,7 +9,7 @@
 #include <sys/mount.h>
 #import <Foundation/Foundation.h>
 
-#define DEBUG_LOG(...) JBLogDebug(__VA_ARGS__)
+#define DEBUG_LOG(...) //JBLogDebug(__VA_ARGS__)
 
 MachO* fat_find_preferred_slice(Fat *fat)
 {
@@ -160,6 +160,7 @@ static void recurse_handler(NSString *loadPath, NSString *loaderPath, NSString *
 	}
 
 	if(_dyld_shared_cache_contains_path(resolvedLoadPath.fileSystemRepresentation)) {
+		DEBUG_LOG("Skipping dyld shared cached library: %s", resolvedLoadPath.fileSystemRepresentation);
 		return;
 	}
 

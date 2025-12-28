@@ -126,6 +126,12 @@ void jailbreakd_received_message(mach_port_t port)
 
 				case JBD_MSG_SYSTEMWIDE_LOG: {
 #ifdef ENABLE_LOGS
+					static char logFilePath[PATH_MAX] = {0};
+					static dispatch_once_t onceToken;
+					dispatch_once(&onceToken, ^{
+						JBLogGetLogFilePath("systemwide", NULL, logFilePath);
+					});
+
 					const char* progname = NULL;
 					const char* procpath = proc_get_path(clientPid,NULL);
 					if(procpath) {
@@ -134,7 +140,7 @@ void jailbreakd_received_message(mach_port_t port)
 					}
 					uint64_t tid = xpc_dictionary_get_uint64(message, "tid");
 					const char* log = xpc_dictionary_get_string(message, "log");
-					JBLogFunction(JBLogGetLogFilePath("systemwide", NULL, NULL), clientPid, tid, progname ? progname : "(null)", "%s", log);
+					JBLogFunction(logFilePath, clientPid, tid, progname ? progname : "(null)", "%s", log);
 					xpc_dictionary_set_int64(reply, "result", 0);
 #else
 					abort();

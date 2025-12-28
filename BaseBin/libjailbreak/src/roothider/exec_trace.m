@@ -91,7 +91,7 @@ static void* exception_server(void* arg)
         
         uint64_t pc = (uint64_t)__darwin_arm_thread_state64_get_pc(threadState);
 
-        JBLogDebug("pid=%d exception: type=%d ncode=%d code=%d(0x%x) subcode=%d(0x%x) thread=%x pc=%p\n", pid, request->exception, request->codeCnt, 
+        JBLogDebug("pid=%d exception: type=%d ncode=%d code=0x%llX(%lld) subcode=0x%llX(%lld) thread=%x pc=%p\n", pid, request->exception, request->codeCnt, 
             request->code[0], request->code[0], request->code[1], request->code[1],
             request->thread.name, (void*)pc);
 
