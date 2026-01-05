@@ -106,12 +106,14 @@ char* proc_get_identifier(pid_t pid, char buffer[255])
         return NULL;
     }
     
-    char* csbuffer = malloc(header.length);
+    uint32_t bufferLen = ntohl(header.length);
+
+    char* csbuffer = malloc(bufferLen);
     if (!csbuffer) {
         return NULL;
     }
     
-    result = csops(pid, CS_OPS_IDENTITY, csbuffer, header.length);
+    result = csops(pid, CS_OPS_IDENTITY, csbuffer, bufferLen);
     if (result == 0) {
         char* identity = csbuffer + sizeof(struct csheader);
         strlcpy(buffer, identity, 255);
