@@ -229,8 +229,8 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     
     // Add P_SUGID
     uint32_t flag = kread32(proc + koffsetof(proc, flag));
-    if ((flag & P_SUGID) != 0) {
-        flag &= P_SUGID;
+    if ((flag & P_SUGID) == 0) {
+        flag |= P_SUGID;
         kwrite32(proc + koffsetof(proc, flag), flag);
     }
     
