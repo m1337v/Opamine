@@ -287,6 +287,17 @@ void jbinfo_initialize_hardcoded_offsets(void)
 										gSystemInfo.kernelStruct.proc.textvp  = 0x350;
 									}
 								}
+                                if (strcmp(darwinVersion, "23.0.0") >= 0) { // iOS 17+
+                                    gSystemInfo.kernelStruct.task.threads     = 0x58;
+                                    gSystemInfo.kernelStruct.vm_map.flags     = 0xc8;
+#ifdef __arm64e__
+                                    // On SPTM devices (A17+), pmap structure has EL2 adjustments
+                                    // These offsets are for the kernel running at EL2 under SPTM
+                                    gSystemInfo.kernelStruct.pmap.sw_asid    = 0xBE + pmapEl2Adjust;
+                                    gSystemInfo.kernelStruct.pmap.wx_allowed = 0xC2 + pmapEl2Adjust;
+                                    gSystemInfo.kernelStruct.pmap.type       = 0xC8 + pmapEl2Adjust;
+#endif
+                                }
 							}
 						}
 					}

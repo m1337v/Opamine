@@ -131,94 +131,62 @@ uint64_t task_get_ipc_port_kobject(uint64_t task, mach_port_t port)
 
 uint64_t alloc_page_table_unassigned(void)
 {
-	uint64_t pmap = pmap_self();
-	uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
+    // On SPTM devices, we cannot directly manipulate page table entries
+    // or reference counts. SPTM manages all frame types and PTEs atomically.
+    // Return 0 to signal that caller should use kcall-based approach instead.
+    if (jbinfo(usesSPTM)) {
+        return 0;
+    }
+    uint64_t pmap = pmap_self();
+    uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
+    uint64_t tte_lvl2 = 0;
+    uint64_t allocatedPT = 0;
+    uint64_t pinfo_pa = 0;
 
-	void *free_lvl2 = NULL;
-	uint64_t tte_lvl2 = 0;
-	uint64_t allocatedPT = 0;
-	uint64_t pinfo_pa = 0;
-	while (true) {
-		// When we allocate the entire address range of an L2 block, we can assume ownership of the backing table
-		if (posix_memalign(&free_lvl2, L2_BLOCK_SIZE, L2_BLOCK_SIZE) != 0) {
-			printf("WARNING: Failed to allocate L2 page table address range\n");
-			return 0;
-		}
-		// Now, fault in one page to make the kernel allocate the page table for it
-		*(volatile uint64_t *)free_lvl2;
+    while (true) {
+        // Allocate 2x so we can align manually, avoiding posix_memalign's
+        // large-alignment malloc zone issues on iOS 17
+        void *map_base = mmap(NULL, L2_BLOCK_SIZE * 2, PROT_READ|PROT_WRITE,
+                              MAP_PRIVATE|MAP_ANON, -1, 0);
+        if (map_base == MAP_FAILED) {
+            printf("WARNING: Failed to mmap L2 page table address range\n");
+            return 0;
+        }
 
-		// Find the newly allocated page table
-		uint64_t lvl = PMAP_TT_L2_LEVEL;
-		allocatedPT = vtophys_lvl(ttep, (uint64_t)free_lvl2, &lvl, &tte_lvl2);
+        // Manually align up to L2_BLOCK_SIZE boundary
+        void *free_lvl2 = (void *)(((uintptr_t)map_base + L2_BLOCK_SIZE - 1) & ~((uintptr_t)(L2_BLOCK_SIZE - 1)));
 
-		uint64_t pvh = pai_to_pvh(pa_index(allocatedPT));
-		uint64_t ptdp = pvh_ptd(pvh);
-		uint64_t pinfo = kread64(ptdp + koffsetof(pt_desc, ptd_info));
-		pinfo_pa = kvtophys(pinfo);
+        // Fault in one page to make the kernel allocate the page table for it
+        *(volatile uint64_t *)free_lvl2;
 
-		uint16_t refCount = physread16(pinfo_pa);
-		if (refCount != 1) {
-			// Something is off, retry
-			free(free_lvl2);
-			continue;
-		}
-		break;
-	}
+        // Find the newly allocated page table
+        uint64_t lvl = PMAP_TT_L2_LEVEL;
+        allocatedPT = vtophys_lvl(ttep, (uint64_t)free_lvl2, &lvl, &tte_lvl2);
+        uint64_t pvh = pai_to_pvh(pa_index(allocatedPT));
+        uint64_t ptdp = pvh_ptd(pvh);
+        uint64_t pinfo = kread64(ptdp + koffsetof(pt_desc, ptd_info));
+        pinfo_pa = kvtophys(pinfo);
+        uint16_t refCount = physread16(pinfo_pa);
+        if (refCount != 1) {
+            munmap(map_base, L2_BLOCK_SIZE * 2);
+            continue;
+        }
 
-	// Handle case where all entries in the level 2 table are 0 after we leak ours
-	// In that case, leak an allocation in the span of it to keep it alive
-	/*uint64_t lvl2Table = tte_lvl2 & ~PAGE_MASK;
-	uint64_t lvl2TableEntries[PAGE_SIZE / sizeof(uint64_t)];
-	physreadbuf(lvl2Table, lvl2TableEntries, PAGE_SIZE);
-	int freeIdx = -1;
-	for (int i = 0; i < (PAGE_SIZE / sizeof(uint64_t)); i++) {
-		uint64_t curPtr = lvl2Table + (sizeof(uint64_t) * i);
-		if (curPtr != tte_lvl2) {
-			if (lvl2TableEntries[i]) {
-				freeIdx = -1;
-				break;
-			}
-			else {
-				freeIdx = i;
-			}
-		}
-	}
-	if (freeIdx != -1) {
-		vm_address_t freeUserspace = ((uint64_t)free_lvl2 & ~L1_BLOCK_MASK) + (freeIdx * L2_BLOCK_SIZE);
-		if (vm_allocate(mach_task_self(), &freeUserspace, 0x4000, VM_FLAGS_FIXED) == 0) {
-			*(volatile uint8_t *)freeUserspace;
-		}
-	}*/
+        // Bump reference count so the page table survives deallocation
+        physwrite16(pinfo_pa, 0x1337);
 
-	// Bump reference count of our allocated page table
-	physwrite16(pinfo_pa, 0x1337);
+        // Release the address range — page table stays due to bumped refcount
+        munmap(map_base, L2_BLOCK_SIZE * 2);
+        break;
+    }
 
-	// Deallocate address range (our allocated page table will stay because we bumped it's reference count)
-	free(free_lvl2);
+    // Remove our allocated page table from its original location (leak it)
+    physwrite64(tte_lvl2, 0);
 
-	// Remove our allocated page table from it's original location (leak it)
-	physwrite64(tte_lvl2, 0);
+    // Refcount must be 0 — our PTEs are outside the pmap layer
+    physwrite16(pinfo_pa, 0);
 
-	// Ensure there is at least one entry in page table
-	// Attempts to prevent "pte is empty" panic
-	// Sometimes weird prefetches happen so this has to be a valid physical page to ensure those don't panic
-	// Disabled for now cause it causes super weird issues
-	//physwrite64(allocatedPT, kconstant(physBase) | PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
-
-	// Reference count of new page table must be 0!
-	// original ref count is 1 because the table holds one PTE
-	// Our new PTEs are not part of the pmap layer though so refcount needs to be 0
-	physwrite16(pinfo_pa, 0);
-
-	// After we leaked the page table, the ledger still thinks it belongs to our process
-	// We need to remove it from there aswell so that the process doesn't get jetsam killed
-	// (This ended up more complicated than I thought, so I just disabled jetsam in launchd)
-	//uint64_t ledger = kread_ptr(pmap + koffsetof(pmap, ledger));
-	//uint64_t ledger_pa = kvtophys(ledger);
-	//int page_table_ledger = physread32(ledger_pa + koffsetof(_task_ledger_indices, page_table));
-	//physwrite32(ledger_pa + koffsetof(_task_ledger_indices, page_table), page_table_ledger - 1);
-
-	return allocatedPT;
+    return allocatedPT;
 }
 
 uint64_t pmap_alloc_page_table(uint64_t pmap, uint64_t va)
@@ -251,6 +219,29 @@ uint64_t pmap_alloc_page_table(uint64_t pmap, uint64_t va)
 
 int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 {
+	// On SPTM devices, page table expansion must go through SPTM APIs
+	// We cannot directly write to PTEs or modify pmap type fields
+	// Use kcall to pmap_enter_options_addr if available, otherwise fail gracefully
+	if (jbinfo(usesSPTM)) {
+		if (is_kcall_available()) {
+			// Use kcall to expand via pmap_enter (SPTM-approved path)
+			uint64_t l2Start = (vaStart & ~L2_BLOCK_MASK);
+			uint64_t l2End = (((vaStart + size) + (L2_BLOCK_SIZE-1)) & ~L2_BLOCK_MASK);
+			for (uint64_t va = l2Start; va < l2End; va += L2_BLOCK_SIZE) {
+				uint64_t kr = 0;
+				kcall(&kr, ksymbol(pmap_enter_options_addr), 8,
+					(uint64_t[]){ pmap, va, FAKE_PHYSPAGE_TO_MAP, VM_PROT_READ | VM_PROT_WRITE, 0, 0, 1, 1 });
+				if (kr != KERN_SUCCESS && kr != KERN_RESOURCE_SHORTAGE) {
+					return -7;
+				}
+				kcall(&kr, ksymbol(pmap_remove_options), 4,
+					(uint64_t[]){ pmap, va, va + vm_real_kernel_page_size, 0x100 });
+			}
+			return 0;
+		}
+		// Without kcall, we cannot expand page tables on SPTM
+		return -1;
+	}
 	uint64_t ttep = kread_ptr(pmap + koffsetof(pmap, ttep));
 
 	if (is_kcall_available()) {
@@ -338,6 +329,19 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 
 int pmap_map_in(uint64_t pmap, uint64_t uaStart, uint64_t paStart, uint64_t size)
 {
+	// On SPTM devices, we cannot directly write to page table entries
+	// Use kcall to pmap_enter_options_addr for each page (SPTM-approved)
+	if (jbinfo(usesSPTM)) {
+		if (!is_kcall_available()) return -1;
+		uint64_t curPA = paStart;
+		for (uint64_t ua = uaStart; ua < uaStart + size; ua += vm_real_kernel_page_size, curPA += vm_real_kernel_page_size) {
+			uint64_t kr = 0;
+			kcall(&kr, ksymbol(pmap_enter_options_addr), 8,
+				(uint64_t[]){ pmap, ua, curPA, VM_PROT_READ | VM_PROT_WRITE, 0, 0, 1, 1 });
+			if (kr != KERN_SUCCESS) return -1;
+		}
+		return 0;
+	}
 	uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
 
 	uint64_t paEnd = paStart + size;
@@ -408,6 +412,12 @@ int pmap_map_in(uint64_t pmap, uint64_t uaStart, uint64_t paStart, uint64_t size
 
 uint64_t pmap_find_main_binary_code_dir(uint64_t pmap)
 {
+	// On SPTM/TXM devices, pmap_cs structures don't exist in the same form
+	// TXM manages code directories separately and they're not accessible
+	// via the pmap structure. Return 0 to indicate unavailable.
+	if (jbinfo(usesSPTM)) {
+		return 0;
+	}
 	uint64_t mainCodeDir = 0;
 	uint64_t pmap_cs_region = kread_ptr(pmap + koffsetof(pmap, pmap_cs_main));
 	while (pmap_cs_region && !mainCodeDir) {

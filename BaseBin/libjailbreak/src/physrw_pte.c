@@ -166,6 +166,20 @@ int libjailbreak_physrw_pte_init(bool receivedHandoff, uint64_t asidPtr)
 	return 0;
 }
 
+bool device_is_sptm(void)
+{
+	cpu_subtype_t cpuFamily = 0;
+	size_t cpuFamilySize = sizeof(cpuFamily);
+	sysctlbyname("hw.cpufamily", &cpuFamily, &cpuFamilySize, NULL, 0);
+	// A17 and later use SPTM instead of PPL
+	// SPTM prevents ALL direct page table manipulation
+	return (cpuFamily == CPUFAMILY_ARM_COLL ||       // A17
+			cpuFamily == CPUFAMILY_ARM_TUPAI ||      // A18
+			cpuFamily == CPUFAMILY_ARM_TAHITI ||     // A18 Pro
+			cpuFamily == CPUFAMILY_ARM_IBIZA ||      // M3
+			cpuFamily == CPUFAMILY_ARM_DONAN);       // M4
+}
+
 bool device_supports_physrw_pte(void)
 {
 	cpu_subtype_t cpuFamily = 0;
@@ -173,10 +187,12 @@ bool device_supports_physrw_pte(void)
 	sysctlbyname("hw.cpufamily", &cpuFamily, &cpuFamilySize, NULL, 0);
 	if (cpuFamily == CPUFAMILY_ARM_TYPHOON) {
 		// On A8, phyrw_pte causes SUPER WEIRD UNEXPLAINABLE SYSTEM RESTARTS
-		// No seriously, there is no panic-full log, only a panic-base that says "Unexpected watchdog reset"
-		// This exact report also what you would get when you do a hard reset, super weird...
-		// Luckily physrw doesn't have that issue so we can just use that immediately on A8
-		// This makes jailbreaking a few seconds slower, but it's not the biggest deal in the world
+		return false;
+	}
+	if (device_is_sptm()) {
+		// On SPTM devices (A17+), page table entries are protected by SPTM
+		// Direct PTE writes trigger VIOLATION_ILLEGAL_PTE and panic the device
+		// We use kread/kwrite primitives from the kernel exploit directly instead
 		return false;
 	}
 	return true;

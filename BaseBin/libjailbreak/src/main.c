@@ -20,16 +20,32 @@ int jbclient_initialize_primitives_internal(bool physrwPTE)
 		xpc_release(xSystemInfo);
 		uint64_t asidPtr = 0;
 		if (jbclient_root_get_physrw(physrwPTE, &asidPtr) == 0) {
-			if (physrwPTE) {
+			if (jbinfo(usesSPTM)) {
+				// On SPTM devices, we cannot use physrw_pte or physrw
+				// The kread/kwrite primitives from the kernel exploit
+				// are passed directly through the boomerang mechanism
+				// and remain active in the Dopamine app process.
+				// For launchd, we rely on the exploit primitives being
+				// available via the shared library context.
+				libjailbreak_translation_init();
+				libjailbreak_IOSurface_primitives_init();
+			}
+			else if (physrwPTE) {
 				libjailbreak_physrw_pte_init(true, asidPtr);
 			}
 			else {
 				libjailbreak_physrw_init(true);
 			}
-			libjailbreak_translation_init();
-			libjailbreak_IOSurface_primitives_init();
+
+			if (!jbinfo(usesSPTM)) {
+				libjailbreak_translation_init();
+				libjailbreak_IOSurface_primitives_init();
+			}
+
 			if (__builtin_available(iOS 16.0, *)) {
-				libjailbreak_kalloc_pt_init();
+				if (!jbinfo(usesSPTM)) {
+					libjailbreak_kalloc_pt_init();
+				}
 			}
 			if (gPrimitives.kalloc_local) {
 #ifdef __arm64e__

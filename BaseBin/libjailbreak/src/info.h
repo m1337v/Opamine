@@ -29,6 +29,7 @@ struct system_info {
 
 	struct {
 		uint64_t usesPACBypass;
+		uint64_t usesSPTM;
 		char *rootPath;
 	} jailbreakInfo;
 
@@ -265,6 +266,7 @@ extern struct system_info gSystemInfo;
 
 #define JAILBREAK_INFO_ITERATE(ctx, iterator) \
 	iterator(ctx, jailbreakInfo.usesPACBypass); \
+	iterator(ctx, jailbreakInfo.usesSPTM); \
 	iterator(ctx, jailbreakInfo.rootPath);
 
 #define JAILBREAK_SETTINGS_ITERATE(ctx, iterator) \

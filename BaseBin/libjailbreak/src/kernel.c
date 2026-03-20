@@ -144,6 +144,13 @@ void mac_label_set(uint64_t label, int slot, uint64_t value)
 #ifdef __arm64e__
 int pmap_cs_allow_invalid(uint64_t pmap)
 {
+	if (jbinfo(usesSPTM)) {
+		// On SPTM devices, wx_allowed is protected by SPTM/TXM
+		// Writing to it directly would trigger a violation
+		// Instead, we rely on CS_DEBUGGED approach in cs_allow_invalid
+		// which sets process-level flags via kwrite (kernel virtual memory)
+		return 0;
+	}
 	kwrite8(pmap + koffsetof(pmap, wx_allowed), true);
 	return 0;
 }
@@ -159,13 +166,12 @@ int cs_allow_invalid(uint64_t proc, bool emulateFully)
 				uint64_t pmap = kread_ptr(vm_map + koffsetof(vm_map, pmap));
 				if (pmap) {
 					// For non-pmap_cs (arm64) devices, this should always be emulated.
+					// On SPTM devices, we MUST always fully emulate because we can't
+					// write to wx_allowed (SPTM protects pmap structures).
+					// The CS_DEBUGGED + vm_map flags approach works on all iOS versions.
 #ifdef __arm64e__
-					if (emulateFully) {
+					if (emulateFully || jbinfo(usesSPTM)) {
 #endif
-						// Fugu15 Rootful
-						//proc_csflags_clear(proc, CS_EXEC_SET_ENFORCEMENT | CS_EXEC_SET_KILL | CS_EXEC_SET_HARD | CS_REQUIRE_LV | CS_ENFORCEMENT | CS_RESTRICT | CS_KILL | CS_HARD | CS_FORCED_LV);
-						//proc_csflags_set(proc, CS_DEBUGGED | CS_INVALID_ALLOWED | CS_GET_TASK_ALLOW);
-
 						// XNU
 						proc_csflags_clear(proc, CS_KILL | CS_HARD);
 						proc_csflags_set(proc, CS_DEBUGGED);
@@ -178,7 +184,8 @@ int cs_allow_invalid(uint64_t proc, bool emulateFully)
 						kwritebuf(vm_map + koffsetof(vm_map, flags), &flags, sizeof(flags));
 #ifdef __arm64e__
 					}
-					// For pmap_cs (arm64e) devices, this is enough to get unsigned code to run
+					// For pmap_cs (arm64e non-SPTM) devices, this is enough to get unsigned code to run
+					// On SPTM devices, pmap_cs_allow_invalid is a no-op (handled above)
 					pmap_cs_allow_invalid(pmap);
 #endif
 				}

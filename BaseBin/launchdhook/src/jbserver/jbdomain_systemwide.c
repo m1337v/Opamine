@@ -325,6 +325,9 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 	// "In trust cache" trust levels have higher runtime enforcements, this can be a problem for some tools as Dopamine trustcaches everything that's adhoc signed
 	// So we add the ability for a binary to get a different trust level using the "jb.pmap_cs_custom_trust" entitlement
 	// This is for binaries that rely on weaker PMAP_CS checks (e.g. Lua trampolines need it)
+	//
+	// On SPTM/TXM devices, pmap_cs structures don't exist - TXM manages trust separately
+	// pmap_find_main_binary_code_dir will return 0 on SPTM, skipping this code path
 	xpc_object_t customTrustObj = xpc_copy_entitlement_for_token("jb.pmap_cs.custom_trust", processToken);
 	if (customTrustObj) {
 		if (xpc_get_type(customTrustObj) == XPC_TYPE_STRING) {

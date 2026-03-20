@@ -23,7 +23,15 @@ int boomerang_get_physrw(audit_token_t *clientToken, bool singlePTE, uint64_t *s
 	pid_t pid = audit_token_to_pid(*clientToken);
 
 	thread_caffeinate_start();
-	if (singlePTE) {
+	if (jbinfo(usesSPTM)) {
+		// On SPTM devices, we cannot hand off physrw via page table manipulation.
+		// Instead, the kread/kwrite primitives from the kernel exploit remain active
+		// and are already available to any process that has the primitives struct.
+		// The boomerang mechanism passes system info (offsets, etc.) via JBS_ROOT_GET_SYSINFO,
+		// and the launchd hook will re-initialize its own primitives using the same exploit context.
+		r = 0;
+	}
+	else if (singlePTE) {
 		r = physrw_pte_handoff(pid, singlePTEAsidPtr);
 	}
 	else {

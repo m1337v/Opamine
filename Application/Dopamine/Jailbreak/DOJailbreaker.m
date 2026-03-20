@@ -73,29 +73,32 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     
     int r = xpf_start_with_kernel_path(kernelPath.fileSystemRepresentation);
     if (r == 0) {
-        char *sets[] = {
-            "translation",
-            "trustcache",
-            "sandbox",
-            "physmap",
-            "struct",
-            "physrw",
-            "perfkrw",
-            NULL,
-            NULL,
-            NULL,
-            NULL,
-        };
+        char *sets[16] = { NULL };
+        uint32_t idx = 0;
 
-        uint32_t idx = 7;
+        sets[idx++] = "translation";
+        if (xpf_set_is_supported("trustcache")) {
+            sets[idx++] = "trustcache";
+        }
+        sets[idx++] = "sandbox";
+        if (xpf_set_is_supported("physmap")) {
+            sets[idx++] = "physmap";
+        }
+        sets[idx++] = "struct";
+        if (xpf_set_is_supported("physrw")) {
+            sets[idx++] = "physrw";
+        }
+        if (xpf_set_is_supported("perfkrw")) {
+            sets[idx++] = "perfkrw";
+        }
         if (xpf_set_is_supported("devmode")) {
-            sets[idx++] = "devmode"; 
+            sets[idx++] = "devmode";
         }
         if (xpf_set_is_supported("badRecovery")) {
-            sets[idx++] = "badRecovery"; 
+            sets[idx++] = "badRecovery";
         }
         if (xpf_set_is_supported("arm64kcall")) {
-            sets[idx++] = "arm64kcall"; 
+            sets[idx++] = "arm64kcall";
         }
 
         _systemInfoXdict = xpf_construct_offset_dictionary((const char **)sets);
@@ -176,6 +179,13 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
         if ([pplBypass run] != 0) {[pacBypass cleanup]; [kernelExploit cleanup]; return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedExploitation userInfo:@{NSLocalizedDescriptionKey:@"Failed to bypass PPL"}];}
         // At this point we presume the PPL bypass gave us unrestricted phys write primitives
     }
+
+    // Detect SPTM devices (A17+) and set the flag
+    // On SPTM devices, PPL bypass is a no-op and we rely on kread/kwrite instead
+    if (device_is_sptm()) {
+        gSystemInfo.jailbreakInfo.usesSPTM = true;
+        NSLog(@"[SPTM] Detected SPTM device - physrw_pte will be skipped");
+    }
     if (!gPrimitives.kalloc_global) {
         // IOSurface kallocs don't work on iOS 16+, use leaked page tables as allocations instead
         libjailbreak_kalloc_pt_init();
@@ -190,6 +200,14 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 
 - (NSError *)buildPhysRWPrimitive
 {
+    // On SPTM devices (A17+), we cannot build physrw primitives
+    // SPTM protects all page table entries - direct PTE writes trigger VIOLATION_ILLEGAL_PTE
+    // Instead, we keep using kread/kwrite from the kernel exploit (coruna)
+    if (gSystemInfo.jailbreakInfo.usesSPTM) {
+        NSLog(@"[SPTM] Skipping physrw primitive - using kread/kwrite from kernel exploit");
+        return nil;
+    }
+
     int r = -1;
     if (device_supports_physrw_pte()) {
         r = libjailbreak_physrw_pte_init(false, 0);
@@ -205,6 +223,18 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 
 - (NSError *)cleanUpExploits
 {
+    // On SPTM devices, we must keep the kernel exploit alive
+    // because kread/kwrite primitives are our only means of kernel access.
+    // physrw_pte cannot be built (SPTM blocks page table manipulation),
+    // so cleaning up the exploit would leave us with no primitives at all.
+    if (gSystemInfo.jailbreakInfo.usesSPTM) {
+        NSLog(@"[SPTM] Keeping kernel exploit alive - kread/kwrite primitives must persist");
+        // Only clean up the PPL bypass (which is a no-op on SPTM anyway)
+        DOExploit *pplBypass = [DOExploitManager sharedManager].selectedPPLBypass;
+        if (pplBypass) [pplBypass cleanup];
+        return nil;
+    }
+
     int r = [[DOExploitManager sharedManager] cleanUpExploits];
     if (r != 0) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedCleanup userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"Failed to cleanup exploits: %d", r]}];
     IOSurface_map_cleanup();
