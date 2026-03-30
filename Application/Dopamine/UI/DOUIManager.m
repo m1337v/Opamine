@@ -7,12 +7,14 @@
 
 #import "DOUIManager.h"
 #import "DOEnvironmentManager.h"
+#import "DOThemeManager.h"
+#import "DOTheme.h"
 #import "NSString+Version.h"
 #import <pthread.h>
 
 @implementation DOUIManager
 
-+ (id)sharedInstance
++ (instancetype)sharedInstance
 {
     static DOUIManager *sharedInstance = nil;
     static dispatch_once_t onceToken;
@@ -25,6 +27,7 @@
 - (id)init
 {
     if (self = [super init]){
+        _bootlogoPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/bootlogo.png"];
         _preferenceManager = [DOPreferenceManager sharedManager];
         _logRecord = [NSMutableArray new];
         _logLock = [NSLock new];
@@ -317,6 +320,11 @@
         if (!candidate) candidate = key;
     }
     return candidate;
+}
+
+- (UIImage *)renderBootLogo
+{
+    return [[[DOThemeManager sharedInstance] enabledTheme] generateBootLogo];
 }
 
 @end

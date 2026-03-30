@@ -583,6 +583,9 @@ void *boomerang_server(struct boomerang_info *info)
     if (*errOut) return;
     setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/rootfs/sbin:/rootfs/bin:/rootfs/usr/sbin:/rootfs/usr/bin", 1);
     setenv("TERM", "xterm-256color", 1);
+
+    *errOut = [[DOEnvironmentManager sharedManager] updateBootLogo];
+    if (*errOut) return;
     
     if (!tweaksEnabled) {
         printf("Creating safe mode marker file since tweaks were disabled in settings\n");
