@@ -586,6 +586,8 @@ void *boomerang_server(struct boomerang_info *info)
 
     *errOut = [[DOEnvironmentManager sharedManager] updateBootLogo];
     if (*errOut) return;
+
+    [[DOEnvironmentManager sharedManager] syncRootHideInjectionSettingsNeedsUnsandbox:NO];
     
     if (!tweaksEnabled) {
         printf("Creating safe mode marker file since tweaks were disabled in settings\n");

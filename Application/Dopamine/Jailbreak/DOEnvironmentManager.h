@@ -10,6 +10,10 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+FOUNDATION_EXPORT NSString * const DORootHideInjectionModeStock;
+FOUNDATION_EXPORT NSString * const DORootHideInjectionModeBlacklist;
+FOUNDATION_EXPORT NSString * const DORootHideInjectionModeWhitelist;
+
 @interface DOEnvironmentManager : NSObject
 {
     DOBootstrapper *_bootstrapper;
@@ -50,6 +54,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (BOOL)isTweakInjectionEnabled;
 - (void)setTweakInjectionEnabled:(BOOL)enabled;
+- (NSString *)configuredTweakInjectionMode;
+- (void)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox;
 - (BOOL)isIDownloadEnabled;
 - (void)setIDownloadEnabled:(BOOL)enabled needsUnsandbox:(BOOL)needsUnsandbox;
 - (void)setIDownloadLoaded:(BOOL)loaded needsUnsandbox:(BOOL)needsUnsandbox;

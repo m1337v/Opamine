@@ -8,11 +8,31 @@
 #include <sandbox.h>
 #include <paths.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include "envbuf.h"
 #include "private.h"
 #include <libjailbreak/jbclient_xpc.h>
 #include <libjailbreak/jbserver_domains.h>
+#include <libjailbreak/jbroot.h>
+
+typedef enum
+{
+	kRootHideInjectionModeStock = 0,
+	kRootHideInjectionModeBlacklist,
+	kRootHideInjectionModeWhitelist,
+} RootHideInjectionMode;
+
+#define ROOT_HIDE_MODE_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist"
+#define ROOT_HIDE_MODE_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist"
+#define ROOT_HIDE_INJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.plist"
+#define ROOT_HIDE_INJECT_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.plist"
+#define ROOT_HIDE_INJECT_SYSTEM_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist"
+#define ROOT_HIDE_INJECT_SYSTEM_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist"
+#define ROOT_HIDE_UNINJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.uninject.plist"
+#define ROOT_HIDE_UNINJECT_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.uninject.plist"
+#define ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD "/var/mobile/zp.unject.plist"
 
 bool string_has_prefix(const char *str, const char* prefix)
 {
@@ -59,6 +79,154 @@ void string_enumerate_components(const char *string, const char *separator, void
 	free(stringCopy);
 }
 
+extern xpc_object_t xpc_create_from_plist(const void* buf, size_t len);
+
+static xpc_object_t root_hide_copy_plist(const char *path)
+{
+	if (!path || access(path, F_OK) != 0) {
+		return NULL;
+	}
+
+	struct stat s = {};
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		return NULL;
+	}
+
+	if (fstat(fd, &s) != 0) {
+		close(fd);
+		return NULL;
+	}
+
+	void *addr = mmap(NULL, s.st_size, PROT_READ, MAP_FILE | MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (addr == MAP_FAILED) {
+		return NULL;
+	}
+
+	xpc_object_t xplist = xpc_create_from_plist(addr, s.st_size);
+	munmap(addr, s.st_size);
+	return xplist;
+}
+
+static xpc_object_t root_hide_copy_plist_for_relative_path(const char *relativePath, const char *legacyPath)
+{
+	const char *jbrootPath = JBROOT_PATH(relativePath);
+	xpc_object_t xplist = root_hide_copy_plist(jbrootPath);
+	if (xplist) {
+		return xplist;
+	}
+	if (legacyPath && (!jbrootPath || strcmp(jbrootPath, legacyPath) != 0)) {
+		return root_hide_copy_plist(legacyPath);
+	}
+	return NULL;
+}
+
+static bool root_hide_plist_exists(const char *relativePath, const char *legacyPath)
+{
+	const char *jbrootPath = JBROOT_PATH(relativePath);
+	if (jbrootPath && access(jbrootPath, F_OK) == 0) {
+		return true;
+	}
+	if (legacyPath && (!jbrootPath || strcmp(jbrootPath, legacyPath) != 0) && access(legacyPath, F_OK) == 0) {
+		return true;
+	}
+	return false;
+}
+
+static bool root_hide_dictionary_get_bool(const char *relativePath, const char *legacyPath, const char *key)
+{
+	if (!key) {
+		return false;
+	}
+
+	xpc_object_t xplist = root_hide_copy_plist_for_relative_path(relativePath, legacyPath);
+	if (!xplist || xpc_get_type(xplist) != XPC_TYPE_DICTIONARY) {
+		if (xplist) xpc_release(xplist);
+		return false;
+	}
+
+	bool result = xpc_dictionary_get_bool(xplist, key);
+	xpc_release(xplist);
+	return result;
+}
+
+static bool root_hide_dictionary_contains_enabled_path(const char *relativePath, const char *legacyPath, const char *path)
+{
+	if (!path) {
+		return false;
+	}
+
+	xpc_object_t xplist = root_hide_copy_plist_for_relative_path(relativePath, legacyPath);
+	if (!xplist || xpc_get_type(xplist) != XPC_TYPE_DICTIONARY) {
+		if (xplist) xpc_release(xplist);
+		return false;
+	}
+
+	__block bool found = false;
+	xpc_dictionary_apply(xplist, ^bool(const char *key, xpc_object_t value) {
+		if (xpc_get_type(value) == XPC_TYPE_BOOL && xpc_bool_get_value(value) && strstr(path, key)) {
+			found = true;
+			return false;
+		}
+		return true;
+	});
+
+	xpc_release(xplist);
+	return found;
+}
+
+static RootHideInjectionMode root_hide_injection_mode(void)
+{
+	xpc_object_t modePlist = root_hide_copy_plist_for_relative_path(ROOT_HIDE_MODE_PLIST_RELATIVE, ROOT_HIDE_MODE_PLIST_LEGACY);
+	if (modePlist && xpc_get_type(modePlist) == XPC_TYPE_DICTIONARY) {
+		const char *mode = xpc_dictionary_get_string(modePlist, "mode");
+		if (mode) {
+			if (!strcmp(mode, "blacklist")) {
+				xpc_release(modePlist);
+				return kRootHideInjectionModeBlacklist;
+			}
+			if (!strcmp(mode, "whitelist")) {
+				xpc_release(modePlist);
+				return kRootHideInjectionModeWhitelist;
+			}
+			if (!strcmp(mode, "stock")) {
+				xpc_release(modePlist);
+				return kRootHideInjectionModeStock;
+			}
+		}
+	}
+	if (modePlist) {
+		xpc_release(modePlist);
+	}
+
+	if (root_hide_plist_exists(ROOT_HIDE_INJECT_PLIST_RELATIVE, ROOT_HIDE_INJECT_PLIST_LEGACY)) {
+		return kRootHideInjectionModeWhitelist;
+	}
+	if (root_hide_plist_exists(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY) || access(ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD, F_OK) == 0) {
+		return kRootHideInjectionModeBlacklist;
+	}
+	return kRootHideInjectionModeStock;
+}
+
+static bool root_hide_allowlisted_executable(const char *execName)
+{
+	return root_hide_dictionary_get_bool(ROOT_HIDE_INJECT_PLIST_RELATIVE, ROOT_HIDE_INJECT_PLIST_LEGACY, execName);
+}
+
+static bool root_hide_system_allowlisted_path(const char *path)
+{
+	return root_hide_dictionary_contains_enabled_path(ROOT_HIDE_INJECT_SYSTEM_PLIST_RELATIVE, ROOT_HIDE_INJECT_SYSTEM_PLIST_LEGACY, path);
+}
+
+static bool root_hide_uninject_executable(const char *execName)
+{
+	if (root_hide_dictionary_get_bool(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY, execName)) {
+		return true;
+	}
+	return root_hide_dictionary_get_bool(ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD, ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD, execName);
+}
+
 kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[restrict])
 {
 	// Blacklist to ensure general system stability
@@ -73,6 +241,44 @@ kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[rest
 	for (size_t i = 0; i < blacklistCount; i++)
 	{
 		if (!strcmp(processBlacklist[i], path)) return 0;
+	}
+
+	RootHideInjectionMode injectionMode = root_hide_injection_mode();
+	if (injectionMode == kRootHideInjectionModeWhitelist) {
+		const char *exec = strrchr(path, '/');
+		if (exec && root_hide_allowlisted_executable(exec + 1)) {
+			return (kSpawnConfigInject | kSpawnConfigTrust);
+		}
+		if (root_hide_system_allowlisted_path(path)) {
+			return (kSpawnConfigInject | kSpawnConfigTrust);
+		}
+		return 0;
+	}
+
+	if (injectionMode == kRootHideInjectionModeBlacklist) {
+		if (strstr(path, "/.jbroot-")) {
+			return (kSpawnConfigInject | kSpawnConfigTrust);
+		}
+
+		if (access("/var/mobile/.appex", F_OK) < 0) {
+			const char *patterns[] = {
+				"wxkb_plugin",
+				"BaiduInputMethod",
+				"com.sogou.sogouinput.BaseKeyboard",
+				".appex/"
+			};
+			size_t patternsCount = sizeof(patterns) / sizeof(patterns[0]);
+			for (size_t i = 0; i < patternsCount; ++i) {
+				if (strstr(path, patterns[i]) != NULL) {
+					return (i == patternsCount - 1) ? 0 : (kSpawnConfigInject | kSpawnConfigTrust);
+				}
+			}
+		}
+
+		const char *exec = strrchr(path, '/');
+		if (exec && root_hide_uninject_executable(exec + 1)) {
+			return 0;
+		}
 	}
 
 	return (kSpawnConfigInject | kSpawnConfigTrust);

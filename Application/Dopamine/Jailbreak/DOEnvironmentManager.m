@@ -31,6 +31,106 @@
 
 int reboot3(uint64_t flags, ...);
 
+NSString * const DORootHideInjectionModeStock = @"stock";
+NSString * const DORootHideInjectionModeBlacklist = @"blacklist";
+NSString * const DORootHideInjectionModeWhitelist = @"whitelist";
+
+static NSString * const DOTweakInjectionModePreferenceKey = @"tweakInjectionMode";
+static NSString * const DORootHideDirectoryRelativePath = @"/var/mobile/Library/RootHide";
+static NSString * const DORootHideModeRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist";
+static NSString * const DORootHideInjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.plist";
+static NSString * const DORootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist";
+static NSString * const DORootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.wantsblacklist.plist";
+static NSString * const DORootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.uninject.plist";
+static NSString * const DORootHideLegacyUninjectPath = @"/var/mobile/zp.unject.plist";
+
+static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
+{
+    if ([mode isEqualToString:DORootHideInjectionModeBlacklist] || [mode isEqualToString:DORootHideInjectionModeWhitelist]) {
+        return mode;
+    }
+    if ([mode isEqualToString:DORootHideInjectionModeStock]) {
+        return mode;
+    }
+    return nil;
+}
+
+static NSArray<NSString *> *DORootHideCandidatePaths(NSString *relativePath)
+{
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    NSString *jbrootPath = JBROOT_PATH(relativePath);
+    if (jbrootPath.length > 0) {
+        [paths addObject:jbrootPath];
+    }
+    if (![paths containsObject:relativePath]) {
+        [paths addObject:relativePath];
+    }
+    return paths;
+}
+
+static NSDictionary *DORootHideDictionaryAtCandidatePaths(NSString *relativePath)
+{
+    for (NSString *path in DORootHideCandidatePaths(relativePath)) {
+        NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:path];
+        if ([dictionary isKindOfClass:[NSDictionary class]]) {
+            return dictionary;
+        }
+    }
+    return nil;
+}
+
+static BOOL DORootHidePathExistsAtCandidatePaths(NSString *relativePath)
+{
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    for (NSString *path in DORootHideCandidatePaths(relativePath)) {
+        if ([fileManager fileExistsAtPath:path]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static NSDictionary *DODefaultRootHideSystemInjection(void)
+{
+    static NSDictionary *defaultSystemInjection;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        defaultSystemInjection = @{
+            @"/.jbroot" : @YES,
+            @"/xpcproxy" : @YES,
+            @"/Dopamine" : @YES,
+            @"/SpringBoard" : @YES,
+            @"/Preferences" : @YES,
+            @"/amfid" : @YES,
+            @"/cfprefsd" : @YES,
+            @"/lsd" : @YES,
+            @"/transitd" : @YES,
+            @"/watchdogd" : @YES,
+            @"/SafariViewService" : @YES,
+            @"/iconservicesagent" : @YES,
+            @"/mobileassetd" : @YES,
+            @"/MobileGestaltHelper" : @YES,
+            @"/useractivityd" : @YES,
+        };
+    });
+    return defaultSystemInjection;
+}
+
+static NSDictionary *DODefaultRootHideWantsBlacklist(void)
+{
+    static NSDictionary *defaultWantsBlacklist;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        defaultWantsBlacklist = @{
+            @"QQ" : @YES,
+            @"WeChat" : @YES,
+            @"Runner" : @YES,
+            @"AppStore" : @YES,
+        };
+    });
+    return defaultWantsBlacklist;
+}
+
 @implementation DOEnvironmentManager
 
 @synthesize bootManifestHash = _bootManifestHash;
@@ -443,6 +543,95 @@ int reboot3(uint64_t flags, ...);
                 }
             }];
         }];
+    }
+}
+
+- (NSString *)configuredTweakInjectionMode
+{
+    NSDictionary *modeConfiguration = DORootHideDictionaryAtCandidatePaths(DORootHideModeRelativePath);
+    NSString *configuredMode = DONormalizeRootHideInjectionMode(modeConfiguration[@"mode"]);
+    if (configuredMode) {
+        return configuredMode;
+    }
+
+    if (DORootHidePathExistsAtCandidatePaths(DORootHideInjectRelativePath)) {
+        return DORootHideInjectionModeWhitelist;
+    }
+
+    if (DORootHidePathExistsAtCandidatePaths(DORootHideUninjectRelativePath) || [[NSFileManager defaultManager] fileExistsAtPath:DORootHideLegacyUninjectPath]) {
+        return DORootHideInjectionModeBlacklist;
+    }
+
+    NSString *preferredMode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]);
+    return preferredMode ?: DORootHideInjectionModeStock;
+}
+
+- (void)ensureRootHideDictionaryExistsAtPath:(NSString *)path defaults:(NSDictionary *)defaults
+{
+    if (!path || [[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        return;
+    }
+    [defaults writeToFile:path atomically:YES];
+}
+
+- (void)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox
+{
+    NSString *mode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]) ?: DORootHideInjectionModeStock;
+
+    void (^syncBlock)(void) = ^{
+        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSString *rootHidePath = JBROOT_PATH(DORootHideDirectoryRelativePath);
+        if (rootHidePath.length == 0) {
+            return;
+        }
+
+        NSDictionary *directoryAttributes = @{
+            NSFilePosixPermissions : @(0755),
+            NSFileOwnerAccountID : @(501),
+            NSFileGroupOwnerAccountID : @(501),
+        };
+        NSDictionary *fileAttributes = @{
+            NSFilePosixPermissions : @(0644),
+            NSFileOwnerAccountID : @(501),
+            NSFileGroupOwnerAccountID : @(501),
+        };
+
+        if (![fileManager fileExistsAtPath:rootHidePath]) {
+            [fileManager createDirectoryAtPath:rootHidePath withIntermediateDirectories:YES attributes:directoryAttributes error:nil];
+        }
+        [fileManager setAttributes:directoryAttributes ofItemAtPath:rootHidePath error:nil];
+
+        NSString *modePath = JBROOT_PATH(DORootHideModeRelativePath);
+        NSString *injectPath = JBROOT_PATH(DORootHideInjectRelativePath);
+        NSString *injectSystemPath = JBROOT_PATH(DORootHideInjectSystemRelativePath);
+        NSString *injectWantsBlacklistPath = JBROOT_PATH(DORootHideInjectWantsBlacklistRelativePath);
+        NSString *uninjectPath = JBROOT_PATH(DORootHideUninjectRelativePath);
+
+        [@{ @"mode" : mode } writeToFile:modePath atomically:YES];
+
+        if ([mode isEqualToString:DORootHideInjectionModeWhitelist]) {
+            [self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}];
+            [self ensureRootHideDictionaryExistsAtPath:injectSystemPath defaults:DODefaultRootHideSystemInjection()];
+            [self ensureRootHideDictionaryExistsAtPath:injectWantsBlacklistPath defaults:DODefaultRootHideWantsBlacklist()];
+        }
+        else if ([mode isEqualToString:DORootHideInjectionModeBlacklist]) {
+            [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];
+        }
+
+        for (NSString *path in @[modePath, injectPath, injectSystemPath, injectWantsBlacklistPath, uninjectPath]) {
+            if ([fileManager fileExistsAtPath:path]) {
+                [fileManager setAttributes:fileAttributes ofItemAtPath:path error:nil];
+            }
+        }
+    };
+
+    if (needsUnsandbox) {
+        [self runAsRoot:^{
+            [self runUnsandboxed:syncBlock];
+        }];
+    }
+    else {
+        syncBlock();
     }
 }
 

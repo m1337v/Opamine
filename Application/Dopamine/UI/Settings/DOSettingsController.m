@@ -149,6 +149,24 @@
     ];
 }
 
+- (NSArray *)tweakInjectionModeIdentifiers
+{
+    return @[
+        DORootHideInjectionModeStock,
+        DORootHideInjectionModeBlacklist,
+        DORootHideInjectionModeWhitelist,
+    ];
+}
+
+- (NSArray *)tweakInjectionModeTitles
+{
+    return @[
+        [NSString stringWithFormat:@"%@ (%@)", DOLocalizedString(@"Settings_Tweak_Injection_Mode_Stock"), DOLocalizedString(@"Recommended")],
+        DOLocalizedString(@"Settings_Tweak_Injection_Mode_Blacklist"),
+        DOLocalizedString(@"Settings_Tweak_Injection_Mode_Whitelist"),
+    ];
+}
+
 - (id)specifiers
 {
     if(_specifiers == nil) {
@@ -228,6 +246,15 @@
             [tweakInjectionSpecifier setProperty:@"tweakInjectionEnabled" forKey:@"key"];
             [tweakInjectionSpecifier setProperty:@YES forKey:@"default"];
             [specifiers addObject:tweakInjectionSpecifier];
+
+            PSSpecifier *tweakInjectionModeSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Settings_Tweak_Injection_Mode") target:self set:@selector(setTweakInjectionMode:specifier:) get:@selector(readTweakInjectionMode:) detail:nil cell:PSLinkListCell edit:nil];
+            [tweakInjectionModeSpecifier setProperty:@YES forKey:@"enabled"];
+            [tweakInjectionModeSpecifier setProperty:@"tweakInjectionMode" forKey:@"key"];
+            [tweakInjectionModeSpecifier setProperty:[[self tweakInjectionModeIdentifiers] firstObject] forKey:@"default"];
+            tweakInjectionModeSpecifier.detailControllerClass = [DOPSListItemsController class];
+            [tweakInjectionModeSpecifier setProperty:@"tweakInjectionModeIdentifiers" forKey:@"valuesDataSource"];
+            [tweakInjectionModeSpecifier setProperty:@"tweakInjectionModeTitles" forKey:@"titlesDataSource"];
+            [specifiers addObject:tweakInjectionModeSpecifier];
             
             if (!envManager.isJailbroken) {
                 PSSpecifier *verboseLogSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Settings_Verbose_Logs") target:self set:defSetter get:defGetter detail:nil cell:PSSwitchCell edit:nil];
@@ -453,15 +480,30 @@
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     if (envManager.isJailbroken) {
         [[DOEnvironmentManager sharedManager] setTweakInjectionEnabled:((NSNumber *)value).boolValue];
-        UIAlertController *userspaceRebootAlertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Title") message:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Body") preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *rebootNowAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Now") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-            [[DOEnvironmentManager sharedManager] rebootUserspace];
-        }];
-        UIAlertAction *rebootLaterAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Later") style:UIAlertActionStyleCancel handler:nil];
-        
-        [userspaceRebootAlertController addAction:rebootNowAction];
-        [userspaceRebootAlertController addAction:rebootLaterAction];
-        [self presentViewController:userspaceRebootAlertController animated:YES completion:nil];
+        [self presentUserspaceRebootAlert];
+    }
+}
+
+- (id)readTweakInjectionMode:(PSSpecifier *)specifier
+{
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    if (envManager.isJailbroken) {
+        return [envManager configuredTweakInjectionMode];
+    }
+    return [self readPreferenceValue:specifier];
+}
+
+- (void)setTweakInjectionMode:(id)value specifier:(PSSpecifier *)specifier
+{
+    NSString *previousMode = [self readTweakInjectionMode:specifier];
+    [self setPreferenceValue:value specifier:specifier];
+
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    if (envManager.isJailbroken) {
+        [envManager syncRootHideInjectionSettingsNeedsUnsandbox:YES];
+        if (![previousMode isEqual:value]) {
+            [self presentUserspaceRebootAlert];
+        }
     }
 }
 
@@ -725,6 +767,19 @@
     [[DOUIManager sharedInstance] resetSettings];
     [self.navigationController popToRootViewControllerAnimated:YES];
     [self reloadSpecifiers];
+}
+
+- (void)presentUserspaceRebootAlert
+{
+    UIAlertController *userspaceRebootAlertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Title") message:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Body") preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *rebootNowAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Now") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [[DOEnvironmentManager sharedManager] rebootUserspace];
+    }];
+    UIAlertAction *rebootLaterAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Later") style:UIAlertActionStyleCancel handler:nil];
+
+    [userspaceRebootAlertController addAction:rebootNowAction];
+    [userspaceRebootAlertController addAction:rebootLaterAction];
+    [self presentViewController:userspaceRebootAlertController animated:YES completion:nil];
 }
 
 
