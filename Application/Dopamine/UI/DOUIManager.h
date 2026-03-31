@@ -19,10 +19,11 @@ NS_ASSUME_NONNULL_BEGIN
     NSLock *_logLock;
 }
 
+@property (nonatomic, readonly) NSString *bootlogoPath;
 @property (nonatomic, retain) NSObject<DOLogViewProtocol> *logView;
 @property (atomic, retain) NSMutableArray<NSString*> *logRecord;
 
-+ (id)sharedInstance;
++ (instancetype)sharedInstance;
 
 - (BOOL)isDebug;
 - (void)sendLog:(NSString*)log debug:(BOOL)debug update:(BOOL)update;
@@ -44,6 +45,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)resetSettings;
 - (void)setPackageManager:(NSString*)key enabled:(BOOL)enabled;
 - (NSString *)localizedStringForKey:(NSString*)key;
+- (UIImage *)renderBootLogo;
 
 @end
 
