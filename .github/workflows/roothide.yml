@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'roothide'
+      - 'zqbb-unified-mode'
     paths-ignore:
       - ".gitignore"
   workflow_dispatch:
@@ -17,9 +18,11 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        run: |
-          set -x
-          git clone -b roothide --recursive https://github.com/m1337v/Opamine ${{ github.workspace }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+          fetch-depth: 0
           
       - name: Install Procursus
         uses: dhinakg/procursus-action@main
@@ -57,9 +60,31 @@ jobs:
           T2=$(TZ=UTC-2 date +'%Y%m%d_%H%M%S')
           TS=$(date -j -f "%Y%m%d_%H%M%S" "${T2}" +%s)
           SHASH=$(git rev-parse --short HEAD)
+          BRANCH="${GITHUB_REF_NAME}"
+          case "${BRANCH}" in
+            roothide)
+              RELEASE_TAG="roothide"
+              RELEASE_NAME="Roothide2 Beta Release"
+              ASSET_NAME="Dopamine2-roothide.tipa"
+              ;;
+            zqbb-unified-mode)
+              RELEASE_TAG="rhunified"
+              RELEASE_NAME="rhunified"
+              ASSET_NAME="Dopamine2-rhunified.tipa"
+              ;;
+            *)
+              SANITIZED_BRANCH=$(echo "${BRANCH}" | tr '/[:space:]' '--')
+              RELEASE_TAG="${SANITIZED_BRANCH}"
+              RELEASE_NAME="${SANITIZED_BRANCH}"
+              ASSET_NAME="Dopamine2-${SANITIZED_BRANCH}.tipa"
+              ;;
+          esac
           echo "ctime=${T2}" >> $GITHUB_ENV
           echo "ctimestamp=${TS}" >> $GITHUB_ENV
           echo "shorthash=${SHASH}" >> $GITHUB_ENV
+          echo "release_tag=${RELEASE_TAG}" >> $GITHUB_ENV
+          echo "release_name=${RELEASE_NAME}" >> $GITHUB_ENV
+          echo "asset_name=${ASSET_NAME}" >> $GITHUB_ENV
 
       - name: Install libarchive
         run: |
@@ -76,7 +101,7 @@ jobs:
           rm -rf $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc $(xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc.modulemap
           gmake -j$(sysctl -n hw.physicalcpu)
           VERSION=$(cat ./BaseBin/_external/basebin/.version).$(git rev-parse --short HEAD)
-          mv ./Application/Dopamine.tipa  "./Application/Dopamine2-roothide.tipa"
+          mv ./Application/Dopamine.tipa "./Application/${asset_name}"
           echo "version=${VERSION}" >> $GITHUB_ENV
 
       - name: Create or Update Release and Upload Asset
@@ -85,10 +110,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: roothide
-          release_name: Roothide2 Beta Release
+          tag_name: ${{ env.release_tag }}
+          release_name: ${{ env.release_name }}
           body: These are automatically updated builds of the latest commit.
           draft: false
           prerelease: false
           overwrite: true
-          files: ${{ github.workspace }}/Application/Dopamine2-roothide.tipa
+          files: ${{ github.workspace }}/Application/${{ env.asset_name }}
