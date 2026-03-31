@@ -9,6 +9,7 @@
 #include <paths.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <math.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include "envbuf.h"
@@ -30,6 +31,8 @@ typedef enum
 #define ROOT_HIDE_INJECT_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.plist"
 #define ROOT_HIDE_INJECT_SYSTEM_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist"
 #define ROOT_HIDE_INJECT_SYSTEM_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist"
+#define ROOT_HIDE_JETSAM_ADDEND_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.jetsam.addend.plist"
+#define ROOT_HIDE_JETSAM_ADDEND_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.jetsam.addend.plist"
 #define ROOT_HIDE_UNINJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.uninject.plist"
 #define ROOT_HIDE_UNINJECT_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.uninject.plist"
 #define ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD "/var/mobile/zp.unject.plist"
@@ -219,6 +222,34 @@ static bool root_hide_system_allowlisted_path(const char *path)
 	return root_hide_dictionary_contains_enabled_path(ROOT_HIDE_INJECT_SYSTEM_PLIST_RELATIVE, ROOT_HIDE_INJECT_SYSTEM_PLIST_LEGACY, path);
 }
 
+static int root_hide_jetsam_addend_for_path(const char *path)
+{
+	if (!path) {
+		return 10;
+	}
+
+	xpc_object_t xplist = root_hide_copy_plist_for_relative_path(ROOT_HIDE_JETSAM_ADDEND_PLIST_RELATIVE, ROOT_HIDE_JETSAM_ADDEND_PLIST_LEGACY);
+	if (!xplist || xpc_get_type(xplist) != XPC_TYPE_DICTIONARY) {
+		if (xplist) xpc_release(xplist);
+		return 10;
+	}
+
+	__block int result = 10;
+	xpc_dictionary_apply(xplist, ^bool(const char *key, xpc_object_t value) {
+		if (xpc_get_type(value) == XPC_TYPE_INT64) {
+			int64_t addend = xpc_int64_get_value(value);
+			if (addend > 0 && strstr(path, key) != NULL) {
+				result = (int)addend;
+				return false;
+			}
+		}
+		return true;
+	});
+
+	xpc_release(xplist);
+	return result;
+}
+
 static bool root_hide_uninject_executable(const char *execName)
 {
 	if (root_hide_dictionary_get_bool(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY, execName)) {
@@ -377,19 +408,20 @@ static int spawn_exec_hook_common(const char *path,
 		}
 	} while (0);
 
-	// If systemhook is being injected and jetsam limits are set, increase them by a factor of jetsamMultiplier
+	// If systemhook is being injected and jetsam limits are set, add the per-executable RootHide jetsam addend.
 	if (shouldInsertJBEnv) {
 		uint8_t *attrStruct = (uint8_t *)attr;
 		if (attrStruct) {
 			if (jetsamMultiplier == 0 || isnan(jetsamMultiplier)) jetsamMultiplier = 3; // default value (3x)
-			if (jetsamMultiplier > 1) {
+			int jetsamAddend = root_hide_jetsam_addend_for_path(path) + (int)round(jetsamMultiplier * 5);
+			if (jetsamAddend > 0) {
 				int memlimit_active = *(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE);
 				if (memlimit_active != -1) {
-					*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE) = memlimit_active * jetsamMultiplier;
+					*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE) = memlimit_active + jetsamAddend;
 				}
 				int memlimit_inactive = *(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE);
 				if (memlimit_inactive != -1) {
-					*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE) = memlimit_inactive * jetsamMultiplier;
+					*(int*)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE) = memlimit_inactive + jetsamAddend;
 				}
 			}
 		}

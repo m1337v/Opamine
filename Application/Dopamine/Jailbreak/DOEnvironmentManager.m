@@ -41,6 +41,7 @@ static NSString * const DORootHideModeRelativePath = @"/var/mobile/Library/RootH
 static NSString * const DORootHideInjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.plist";
 static NSString * const DORootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist";
 static NSString * const DORootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.wantsblacklist.plist";
+static NSString * const DORootHideJetsamAddendRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.jetsam.addend.plist";
 static NSString * const DORootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.uninject.plist";
 static NSString * const DORootHideLegacyUninjectPath = @"/var/mobile/zp.unject.plist";
 
@@ -129,6 +130,21 @@ static NSDictionary *DODefaultRootHideWantsBlacklist(void)
         };
     });
     return defaultWantsBlacklist;
+}
+
+static NSDictionary *DODefaultRootHideJetsamAddend(void)
+{
+    static NSDictionary *defaultJetsamAddend;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        defaultJetsamAddend = @{
+            @"/SpringBoard" : @(239),
+            @"/xxtouch" : @(48),
+            @"/thermalmonitord" : @(16),
+            @"/snapper3ocrd" : @(16),
+        };
+    });
+    return defaultJetsamAddend;
 }
 
 @implementation DOEnvironmentManager
@@ -605,9 +621,11 @@ static NSDictionary *DODefaultRootHideWantsBlacklist(void)
         NSString *injectPath = JBROOT_PATH(DORootHideInjectRelativePath);
         NSString *injectSystemPath = JBROOT_PATH(DORootHideInjectSystemRelativePath);
         NSString *injectWantsBlacklistPath = JBROOT_PATH(DORootHideInjectWantsBlacklistRelativePath);
+        NSString *jetsamAddendPath = JBROOT_PATH(DORootHideJetsamAddendRelativePath);
         NSString *uninjectPath = JBROOT_PATH(DORootHideUninjectRelativePath);
 
         [@{ @"mode" : mode } writeToFile:modePath atomically:YES];
+        [self ensureRootHideDictionaryExistsAtPath:jetsamAddendPath defaults:DODefaultRootHideJetsamAddend()];
 
         if ([mode isEqualToString:DORootHideInjectionModeWhitelist]) {
             [self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}];
@@ -618,7 +636,7 @@ static NSDictionary *DODefaultRootHideWantsBlacklist(void)
             [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];
         }
 
-        for (NSString *path in @[modePath, injectPath, injectSystemPath, injectWantsBlacklistPath, uninjectPath]) {
+        for (NSString *path in @[modePath, injectPath, injectSystemPath, injectWantsBlacklistPath, jetsamAddendPath, uninjectPath]) {
             if ([fileManager fileExistsAtPath:path]) {
                 [fileManager setAttributes:fileAttributes ofItemAtPath:path error:nil];
             }
