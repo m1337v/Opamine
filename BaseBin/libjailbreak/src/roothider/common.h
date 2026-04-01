@@ -61,7 +61,7 @@ char* generate_sandbox_extensions(audit_token_t *processToken, bool writable);
 
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath);
 
-bool otherJailbreakActived();
+bool otherJailbreakActived(bool postexploit);
 
 void hideDeveloperMode();
 

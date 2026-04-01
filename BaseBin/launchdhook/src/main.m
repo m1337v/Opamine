@@ -61,13 +61,15 @@ void draw_boot_logo(const char *bootLogoPath)
 int (*sysctlbyname_orig)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) = NULL;
 int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
-/********************* roothide specific *************/
+/*********************** roothide specific ********************/
+#ifdef __arm64e__
 	if (!__builtin_available(iOS 16.0, *))
 	{
 		if (strcmp(name, "vm.shared_region_pivot") == 0) {
 			return 0;
 		}
 	}
+#endif
 /*************************************************************/
 
 

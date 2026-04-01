@@ -252,7 +252,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     return error;
 }
 
-/*
+#if 0
 - (BOOL)isPrivatePrebootMountedWritable
 {
     struct statfs ppStfs;
@@ -311,7 +311,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
         tmpPath = [tmpPath stringByDeletingLastPathComponent];
     }
 }
-*/
+#endif
 
 - (void)patchBasebinDaemonPlist:(NSString *)plistPath
 {
@@ -340,6 +340,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     }
 }
 
+#if 0
 - (NSString *)bootstrapVersion
 {
     uint64_t cfver = (((uint64_t)kCFCoreFoundationVersionNumber / 100) * 100);
@@ -374,7 +375,6 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     [_bootstrapDownloadTask resume];
 }*/
 
-/*
 - (void)extractBootstrap:(NSString *)path withCompletion:(void (^)(NSError *))completion
 {
     NSString *bootstrapTar = [@"/var/tmp" stringByAppendingPathComponent:@"bootstrap.tar"];
@@ -393,9 +393,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     [[NSData data] writeToFile:JBROOT_PATH(@"/.installed_dopamine") atomically:YES];
     completion(nil);
 }
-*/
 
-#if 0
 - (void)prepareBootstrapWithCompletion:(void (^)(NSError *))completion
 {
     [[DOUIManager sharedInstance] sendLog:@"Updating BaseBin" debug:NO];
@@ -647,7 +645,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     return [installedVersion numericalVersionRepresentation] < [bundledVersion numericalVersionRepresentation];
 }
 
-/*
+#if 0
 - (NSError *)finalizeBootstrap
 {
     // Initial setup on first jailbreak
@@ -715,7 +713,6 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     [[NSFileManager defaultManager] removeItemAtPath:@"/var/jb" error:nil];
     return error;
 }
-*/
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didWriteData:(int64_t)bytesWritten totalBytesWritten:(int64_t)totalBytesWritten totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite
 {
@@ -736,6 +733,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 {
     _downloadCompletionBlock(location, nil);
 }
+#endif
 
 @end
 
@@ -751,8 +749,6 @@ NSString* find_jbroot(BOOL force);
 NSString* jbrootPrefix(NSString *path);
 NSString* rootfsPrefix(NSString* path);
 ///////////////////////////////////////////////////////
-
-@implementation DOBootstrapper(roothide)
 
 uint64_t jbrand_new()
 {
@@ -917,12 +913,23 @@ deb https://roothide.github.io/procursus iphoneos-arm64e/%d main\n\
 
 int getCFMajorVersion(void)
 {
+    if(@available(iOS 16.0, *)) {
+        return 1900;
+    }
+    
     return ((int)kCFCoreFoundationVersionNumber / 100) * 100;
 }
 /////////////////////////////////////////////////////////////////////
 
+@implementation DOBootstrapper(roothide)
+
 #define STRAPLOG(...)   [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@__VA_ARGS__] debug:YES];
 #define ASSERT(...)     do{if(!(__VA_ARGS__)) {completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"ABORT: %s (%d): %s", __FILE_NAME__, __LINE__, #__VA_ARGS__]}]);return -1;}} while(0)
+
+- (NSString *)bootstrapVersion
+{
+    return [NSString stringWithFormat:@"%d", getCFMajorVersion()];
+}
 
 -(int) buildPackageSources:(void (^)(NSError *))completion
 {
@@ -1225,7 +1232,12 @@ int getCFMajorVersion(void)
     const char* jbpath = jbrootPrefix(path).fileSystemRepresentation;
     
     struct stat st={0};
-    assert(lstat(jbpath, &st) == 0);
+    int r = lstat(jbpath, &st);
+    if(r != 0) {
+        assert(errno != 0);
+        return errno;
+    }
+    
     if (!S_ISLNK(st.st_mode)) {
         return 0;
     }
@@ -1279,8 +1291,16 @@ int getCFMajorVersion(void)
     else
     {
         [[DOUIManager sharedInstance] sendLog:@"Updating Symlinks" debug:NO];
-        [self fixBootstrapSymlink:@"/bin/sh"];
-        [self fixBootstrapSymlink:@"/usr/bin/sh"];
+
+        NSArray* bootstrapSymlinks = @[@"/bin/sh", @"/usr/bin/sh"];
+        for(NSString* slink in bootstrapSymlinks)
+        {
+            int r = [self fixBootstrapSymlink:slink];
+            if(r != 0) {
+                return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"fixBootstrapSymlink(%@) returned %d\n", slink, r]}];
+            }
+        }
+        
         int r = exec_cmd_trusted(JBROOT_PATH("/bin/sh"), "/usr/libexec/updatelinks.sh", NULL);
         if (r != 0) {
             return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"updatelinks.sh returned %d\n", r]}];
