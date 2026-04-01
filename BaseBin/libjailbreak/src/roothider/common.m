@@ -10,6 +10,7 @@
 #include <xpc/xpc.h>
 #include <sys/proc.h>
 #include <sys/mount.h>
+#include <mach-o/dyld.h>
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
 
@@ -181,9 +182,18 @@ bool process_force_dyld_patch(const char* path, const char** argv)
         if(string_has_suffix(path, "/System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.xpc/com.apple.WebKit.WebContent")) {
             return true;
         }
-        else if(strcmp(path, "/usr/libexec/xpcproxy")==0) {
-            if (argv && argv[0] && argv[1] && string_has_prefix(argv[1], "com.apple.WebKit.WebContent")) {
-                return true;
+        else if(string_has_suffix(path, "/System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.CaptivePortal.xpc/com.apple.WebKit.WebContent.CaptivePortal")) {
+            return true;
+        }
+        else if(strcmp(path, "/usr/libexec/xpcproxy")==0)
+        {
+            if (argv && argv[0] && argv[1]) {
+                if(string_has_prefix(argv[1], "com.apple.WebKit.WebContent")) {
+                    return true;
+                }
+                else if(string_has_prefix(argv[1], "com.apple.WebKit.WebContent.CaptivePortal")) {
+                    return true;
+                }
             }
         }
     }
@@ -582,57 +592,67 @@ int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
 
 kern_return_t bootstrap_look_up(mach_port_t port, const char *service, mach_port_t *server_port);
 
-bool otherJailbreakActived()
+bool otherJailbreakActived(bool postexploit)
 {
-    if(jbclient_roothide_jailbroken())
+    if(!postexploit)
     {
-        return false;
+        // // may be palehide
+        // uint32_t csflags = 0;
+        // csops(getpid(), CS_OPS_STATUS, &csflags, sizeof(csflags));
+        // if((csflags & CS_PLATFORM_BINARY) != 0) {
+        //     if(!builtint_palehide_test()) {
+        //         return true; // rootless dopamine 2.x
+        //     }
+        // }
     }
 
-    // // may be palehide
-    // uint32_t csFlags = 0;
-    // csops(getpid(), CS_OPS_STATUS, &csFlags, sizeof(csFlags));
-    // if(csFlags & CS_PLATFORM_BINARY)
-    // {
-    //     if(!builtint_palehide_test()) {
-    //         return true;
-    //     }
-    // }
+    if(!jbclient_roothide_jailbroken())
+    {
+        // it works even rootless dopamine 2.x is hidden
+        const char* rootpath = jbclient_get_jbroot();
+        if(rootpath && strlen(rootpath) > 0) {
+            return true; // rootless dopamine 2.x
+        }
+    }
 
-	char pathbuf[PATH_MAX] = {0};
-	int ret = proc_pidpath(1, pathbuf, sizeof(pathbuf));
-	if(ret <= 0) {
-		JBLogError("proc_pidpath failed for pid 1: %d", ret);
-		return true;
-	}
+    struct statfs fs = {0};
+    int sfsret = statfs("/usr/lib", &fs);
+    // not work when rootless dopamine 2.x is hidden
+    if (sfsret==0 && strcmp(fs.f_mntonname, "/usr/lib")==0) {
+        return true; // rootless dopamine
+    }
 
-	if(strcmp(pathbuf, "/sbin/launchd") != 0) {
-		return true;
-	}
+    if(access("/dev/md0", F_OK)==0) {
+        return true; // rootless palera1n
+    }
 
+    if(access("/dev/rmd0", F_OK)==0) {
+        return true; // rootless palera1n
+    }
+
+    // not work in sandbox
+    char pathbuf[PATH_MAX] = {0};
+    int ret = proc_pidpath(1, pathbuf, sizeof(pathbuf));
+    if(ret > 0) {
+        if(strcmp(pathbuf, "/sbin/launchd") != 0) {
+            return true; // roothide Bootstrap or NathanLR
+        }
+    } else {
+        JBLogError("proc_pidpath failed for pid 1: %d", ret);
+        assert(!postexploit);
+        // return true;
+    }
+
+    // not work in sandbox
     mach_port_t port = MACH_PORT_NULL;
     kern_return_t kr = bootstrap_look_up(bootstrap_port, "com.opa334.jailbreakd", &port);
     if(kr == KERN_SUCCESS) {
         return true; // roothide dopamine 1.x
     }
 
-    const char* rootpath = jbclient_get_jbroot();
-    if(rootpath && strlen(rootpath) > 0) {
-        return true;
-    }
-
-    if(access("/dev/md0", F_OK)==0) {
-        return true;
-    }
-
-    if(access("/dev/rmd0", F_OK)==0) {
-        return true;
-    }
-
-    struct statfs fs;
-    int sfsret = statfs("/usr/lib", &fs);
-    if (sfsret == 0) {
-        if(strcmp(fs.f_mntonname, "/usr/lib")==0) {
+    // detect roothide dopamine 1.x in sandbox
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if(strncmp(_dyld_get_image_name(i), "/usr/lib/systemhook-", sizeof("/usr/lib/systemhook-")-1) == 0) {
             return true;
         }
     }

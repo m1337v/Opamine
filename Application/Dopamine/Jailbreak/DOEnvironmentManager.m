@@ -6,22 +6,28 @@
 //
 
 #import "DOEnvironmentManager.h"
+#import "UIImage+JPEG2000.h"
 
 #import <sys/sysctl.h>
 #import <sys/mount.h>
+#import <sys/utsname.h>
 #import <sys/stat.h>
+#import <unistd.h>
 #import <mach-o/dyld.h>
 #import <libgrabkernel2/libgrabkernel2.h>
 #import <libjailbreak/info.h>
 #import <libjailbreak/codesign.h>
 #import <libjailbreak/util.h>
+#import <libjailbreak/display.h>
 #import <libjailbreak/machine_info.h>
 #import <libjailbreak/carboncopy.h>
 
 #import <IOKit/IOKitLib.h>
 #import "DOUIManager.h"
 #import "DOExploitManager.h"
+#import "DOPreferenceManager.h"
 #import "NSData+Hex.h"
+#import <LocalAuthentication/LocalAuthentication.h>
 
 int reboot3(uint64_t flags, ...);
 
@@ -208,7 +214,7 @@ int reboot3(uint64_t flags, ...);
         return @"iOS 15.0 - 16.5.1 (arm64e)";
     }
     else {
-        return @"iOS 15.0 - 16.6.1 (arm64)";
+        return @"iOS 15.0 - 15.8.6 / 16.0 - 16.6.1 (arm64)";
     }
 }
 
@@ -637,6 +643,30 @@ int reboot3(uint64_t flags, ...);
     return false;
 }
 
+- (BOOL)deviceSupportsFaceID
+{
+    if (![LAContext class]) return NO;
+
+    LAContext *myContext = [[LAContext alloc] init];
+    NSError *authError = nil;
+    if (![myContext canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&authError]) {
+        NSLog(@"%@", [authError localizedDescription]);
+        return NO;
+    }
+
+    return myContext.biometryType == LABiometryTypeFaceID;
+}
+
+- (BOOL)deviceSupportsLandscapeBootLogo
+{
+    struct utsname u;
+    uname(&u);
+    const char *ipadString = "iPad";
+
+    bool isPad = strncmp(u.machine, ipadString, strlen(ipadString)) == 0;
+    return isPad && [self deviceSupportsFaceID];
+}
+
 - (NSError *)prepareBootstrap
 {
     __block NSError *errOut;
@@ -689,5 +719,37 @@ int reboot3(uint64_t flags, ...);
     return error;
 }
 
+- (NSError *)updateBootLogo
+{
+    const char *bootLogoPath = JBROOT_PATH("/basebin/bootlogo.jp2");
+    if ([[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"bootlogoEnabled" fallback:YES]) {
+        UIImage *bootLogoImage;
+
+        if ([[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"customBootlogoEnabled" fallback:NO]) {
+            bootLogoImage = [UIImage imageWithContentsOfFile:[DOUIManager sharedInstance].bootlogoPath];
+        }
+
+        if (!bootLogoImage) {
+            bootLogoImage = [[DOUIManager sharedInstance] renderBootLogo];
+        }
+
+        [self runAsRoot:^{
+            [self runUnsandboxed:^{
+                unlink(bootLogoPath);
+                [[bootLogoImage jp2DataWithCompressionQuality:0.9] writeToFile:[NSString stringWithUTF8String:bootLogoPath] atomically:NO];
+            }];
+        }];
+
+        return nil;
+    }
+    else {
+        [self runAsRoot:^{
+            [self runUnsandboxed:^{
+                unlink(bootLogoPath);
+            }];
+        }];
+        return nil;
+    }
+}
 
 @end

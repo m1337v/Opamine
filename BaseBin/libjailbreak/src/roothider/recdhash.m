@@ -14,7 +14,7 @@
 extern MachO* fat_find_preferred_slice(Fat* fat);
 
 extern CS_DecodedBlob *csd_superblob_find_best_code_directory(CS_DecodedSuperBlob *decodedSuperblob);
-extern bool csd_code_directory_calculate_page_hash(CS_DecodedBlob *codeDirBlob, MachO *macho, int slot, uint8_t *pageHashOut);
+extern bool code_directory_calculate_page_hash(CS_CodeDirectory *codeDir, MachO *macho, int slot, uint8_t *pageHashOut);
 
 /* 
 if here are any unclosed file descriptors before the Dopamine process ends, 
@@ -223,7 +223,7 @@ int ensure_randomized_cdhash_for_slice(const char* inputPath, uint64_t offset, v
 		CODE_DIRECTORY_APPLY_BYTE_ORDER(&codeDir, BIG_TO_HOST_APPLIER);
 
 		uint8_t pageHash[codeDir.hashSize];
-		if(!csd_code_directory_calculate_page_hash(bestCDBlob, macho, 0, pageHash)) {
+		if(!code_directory_calculate_page_hash(&codeDir, macho, 0, pageHash)) {
 			JBLogError("Error: failed to calculate page hash: %s\n", inputPath);
 			break;
 		}

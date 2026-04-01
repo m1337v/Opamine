@@ -28,6 +28,7 @@ int __sysctl_hook(int *name, u_int namelen, void *oldp, size_t *oldlenp, const v
 int __sysctlbyname(const char *name, size_t namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 int __sysctlbyname_hook(const char *name, size_t namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 
+/*
 int (*sysctlbyname_orig)(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
 int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
@@ -36,6 +37,7 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 	}
 	return sysctlbyname_orig(name, oldp, oldlenp, newp, newlen);
 }
+*/
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -148,7 +150,7 @@ void roothide_launchd_postinit(bool firstLoad)
 	else 
 	{
 		// iOS15 arm64e only
-		MSHookFunction(sysctlbyname, (void *)sysctlbyname_hook, (void **)&sysctlbyname_orig);
+		// MSHookFunction(sysctlbyname, (void *)sysctlbyname_hook, (void **)&sysctlbyname_orig);
 	}
 #endif
 
