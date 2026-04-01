@@ -136,17 +136,8 @@
 
 
 /********************************** roothide specific ************************************/
-        if(otherJailbreakActived()) {
+        if(otherJailbreakActived(false)) {
             UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Error") message:DOLocalizedString(@"Your device currently has another jailbreak activated, please reboot device.") preferredStyle:UIAlertControllerStyleAlert];
-            UIAlertAction *rebootAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                //exit(0);
-            }];
-            [alertController addAction:rebootAction];
-            [self presentViewController:alertController animated:YES completion:nil];
-            return;
-        }
-        if(![DOEnvironmentManager.sharedManager isInstalledThroughTrollStore]) {
-            UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Error") message:DOLocalizedString(@"Please install this app via trollstore.") preferredStyle:UIAlertControllerStyleAlert];
             UIAlertAction *rebootAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
                 //exit(0);
             }];

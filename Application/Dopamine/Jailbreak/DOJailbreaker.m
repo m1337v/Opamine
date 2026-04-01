@@ -286,6 +286,14 @@ sets[idx] = NULL;
     csops(getpid(), CS_OPS_STATUS, &csflags, sizeof(csflags));
     if (!(csflags & CS_PLATFORM_BINARY)) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedPlatformize userInfo:@{NSLocalizedDescriptionKey:@"Failed to get CS_PLATFORM_BINARY"}];
     
+/**************************** roothide specific ********************/
+    proc_csflags_set(proc, CS_INSTALLER);
+
+    if(otherJailbreakActived(true)) {
+        return [NSError errorWithDomain:@"RootHide" code:1 userInfo:@{NSLocalizedDescriptionKey:@"Your device currently has another jailbreak activated, please reboot device."}];
+    }
+/***********************************************************************/
+    
     return nil;
 }
 

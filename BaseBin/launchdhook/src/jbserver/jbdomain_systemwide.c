@@ -375,6 +375,10 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 
 		// platformize
 		proc_csflags_set(proc, CS_PLATFORM_BINARY);
+
+/********************* roothide specific ********************/
+		proc_csflags_set(proc, CS_INSTALLER);
+/*************************************************************/
 	}
 
 #ifdef __arm64e__
