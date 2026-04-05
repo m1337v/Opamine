@@ -205,6 +205,15 @@ bool should_enable_tweaks(void)
 		}
 	}
 
+	char *choicySkipTweakLoaderEnv = getenv("CHOICY_SKIP_TWEAKLOADER");
+	if (choicySkipTweakLoaderEnv) {
+		bool shouldSkipTweakLoader = !strcmp(choicySkipTweakLoaderEnv, "1");
+		unsetenv("CHOICY_SKIP_TWEAKLOADER");
+		if (shouldSkipTweakLoader) {
+			return false;
+		}
+	}
+
 
 /******************* roothide specific ***************/
 const char *safeModeValue = getenv("_SafeMode");
