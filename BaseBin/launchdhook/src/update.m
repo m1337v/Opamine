@@ -6,11 +6,29 @@
 #include <libjailbreak/basebin_gen.h>
 #include <xpc/xpc.h>
 #include <dlfcn.h>
+#include <CommonCrypto/CommonDigest.h>
 
 #import <Foundation/Foundation.h>
 
 //void abort_with_reason(uint32_t reason_namespace, uint64_t reason_code, const char *reason_string, uint64_t reason_flags);
 #define abort_with_reason(reason_namespace,reason_code,reason_string,reason_flags)  launchd_panic("%s",reason_string)
+
+static NSString *basebin_tar_md5(NSString *path)
+{
+	NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+	if (data.length == 0) {
+		return nil;
+	}
+
+	unsigned char digest[CC_MD5_DIGEST_LENGTH] = {0};
+	CC_MD5(data.bytes, (CC_LONG)data.length, digest);
+
+	NSMutableString *hash = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
+	for (NSUInteger i = 0; i < CC_MD5_DIGEST_LENGTH; i++) {
+		[hash appendFormat:@"%02x", digest[i]];
+	}
+	return hash;
+}
 
 int jbupdate_basebin(const char *basebinTarPath)
 {
@@ -19,6 +37,7 @@ int jbupdate_basebin(const char *basebinTarPath)
 		if (access(basebinTarPath, F_OK) != 0) return 1;
 
 		NSString *prevVersion = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil] ?: @"2.0";
+		NSString *basebinMD5 = basebin_tar_md5(@(basebinTarPath));
 
 		// Extract basebin tar
 		NSString *tmpExtractionPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
@@ -62,6 +81,9 @@ int jbupdate_basebin(const char *basebinTarPath)
 				[[NSFileManager defaultManager] removeItemAtPath:oldBasebinPath error:nil];
 			}
 			[[NSFileManager defaultManager] copyItemAtPath:newBasebinPath toPath:oldBasebinPath error:nil];
+		}
+		if (basebinMD5.length > 0) {
+			[basebinMD5 writeToFile:JBROOT_PATH(@"/basebin/.basebin_md5") atomically:YES encoding:NSUTF8StringEncoding error:nil];
 		}
 		[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
 

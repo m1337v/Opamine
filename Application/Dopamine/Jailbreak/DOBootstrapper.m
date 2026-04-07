@@ -495,6 +495,12 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
         completion(error);
         return;
     }
+    NSString *basebinMD5Path = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.md5"];
+    NSString *installedBasebinMD5Path = JBROOT_PATH(@"/basebin/.basebin_md5");
+    if ([[NSFileManager defaultManager] fileExistsAtPath:basebinMD5Path]) {
+        [[NSFileManager defaultManager] removeItemAtPath:installedBasebinMD5Path error:nil];
+        [[NSFileManager defaultManager] copyItemAtPath:basebinMD5Path toPath:installedBasebinMD5Path error:nil];
+    }
     [self patchBasebinDaemonPlists];
     [[NSFileManager defaultManager] removeItemAtPath:JBROOT_PATH(@"/basebin/basebin.tc") error:nil];
     
@@ -1217,6 +1223,12 @@ int getCFMajorVersion(void)
         if (error) {
             completion(error);
             return;
+        }
+        NSString *basebinMD5Path = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.md5"];
+        NSString *installedBasebinMD5Path = jbrootPrefix(@"/basebin/.basebin_md5");
+        if ([[NSFileManager defaultManager] fileExistsAtPath:basebinMD5Path]) {
+            [[NSFileManager defaultManager] removeItemAtPath:installedBasebinMD5Path error:nil];
+            [[NSFileManager defaultManager] copyItemAtPath:basebinMD5Path toPath:installedBasebinMD5Path error:nil];
         }
         [self patchBasebinDaemonPlists];
         [[NSFileManager defaultManager] removeItemAtPath:jbrootPrefix(@"/basebin/basebin.tc") error:nil];

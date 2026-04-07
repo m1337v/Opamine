@@ -1,3 +1,4 @@
+#include <bsm/audit.h>
 #import <Foundation/Foundation.h>
 #import <spawn.h>
 #include <roothide.h>

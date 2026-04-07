@@ -131,10 +131,20 @@
         [(UINavigationController*)(self.parentViewController) pushViewController:downloadVC animated:YES];
     }] chevron:NO];
  */
-    self.button = [DOActionMenuButton buttonWithAction:[UIAction actionWithTitle:DOLocalizedString(envUpdate ? @"Button_Reboot" : @"Button_Update") image:[UIImage systemImageNamed:(envUpdate ? @"arrow.clockwise.circle" : @"arrow.down") withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"update" handler:^(__kindof UIAction * _Nonnull action) {
+    self.button = [DOActionMenuButton buttonWithAction:[UIAction actionWithTitle:DOLocalizedString(envUpdate ? @"Button_Update_Environment" : @"Button_Update") image:[UIImage systemImageNamed:(envUpdate ? @"arrow.clockwise.circle" : @"arrow.down") withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"update" handler:^(__kindof UIAction * _Nonnull action) {
         if (envUpdate)
         {
-            [[DOEnvironmentManager sharedManager] reboot];
+            self.button.enabled = NO;
+            self.button.alpha = 0.5;
+            NSError *error = [[DOEnvironmentManager sharedManager] updateEnvironment];
+            if (error)
+            {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error Updating Basebin" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close") style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
+                self.button.enabled = YES;
+                self.button.alpha = 1.0;
+            }
         }
         else
         {

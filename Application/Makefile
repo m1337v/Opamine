@@ -2,7 +2,7 @@
 
 all: Dopamine.ipa
 
-Dopamine.ipa: build/Build/Products/Debug-iphoneos/Dopamine.app
+Dopamine.ipa: ../BaseBin/basebin.tar build/Build/Products/Debug-iphoneos/Dopamine.app
 	@echo Ad-Hoc signing Dopamine
 	xattr -rc build/Build/Products/Debug-iphoneos/Dopamine.app
 	ldid -SDopamine/Dopamine.entitlements build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine
@@ -16,15 +16,19 @@ Dopamine.ipa: build/Build/Products/Debug-iphoneos/Dopamine.app
 	cp Dopamine.ipa Dopamine.tipa
 
 ifeq ($(NIGHTLY), 1)
-build/Build/Products/Debug-iphoneos/Dopamine.app: FORCE
+build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar FORCE
 	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO GCC_PREPROCESSOR_DEFINITIONS='NIGHTLY=1 COMMIT_HASH=\"$(COMMIT_HASH)\"'
 else
-build/Build/Products/Debug-iphoneos/Dopamine.app: FORCE
+build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar FORCE
 	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO MARKETING_VERSION="$(shell cat ../BaseBin/_external/basebin/.version)"
 endif
 	touch build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine.roothide
+	cp -f ../BaseBin/basebin.tar build/Build/Products/Debug-iphoneos/Dopamine.app/basebin.tar
+	md5 -q ../BaseBin/basebin.tar > build/Build/Products/Debug-iphoneos/Dopamine.app/basebin.md5
+	cp -f ../BaseBin/.build/.build_id build/Build/Products/Debug-iphoneos/Dopamine.app/basebin-build-id.txt
 	cp -a Dopamine/Resources/*.deb build/Build/Products/Debug-iphoneos/Dopamine.app/
 # ifeq ($(PALEHIDE), 1)
+	find /var/folders -type d -path '*/C/clang/ModuleCache' -prune -exec rm -rf {} + 2>/dev/null || true
 	make -C Dopamine/Exploits/palera1n package
 	cp -a Dopamine/Exploits/palera1n/.framework build/Build/Products/Debug-iphoneos/Dopamine.app/Frameworks/palera1n.framework
 # endif

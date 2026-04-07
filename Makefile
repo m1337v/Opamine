@@ -4,9 +4,18 @@ ifeq ($(NIGHTLY), 1)
 export COMMIT_HASH = $(shell git rev-parse HEAD)
 endif
 
-all:
+all: tipa
+
+basebin:
 	@$(MAKE) -C BaseBin
+
+tipa: basebin
+	@$(MAKE) -C Application
+
+packages:
 	@$(MAKE) -C Packages
+
+full: basebin packages
 	@$(MAKE) -C Application
 
 clean:
@@ -24,4 +33,4 @@ update-basebin: all
 	scp -C ./BaseBin/basebin.tar "$(DEVICE):/var/mobile/Documents/basebin.tar"
 	ssh $(DEVICE) "/basebin/jbctl update basebin \$(jbroot)/var/mobile/Documents/basebin.tar"
 
-.PHONY: update clean
+.PHONY: all basebin tipa packages full update clean

@@ -28,26 +28,27 @@
 #import "DOPreferenceManager.h"
 #import "NSData+Hex.h"
 #import <LocalAuthentication/LocalAuthentication.h>
+#import <CommonCrypto/CommonDigest.h>
 
 int reboot3(uint64_t flags, ...);
 
 NSString * const DORootHideInjectionModeStock = @"stock";
 NSString * const DORootHideInjectionModeBlacklist = @"blacklist";
 NSString * const DORootHideInjectionModeWhitelist = @"whitelist";
+NSString * const DORootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
 
 static NSString * const DOTweakInjectionModePreferenceKey = @"tweakInjectionMode";
 static NSString * const DORootHideDirectoryRelativePath = @"/var/mobile/Library/RootHide";
-static NSString * const DORootHideModeRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist";
-static NSString * const DORootHideInjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.plist";
-static NSString * const DORootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist";
-static NSString * const DORootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.wantsblacklist.plist";
-static NSString * const DORootHideJetsamAddendRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.jetsam.addend.plist";
-static NSString * const DORootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.uninject.plist";
-static NSString * const DORootHideLegacyUninjectPath = @"/var/mobile/zp.unject.plist";
+static NSString * const DORootHideModeRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist";
+static NSString * const DORootHideInjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.plist";
+static NSString * const DORootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.system.plist";
+static NSString * const DORootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.wantsblacklist.plist";
+static NSString * const DORootHideJetsamAddendRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.jetsam.addend.plist";
+static NSString * const DORootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.uninject.plist";
 
 static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
 {
-    if ([mode isEqualToString:DORootHideInjectionModeBlacklist] || [mode isEqualToString:DORootHideInjectionModeWhitelist]) {
+    if ([mode isEqualToString:DORootHideInjectionModeBlacklist] || [mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist]) {
         return mode;
     }
     if ([mode isEqualToString:DORootHideInjectionModeStock]) {
@@ -62,9 +63,6 @@ static NSArray<NSString *> *DORootHideCandidatePaths(NSString *relativePath)
     NSString *jbrootPath = JBROOT_PATH(relativePath);
     if (jbrootPath.length > 0) {
         [paths addObject:jbrootPath];
-    }
-    if (![paths containsObject:relativePath]) {
-        [paths addObject:relativePath];
     }
     return paths;
 }
@@ -89,6 +87,23 @@ static BOOL DORootHidePathExistsAtCandidatePaths(NSString *relativePath)
         }
     }
     return NO;
+}
+
+static NSString *DOFileMD5AtPath(NSString *path)
+{
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+    if (data.length == 0) {
+        return nil;
+    }
+
+    unsigned char digest[CC_MD5_DIGEST_LENGTH] = {0};
+    CC_MD5(data.bytes, (CC_LONG)data.length, digest);
+
+    NSMutableString *hash = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
+    for (NSUInteger i = 0; i < CC_MD5_DIGEST_LENGTH; i++) {
+        [hash appendFormat:@"%02x", digest[i]];
+    }
+    return hash;
 }
 
 static NSDictionary *DODefaultRootHideSystemInjection(void)
@@ -376,6 +391,51 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     return [[version componentsSeparatedByString:@"."] lastObject];
 }
 
+- (NSString *)jailbrokenBasebinMD5
+{
+    if (!self.isJailbroken) return nil;
+
+    __block NSString *md5;
+    [self runAsRoot:^{
+        [self runUnsandboxed:^{
+            md5 = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.basebin_md5") encoding:NSUTF8StringEncoding error:nil];
+        }];
+    }];
+    return [md5 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (NSString *)launchedBasebinMD5
+{
+    NSString *md5Path = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.md5"];
+    NSString *md5 = [NSString stringWithContentsOfFile:md5Path encoding:NSUTF8StringEncoding error:nil];
+    if (md5.length > 0) {
+        return [md5 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+
+    NSString *basebinTarPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.tar"];
+    return DOFileMD5AtPath(basebinTarPath);
+}
+
+- (NSString *)jailbrokenBuildID
+{
+    if (!self.isJailbroken) return nil;
+
+    __block NSString *buildID;
+    [self runAsRoot:^{
+        [self runUnsandboxed:^{
+            buildID = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.build_id") encoding:NSUTF8StringEncoding error:nil];
+        }];
+    }];
+    return [buildID stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (NSString *)launchedBuildID
+{
+    NSString *buildIDPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin-build-id.txt"];
+    NSString *buildID = [NSString stringWithContentsOfFile:buildIDPath encoding:NSUTF8StringEncoding error:nil];
+    return [buildID stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
 - (BOOL)isBootstrapped
 {
     return (BOOL)jbinfo(rootPath);
@@ -570,12 +630,12 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         return configuredMode;
     }
 
-    if (DORootHidePathExistsAtCandidatePaths(DORootHideInjectRelativePath)) {
-        return DORootHideInjectionModeWhitelist;
+    if (DORootHidePathExistsAtCandidatePaths(DORootHideUninjectRelativePath)) {
+        return DORootHideInjectionModeBlacklist;
     }
 
-    if (DORootHidePathExistsAtCandidatePaths(DORootHideUninjectRelativePath) || [[NSFileManager defaultManager] fileExistsAtPath:DORootHideLegacyUninjectPath]) {
-        return DORootHideInjectionModeBlacklist;
+    if (DORootHidePathExistsAtCandidatePaths(DORootHideInjectRelativePath)) {
+        return DORootHideInjectionModeWhitelist;
     }
 
     NSString *preferredMode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]);
@@ -627,10 +687,13 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         [@{ @"mode" : mode } writeToFile:modePath atomically:YES];
         [self ensureRootHideDictionaryExistsAtPath:jetsamAddendPath defaults:DODefaultRootHideJetsamAddend()];
 
-        if ([mode isEqualToString:DORootHideInjectionModeWhitelist]) {
+        if ([mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist]) {
             [self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}];
             [self ensureRootHideDictionaryExistsAtPath:injectSystemPath defaults:DODefaultRootHideSystemInjection()];
             [self ensureRootHideDictionaryExistsAtPath:injectWantsBlacklistPath defaults:DODefaultRootHideWantsBlacklist()];
+            if ([mode isEqualToString:DORootHideInjectionModeHiddenWhitelist]) {
+                [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];
+            }
         }
         else if ([mode isEqualToString:DORootHideInjectionModeBlacklist]) {
             [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];

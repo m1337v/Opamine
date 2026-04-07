@@ -1,24 +1,24 @@
 #import <Foundation/Foundation.h>
-
+#import <os/log.h>
+#include <stdarg.h>
 #include "../libjailbreak.h"
 #include "common.h"
 
 static NSString * const kRootHideInjectionModeStock = @"stock";
 static NSString * const kRootHideInjectionModeBlacklist = @"blacklist";
 static NSString * const kRootHideInjectionModeWhitelist = @"whitelist";
-static NSString * const kRootHideModeRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist";
-static NSString * const kRootHideInjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.plist";
-static NSString * const kRootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist";
-static NSString * const kRootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.inject.wantsblacklist.plist";
-static NSString * const kRootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/cn.zqbb.uninject.plist";
-static NSString * const kRootHideLegacyUninjectPath = @"/var/mobile/zp.unject.plist";
-
+static NSString * const kRootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
+static NSString * const kRootHideModeRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist";
+static NSString * const kRootHideInjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.plist";
+static NSString * const kRootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.system.plist";
+static NSString * const kRootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.wantsblacklist.plist";
+static NSString * const kRootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.uninject.plist";
 #define APP_PATH_PREFIX "/private/var/containers/Bundle/Application/"
 #define NULL_UUID "00000000-0000-0000-0000-000000000000"
 
 static NSString *normalizedRootHideInjectionMode(NSString *mode)
 {
-    if ([mode isEqualToString:kRootHideInjectionModeBlacklist] || [mode isEqualToString:kRootHideInjectionModeWhitelist]) {
+    if ([mode isEqualToString:kRootHideInjectionModeBlacklist] || [mode isEqualToString:kRootHideInjectionModeWhitelist] || [mode isEqualToString:kRootHideInjectionModeHiddenWhitelist]) {
         return mode;
     }
     if ([mode isEqualToString:kRootHideInjectionModeStock]) {
@@ -27,15 +27,30 @@ static NSString *normalizedRootHideInjectionMode(NSString *mode)
     return nil;
 }
 
+static void RootHideTraceLog(NSString *format, ...)
+{
+    (void)format;
+}
+
+static BOOL RootHideShouldTracePath(const char *path)
+{
+    if (!path) {
+        return NO;
+    }
+
+    return strstr(path, ".app/") != NULL
+        || strstr(path, ".appex/") != NULL
+        || strstr(path, "/PlugIns/") != NULL
+        || strstr(path, "/Extensions/") != NULL
+        || strcmp(path, "/usr/libexec/xpcproxy") == 0;
+}
+
 static NSArray<NSString *> *rootHideCandidatePaths(NSString *relativePath)
 {
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
     NSString *jbrootPath = JBROOT_PATH(relativePath);
     if (jbrootPath.length > 0) {
         [paths addObject:jbrootPath];
-    }
-    if (![paths containsObject:relativePath]) {
-        [paths addObject:relativePath];
     }
     return paths;
 }
@@ -67,17 +82,21 @@ static NSString *rootHideInjectionMode(void)
     NSDictionary *modeConfiguration = rootHideDictionaryAtCandidatePaths(kRootHideModeRelativePath);
     NSString *configuredMode = normalizedRootHideInjectionMode(modeConfiguration[@"mode"]);
     if (configuredMode) {
+        RootHideTraceLog(@"mode resolved=%@ source=plist", configuredMode);
         return configuredMode;
     }
 
-    if (rootHidePathExistsAtCandidatePaths(kRootHideInjectRelativePath)) {
-        return kRootHideInjectionModeWhitelist;
-    }
-
-    if (rootHidePathExistsAtCandidatePaths(kRootHideUninjectRelativePath) || [[NSFileManager defaultManager] fileExistsAtPath:kRootHideLegacyUninjectPath]) {
+    if (rootHidePathExistsAtCandidatePaths(kRootHideUninjectRelativePath)) {
+        RootHideTraceLog(@"mode resolved=blacklist source=uninject-exists");
         return kRootHideInjectionModeBlacklist;
     }
 
+    if (rootHidePathExistsAtCandidatePaths(kRootHideInjectRelativePath)) {
+        RootHideTraceLog(@"mode resolved=whitelist source=inject-exists");
+        return kRootHideInjectionModeWhitelist;
+    }
+
+    RootHideTraceLog(@"mode resolved=stock source=default");
     return kRootHideInjectionModeStock;
 }
 
@@ -160,18 +179,31 @@ bool isBlacklistedApp(const char* identifier)
 {
     if(!identifier) return false;
 
-    if([builtinApps containsObject:@(identifier)]) return false;
+    if([builtinApps containsObject:@(identifier)]) {
+        RootHideTraceLog(@"blacklist app identifier=%s result=0 reason=builtin", identifier);
+        return false;
+    }
 
     NSString* configFilePath = JBROOT_PATH(@"/var/mobile/Library/RootHide/RootHideConfig.plist");
     NSDictionary* roothideConfig = [NSDictionary dictionaryWithContentsOfFile:configFilePath];
-    if(!roothideConfig) return false;
+    if(!roothideConfig) {
+        RootHideTraceLog(@"blacklist app identifier=%s result=0 reason=no-config path=%@", identifier, configFilePath);
+        return false;
+    }
 
     NSDictionary* appconfig = roothideConfig[@"appconfig"];
-    if(!appconfig) return false;
+    if(!appconfig) {
+        RootHideTraceLog(@"blacklist app identifier=%s result=0 reason=no-appconfig", identifier);
+        return false;
+    }
 
     NSNumber* blacklisted = appconfig[@(identifier)];
-    if(!blacklisted) return false;
+    if(!blacklisted) {
+        RootHideTraceLog(@"blacklist app identifier=%s result=0 reason=no-entry", identifier);
+        return false;
+    }
 
+    RootHideTraceLog(@"blacklist app identifier=%s result=%d", identifier, blacklisted.boolValue);
     return blacklisted.boolValue;
 }
 
@@ -195,25 +227,61 @@ static bool isBlacklistedExec(const char *path)
     exec++;
 
     if (isWantsBlacklist([NSString stringWithUTF8String:exec]) && isBlacklistedPathOrig(path)) {
+        if (RootHideShouldTracePath(path)) {
+            RootHideTraceLog(@"blacklist exec path=%s exec=%s result=1 reason=wantsblacklist", path, exec);
+        }
         return true;
     }
 
     if (rootHideDictionaryHasEnabledKey(kRootHideInjectRelativePath, @(exec))) {
+        if (RootHideShouldTracePath(path)) {
+            RootHideTraceLog(@"blacklist exec path=%s exec=%s result=0 reason=allowlisted", path, exec);
+        }
         return false;
     }
 
+    if (RootHideShouldTracePath(path)) {
+        RootHideTraceLog(@"blacklist exec path=%s exec=%s result=1 reason=default", path, exec);
+    }
     return true;
 }
 
 bool isBlacklistedPath(const char* path)
 {
-    if(!path) return false;
+	if(!path) return false;
 
-    if ([rootHideInjectionMode() isEqualToString:kRootHideInjectionModeWhitelist]) {
-        if (!strcmp(path, "/sbin/launchd")) return false;
-        if (rootHideDictionaryContainsEnabledSubstring(kRootHideInjectSystemRelativePath, path)) return false;
-        return isBlacklistedExec(path);
+    NSString *mode = rootHideInjectionMode();
+    if ([mode isEqualToString:kRootHideInjectionModeHiddenWhitelist]) {
+        // Hidden whitelist keeps the classic RootHide hidden-app semantics.
+        // Injection is separately gated by the executable allowlist at spawn time.
+        bool result = isBlacklistedPathOrig(path);
+        if (RootHideShouldTracePath(path)) {
+            RootHideTraceLog(@"blacklist path=%s mode=%@ result=%d reason=hiddenwhitelist-orig", path, mode, result);
+        }
+        return result;
     }
 
-    return isBlacklistedPathOrig(path);
+    if ([mode isEqualToString:kRootHideInjectionModeWhitelist]) {
+        if (!strcmp(path, "/sbin/launchd")) {
+            RootHideTraceLog(@"blacklist path=%s mode=%@ result=0 reason=launchd", path, mode);
+            return false;
+        }
+        if (rootHideDictionaryContainsEnabledSubstring(kRootHideInjectSystemRelativePath, path)) {
+            if (RootHideShouldTracePath(path)) {
+                RootHideTraceLog(@"blacklist path=%s mode=%@ result=0 reason=system-allowlist", path, mode);
+            }
+            return false;
+        }
+        bool result = isBlacklistedExec(path);
+        if (RootHideShouldTracePath(path)) {
+            RootHideTraceLog(@"blacklist path=%s mode=%@ result=%d reason=whitelist-exec", path, mode, result);
+        }
+        return result;
+    }
+
+    bool result = isBlacklistedPathOrig(path);
+    if (RootHideShouldTracePath(path)) {
+        RootHideTraceLog(@"blacklist path=%s mode=%@ result=%d reason=orig", path, mode, result);
+    }
+    return result;
 }

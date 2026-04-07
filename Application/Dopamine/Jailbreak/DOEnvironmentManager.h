@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 FOUNDATION_EXPORT NSString * const DORootHideInjectionModeStock;
 FOUNDATION_EXPORT NSString * const DORootHideInjectionModeBlacklist;
 FOUNDATION_EXPORT NSString * const DORootHideInjectionModeWhitelist;
+FOUNDATION_EXPORT NSString * const DORootHideInjectionModeHiddenWhitelist;
 
 @interface DOEnvironmentManager : NSObject
 {
@@ -32,6 +33,10 @@ FOUNDATION_EXPORT NSString * const DORootHideInjectionModeWhitelist;
 - (BOOL)isJailbroken;
 - (BOOL)isBootstrapped;
 - (NSString *)jailbrokenVersion;
+- (NSString *)jailbrokenBasebinMD5;
+- (NSString *)launchedBasebinMD5;
+- (NSString *)jailbrokenBuildID;
+- (NSString *)launchedBuildID;
 
 - (BOOL)isSupported;
 - (BOOL)isArm64e;

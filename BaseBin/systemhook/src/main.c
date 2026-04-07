@@ -18,10 +18,74 @@
 #include "private.h"
 
 bool gFullyDebugged = false;
+static bool gHiddenInjection = false;
+static bool gHiddenTweakLoading = false;
+static void *gHiddenTweakLoaderHandle = NULL;
 static void *gLibSandboxHandle;
 char *JB_BootUUID = NULL;
 char *JB_RootPath = NULL;
 char *get_jbroot(void) { return JB_RootPath; }
+
+static bool hidden_injection_should_bridge_children(void)
+{
+	if (!gHiddenInjection) {
+		return false;
+	}
+
+	const char *progname = getprogname();
+	return progname && !strcmp(progname, "xpcproxy");
+}
+
+static bool hidden_tweak_loading_should_apply_runtime_patch(void)
+{
+	if (!gHiddenInjection || !gHiddenTweakLoading) {
+		return false;
+	}
+
+	const char *progname = getprogname();
+	return !(progname && !strcmp(progname, "xpcproxy"));
+}
+
+static void sanitize_dyld_insert_libraries_env(void)
+{
+	const char *dyldInsertLibraries = getenv("DYLD_INSERT_LIBRARIES");
+	if (!dyldInsertLibraries || !HOOK_DYLIB_PATH || HOOK_DYLIB_PATH[0] == '\0') {
+		return;
+	}
+
+	if (!strstr(dyldInsertLibraries, HOOK_DYLIB_PATH)) {
+		return;
+	}
+
+	size_t bufferSize = strlen(dyldInsertLibraries) + 1;
+	char *sanitizedInsertLibraries = calloc(1, bufferSize);
+	if (!sanitizedInsertLibraries) {
+		return;
+	}
+
+	__block bool first = true;
+	string_enumerate_components(dyldInsertLibraries, ":", ^(const char *component, bool *stop) {
+		(void)stop;
+		if (!component || component[0] == '\0' || !strcmp(component, HOOK_DYLIB_PATH)) {
+			return;
+		}
+
+		if (!first) {
+			strlcat(sanitizedInsertLibraries, ":", bufferSize);
+		}
+		strlcat(sanitizedInsertLibraries, component, bufferSize);
+		first = false;
+	});
+
+	if (sanitizedInsertLibraries[0] == '\0') {
+		unsetenv("DYLD_INSERT_LIBRARIES");
+	}
+	else {
+		setenv("DYLD_INSERT_LIBRARIES", sanitizedInsertLibraries, 1);
+	}
+
+	free(sanitizedInsertLibraries);
+}
 
 static char gExecutablePath[PATH_MAX];
 static int load_executable_path(void)
@@ -95,6 +159,15 @@ void *dyld_dlsym_hook(void *dyld, void *handle, const char *name)
 		// Because we can just return a different pointer, we avoid doing instruction replacements
 		return sandbox_apply_hook;
 	}
+
+	// NOTE: dlsym remap for hidden injection is handled at the GOT level
+	// by h_dlsym in hidden_dylib_hider.c, which correctly differentiates
+	// between app callers (remapped) and hidden callers like tweaks/ellekit
+	// (pass-through to real pointers).  Do NOT add a remap here — this
+	// vtable hook intercepts ALL callers unconditionally, which would break
+	// tweak loading by giving ellekit/TweakLoader our hooked pointers
+	// instead of the real DSC ones they need for trampoline setup.
+
 	__attribute__((musttail)) return dyld_dlsym_orig(dyld, handle, name);
 }
 
@@ -168,6 +241,11 @@ int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
 			if (pid == getpid() && gFullyDebugged) {
 				*csflag |= CS_DEBUGGED;
 			}
+			// For hidden injection: strip debug entitlement flag and ensure
+			// enforcement flags match stock App Store profile.
+			if (pid == getpid() && gHiddenInjection) {
+				*csflag &= ~CS_GET_TASK_ALLOW;
+			}
 		}
 	}
 	return rv;
@@ -185,6 +263,9 @@ int csops_audittoken_hook(pid_t pid, unsigned int ops, void *useraddr, size_t us
 			if (pid == getpid() && gFullyDebugged) {
 				*csflag |= CS_DEBUGGED;
 			}
+			if (pid == getpid() && gHiddenInjection) {
+				*csflag &= ~CS_GET_TASK_ALLOW;
+			}
 		}
 	}
 	return rv;
@@ -194,6 +275,18 @@ int csops_audittoken_hook(pid_t pid, unsigned int ops, void *useraddr, size_t us
 
 bool should_enable_tweaks(void)
 {
+	if (gHiddenInjection && string_has_suffix(gExecutablePath, "/usr/libexec/xpcproxy")) {
+		root_hide_hidden_whitelist_log("skip tweaks for xpcproxy executable=%s", gExecutablePath);
+		return false;
+	}
+
+	if (gHiddenInjection && !gHiddenTweakLoading) {
+		// Hidden whitelist keeps daemon-side blacklist hiding but should not load
+		// TweakLoader unless an explicit hidden-tweaks policy is added later.
+		root_hide_hidden_whitelist_log("skip tweaks hidden-mode without hidden tweak loading executable=%s", gExecutablePath);
+		return false;
+	}
+
 	if (access(JBROOT_PATH("/basebin/.safe_mode"), F_OK) == 0) {
 		return false;
 	}
@@ -201,6 +294,7 @@ bool should_enable_tweaks(void)
 	char *tweaksDisabledEnv = getenv("DISABLE_TWEAKS");
 	if (tweaksDisabledEnv) {
 		if (!strcmp(tweaksDisabledEnv, "1")) {
+			root_hide_hidden_whitelist_log("skip tweaks DISABLE_TWEAKS=1 executable=%s", gExecutablePath);
 			return false;
 		}
 	}
@@ -210,6 +304,7 @@ bool should_enable_tweaks(void)
 		bool shouldSkipTweakLoader = !strcmp(choicySkipTweakLoaderEnv, "1");
 		unsetenv("CHOICY_SKIP_TWEAKLOADER");
 		if (shouldSkipTweakLoader) {
+			root_hide_hidden_whitelist_log("skip tweaks CHOICY_SKIP_TWEAKLOADER=1 executable=%s", gExecutablePath);
 			return false;
 		}
 	}
@@ -219,12 +314,14 @@ bool should_enable_tweaks(void)
 const char *safeModeValue = getenv("_SafeMode");
 if (safeModeValue) {
 	if (!strcmp(safeModeValue, "1")) {
+		root_hide_hidden_whitelist_log("skip tweaks _SafeMode=1 executable=%s", gExecutablePath);
 		return false;
 	}
 }
 const char *msSafeModeValue = getenv("_MSSafeMode");
 if (msSafeModeValue) {
 	if (!strcmp(msSafeModeValue, "1")) {
+		root_hide_hidden_whitelist_log("skip tweaks _MSSafeMode=1 executable=%s", gExecutablePath);
 		return false;
 	}
 }
@@ -239,7 +336,10 @@ if (msSafeModeValue) {
 		"Dopamine.app/Dopamine",
 	};
 	for (size_t i = 0; i < sizeof(tweaksDisabledPathSuffixes) / sizeof(const char*); i++) {
-		if (string_has_suffix(gExecutablePath, tweaksDisabledPathSuffixes[i])) return false;
+		if (string_has_suffix(gExecutablePath, tweaksDisabledPathSuffixes[i])) {
+			root_hide_hidden_whitelist_log("skip tweaks disabled path suffix=%s executable=%s", tweaksDisabledPathSuffixes[i], gExecutablePath);
+			return false;
+		}
 	}
 
 	if (__builtin_available(iOS 16.0, *)) {
@@ -250,7 +350,10 @@ if (msSafeModeValue) {
 			"/usr/libexec/usermanagerd",
 		};
 		for (size_t i = 0; i < sizeof(iOS16TweaksDisabledPaths) / sizeof(const char*); i++) {
-			if (!strcmp(gExecutablePath, iOS16TweaksDisabledPaths[i])) return false;
+			if (!strcmp(gExecutablePath, iOS16TweaksDisabledPaths[i])) {
+				root_hide_hidden_whitelist_log("skip tweaks iOS16 disabled path=%s", gExecutablePath);
+				return false;
+			}
 		}
 	}
 
@@ -317,68 +420,149 @@ int parse_dyldhook_jbinfo(char **jbRootPathOut, char **bootUUIDOut, char **sandb
 	return 0;
 }
 
+static bool consume_hidden_injection_env(void)
+{
+	char *hiddenInjectionEnv = getenv("ROOTHIDE_HIDDEN_INJECTION");
+	if (!hiddenInjectionEnv) {
+		return false;
+	}
+
+	bool enabled = !strcmp(hiddenInjectionEnv, "1");
+	unsetenv("ROOTHIDE_HIDDEN_INJECTION");
+	return enabled;
+}
+
+static bool consume_hidden_tweak_loading_env(void)
+{
+	char *hiddenTweakLoadingEnv = getenv("ROOTHIDE_ENABLE_HIDDEN_TWEAKS");
+	if (!hiddenTweakLoadingEnv) {
+		return false;
+	}
+
+	bool enabled = !strcmp(hiddenTweakLoadingEnv, "1");
+	unsetenv("ROOTHIDE_ENABLE_HIDDEN_TWEAKS");
+	return enabled;
+}
+
+void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void rhi_diag_log(const char *fmt, ...)
+{
+	va_list va;
+	va_start(va, fmt);
+	char line[4096];
+	int len = snprintf(line, sizeof(line), "[RHI-DIAG][%d][%s] ", getpid(), getprogname() ?: "?");
+	vsnprintf(line + len, sizeof(line) - len, fmt, va);
+	va_end(va);
+	fprintf(stderr, "%s\n", line);
+}
+
 __attribute__((constructor)) static void initializer(void)
 {	
 /***** roothide specific ****/
 	roothide_init();
 /***** roothide specific ****/
 
+	// Early diagnostic: dump ROOTHIDE_* env vars BEFORE anything consumes them
+	{
+		const char *hi = getenv("ROOTHIDE_HIDDEN_INJECTION");
+		const char *ht = getenv("ROOTHIDE_ENABLE_HIDDEN_TWEAKS");
+		const char *hm = getenv("ROOTHIDE_HIDDEN_TWEAK_MODE");
+		const char *hl = getenv("ROOTHIDE_HIDDEN_TWEAK_LIST");
+		const char *dil = getenv("DYLD_INSERT_LIBRARIES");
+		rhi_diag_log("PRE-CHECKIN env HIDDEN_INJECTION=%s ENABLE_HIDDEN_TWEAKS=%s MODE=%s LIST=%s DYLD=%s",
+			hi ?: "(null)", ht ?: "(null)", hm ?: "(null)", hl ?: "(null)", dil ?: "(null)");
+	}
 
 	// Under normal circumstances, dyldhook will have already handled the check-in, so get the check-in information from the __jbinfo section
 	// For more information on the check-in process, check the comments in dyldhook
-	if (parse_dyldhook_jbinfo(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged) != 0) {
+	int dyldCheckinResult = parse_dyldhook_jbinfo(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged);
+	if (dyldCheckinResult != 0) {
+		rhi_diag_log("dyldhook jbinfo failed (%d), trying jbclient checkin", dyldCheckinResult);
 		// If under any circumstances dyldhook has *not* performed a check-in, do it now
 		// This code path is taken inside xpcproxy on iOS 16, because launchd apparently no longer passes it a bootstrap port
-		if (jbclient_process_checkin(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged) == 0) {
+		int processCheckinResult = jbclient_process_checkin(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged);
+		if (processCheckinResult == 0) {
+			rhi_diag_log("jbclient checkin OK");
 			consume_tokenized_sandbox_extensions(JB_SandboxExtensions);
 		}
 		else {
 			// If neither dyldhook nor systemhook managed to perform the check-in, something is very wrong and the best thing we can do is bail out
 			// Should realistically never happen though
+			rhi_diag_log("BAIL: both checkin paths failed (dyld=%d jbclient=%d)", dyldCheckinResult, processCheckinResult);
 			return;
 		}
+	} else {
+		rhi_diag_log("dyldhook jbinfo OK rootPath=%s", JB_RootPath ?: "(null)");
 	}
 
-	// Unset DYLD_INSERT_LIBRARIES, but only if systemhook itself is the only thing contained in it
-	// Feeable attempt at making jailbreak detection harder
-	const char *dyldInsertLibraries = getenv("DYLD_INSERT_LIBRARIES");
-	if (dyldInsertLibraries) {
-		if (!strcmp(dyldInsertLibraries, HOOK_DYLIB_PATH)) {
-			unsetenv("DYLD_INSERT_LIBRARIES");
-		}
+	gHiddenInjection = consume_hidden_injection_env();
+	gHiddenTweakLoading = consume_hidden_tweak_loading_env();
+	rhi_diag_log("POST-CONSUME hiddenInjection=%d hiddenTweakLoading=%d", gHiddenInjection, gHiddenTweakLoading);
+	bool hiddenTweakRuntimeSupport = hidden_tweak_loading_should_apply_runtime_patch();
+	rhi_diag_log("POST-RUNTIME-PATCH hiddenTweakRuntimeSupport=%d", hiddenTweakRuntimeSupport);
+	sanitize_dyld_insert_libraries_env();
+	rhi_diag_log("POST-SANITIZE DYLD_INSERT_LIBRARIES=%s", getenv("DYLD_INSERT_LIBRARIES") ?: "(null)");
+
+	// For hidden injection: fully scrub all JB-related env vars so
+	// getenv / environ / _NSGetEnviron can't leak them.
+	if (gHiddenInjection) {
+		unsetenv("DYLD_INSERT_LIBRARIES");
+		unsetenv("DYLD_LIBRARY_PATH");
+		unsetenv("DYLD_FRAMEWORK_PATH");
+		unsetenv("_MSSafeMode");
+		unsetenv("_SafeMode");
+		// ROOTHIDE_* already consumed+unset by consume_*_env above
+	}
+
+	// Install dylib image hiding hooks for hidden-injection processes.
+	// Must happen after env consumption (filter is loaded) and before
+	// TweakLoader (which triggers image-add callbacks).
+	if (gHiddenInjection) {
+		rhi_diag_log("PRE-HIDER-INIT gHiddenInjection=%d", gHiddenInjection);
+		extern void hidden_dylib_hider_init(void);
+		hidden_dylib_hider_init();
+		rhi_diag_log("POST-HIDER-INIT OK");
 	}
 
 	// Apply posix_spawn / execve hooks
-	if (__builtin_available(iOS 16.0, *)) {
-		litehook_hook_function(__posix_spawn, __posix_spawn_hook);
-		litehook_hook_function(__execve,      __execve_hook);
-	}
-	else {
-		// On iOS 15 there is a way to hook posix_spawn and execve without doing instruction replacements
-		// Unfortunately Apple decided to remove these in iOS 16 :(
+	if (!gHiddenInjection || hidden_injection_should_bridge_children()) {
+		if (__builtin_available(iOS 16.0, *)) {
+			litehook_hook_function(__posix_spawn, __posix_spawn_hook);
+			litehook_hook_function(__execve,      __execve_hook);
+		}
+		else {
+			// On iOS 15 there is a way to hook posix_spawn and execve without doing instruction replacements
+			// Unfortunately Apple decided to remove these in iOS 16 :(
 
-		void **posix_spawn_with_filter = litehook_find_dsc_symbol("/usr/lib/system/libsystem_kernel.dylib", "_posix_spawn_with_filter");
-		void **execve_with_filter      = litehook_find_dsc_symbol("/usr/lib/system/libsystem_kernel.dylib", "_execve_with_filter");
+			void **posix_spawn_with_filter = litehook_find_dsc_symbol("/usr/lib/system/libsystem_kernel.dylib", "_posix_spawn_with_filter");
+			void **execve_with_filter      = litehook_find_dsc_symbol("/usr/lib/system/libsystem_kernel.dylib", "_execve_with_filter");
 
-		*posix_spawn_with_filter = __posix_spawn_hook_with_filter;
-		*execve_with_filter      = __execve_hook;
+			*posix_spawn_with_filter = __posix_spawn_hook_with_filter;
+			*execve_with_filter      = __execve_hook;
+		}
 	}
 
 	// Hook the dyld_shared_cache __fcntl to jump to the dyld __fcntl instead
 	// This makes it so that library validation is also bypassed if someone calls fcntl in userspace to attach a signature manually
-	void *dyld___fcntl = litehook_find_symbol(get_dyld_mach_header(), "___fcntl");
-	extern int __fcntl(int fd, int op, ... /* arg */ );
-	litehook_hook_function(__fcntl, dyld___fcntl);
+	if (!gHiddenInjection || hiddenTweakRuntimeSupport) {
+		void *dyld___fcntl = litehook_find_symbol(get_dyld_mach_header(), "___fcntl");
+		extern int __fcntl(int fd, int op, ... /* arg */ );
+		if (dyld___fcntl) {
+			litehook_hook_function(__fcntl, dyld___fcntl);
+		} else {
+			rhi_diag_log("WARN: dyld ___fcntl symbol not found, skipping fcntl hook (iOS 15?)");
+		}
 
-	// Initialize stuff neccessary for sandbox_apply hook
-	gLibSandboxHandle = dlopen("/usr/lib/libsandbox.1.dylib", RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY);
-	sandbox_apply_orig = dlsym(gLibSandboxHandle, "sandbox_apply");
+		// Initialize stuff neccessary for sandbox_apply hook
+		gLibSandboxHandle = dlopen("/usr/lib/libsandbox.1.dylib", RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY);
+		sandbox_apply_orig = dlsym(gLibSandboxHandle, "sandbox_apply");
 
-	// Apply dyld hooks
-	void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
-	if (gDyldPtr) {
-		// TODO: Maybe we can just rebind sandbox_apply instead?
-		dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+		// Apply dyld hooks
+		void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
+		if (gDyldPtr) {
+			// TODO: Maybe we can just rebind sandbox_apply instead?
+			dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+		}
 	}
 
 
@@ -386,34 +570,53 @@ __attribute__((constructor)) static void initializer(void)
 /* after unsandboxing jbroot and applying library-trust-hook */
 roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 /*************************** roothide ************************/
+	rhi_diag_log("POST-ROOTHIDE-CHECKIN done");
 
 
 #ifdef __arm64e__
-	// Since pages have been modified in this process, we need to load forkfix to ensure forking will work
-	// Optimization: If the process cannot fork at all due to sandbox, we don't need to do anything
-	if (sandbox_check(getpid(), "process-fork", SANDBOX_CHECK_NO_REPORT, NULL) == 0) {
-		dlopen(JBROOT_PATH("/basebin/forkfix.dylib"), RTLD_NOW);
+	if (!gHiddenInjection) {
+		// Since pages have been modified in this process, we need to load forkfix to ensure forking will work
+		// Optimization: If the process cannot fork at all due to sandbox, we don't need to do anything
+		if (sandbox_check(getpid(), "process-fork", SANDBOX_CHECK_NO_REPORT, NULL) == 0) {
+			dlopen(JBROOT_PATH("/basebin/forkfix.dylib"), RTLD_NOW);
+		}
 	}
 #endif
 
 	if (load_executable_path() == 0) {
-		// Load rootlesshooks / watchdoghook when neccessary
-		if (!strcmp(gExecutablePath, "/usr/sbin/cfprefsd") ||
-			!strcmp(gExecutablePath, "/System/Library/CoreServices/SpringBoard.app/SpringBoard") ||
-			!strcmp(gExecutablePath, "/usr/libexec/lsd")) {
-			dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
-		}
-		else if (!strcmp(gExecutablePath, "/usr/libexec/watchdogd")) {
-			dlopen(JBROOT_PATH("/basebin/watchdoghook.dylib"), RTLD_NOW);
+		root_hide_set_runtime_logging_enabled(true);
+		root_hide_hidden_whitelist_log("initializer ready executable=%s hiddenInjection=%d hiddenTweakLoading=%d",
+			gExecutablePath,
+			gHiddenInjection,
+			gHiddenTweakLoading);
+
+		// Diagnostic: warn if mode is hiddenwhitelist but env vars were not propagated
+		// This indicates launchdhook failed to set ROOTHIDE_HIDDEN_INJECTION for this spawn
+		if (!gHiddenInjection && root_hide_injection_mode_is_hidden_whitelist()) {
+			if (strstr(gExecutablePath, ".app/") || strstr(gExecutablePath, ".appex/")) {
+				root_hide_hidden_whitelist_log("WARNING: hiddenwhitelist mode active but hiddenInjection=0 for app executable=%s (launchdhook env propagation may have failed)", gExecutablePath);
+			}
 		}
 
-		// ptrace hook to allow attaching a debugger to processes that systemhook did not inject into
-		// e.g. allows attaching debugserver to an app where tweak injection has been disabled via choicy
-		// since we want to keep hooks minimal and debugserver is the only thing I can think of that would
-		// call ptrace and expect it to allow invalid pages, we only hook it in debugserver
-		// this check is a bit shit since we rely on the name of the binary, but who cares ¯\_(ツ)_/¯
-		if (string_has_suffix(gExecutablePath, "/debugserver")) {
-			litehook_hook_function(ptrace, ptrace_hook);
+		if (!gHiddenInjection) {
+			// Load rootlesshooks / watchdoghook when neccessary
+			if (!strcmp(gExecutablePath, "/usr/sbin/cfprefsd") ||
+				!strcmp(gExecutablePath, "/System/Library/CoreServices/SpringBoard.app/SpringBoard") ||
+				!strcmp(gExecutablePath, "/usr/libexec/lsd")) {
+				dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
+			}
+			else if (!strcmp(gExecutablePath, "/usr/libexec/watchdogd")) {
+				dlopen(JBROOT_PATH("/basebin/watchdoghook.dylib"), RTLD_NOW);
+			}
+
+			// ptrace hook to allow attaching a debugger to processes that systemhook did not inject into
+			// e.g. allows attaching debugserver to an app where tweak injection has been disabled via choicy
+			// since we want to keep hooks minimal and debugserver is the only thing I can think of that would
+			// call ptrace and expect it to allow invalid pages, we only hook it in debugserver
+			// this check is a bit shit since we rely on the name of the binary, but who cares ¯\_(ツ)_/¯
+			if (string_has_suffix(gExecutablePath, "/debugserver")) {
+				litehook_hook_function(ptrace, ptrace_hook);
+			}
 		}
 
 #ifndef __arm64e__
@@ -433,19 +636,49 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 
 
 /******************* roothide *****************/
-roothide_init_with_executable(gExecutablePath);
+			if (!gHiddenInjection || hiddenTweakRuntimeSupport) {
+				root_hide_hidden_whitelist_log("apply runtime patch %s executable=%s",
+					gHiddenInjection ? "hidden" : "normal",
+					gExecutablePath);
+				roothide_init_with_executable(gExecutablePath);
+			}
 /******************* roothide ****************/
 
 
 		// Load tweaks if desired
 		// We can hardcode /var/jb here since if it doesn't exist, loading TweakLoader.dylib is not going to work anyways
-		if (should_enable_tweaks()) {
+		bool tweaksEnabled = should_enable_tweaks();
+		rhi_diag_log("should_enable_tweaks=%d gHiddenInjection=%d gHiddenTweakLoading=%d", tweaksEnabled, gHiddenInjection, gHiddenTweakLoading);
+		if (tweaksEnabled) {
 			const char *tweakLoaderPath = JBROOT_PATH("/usr/lib/TweakLoader.dylib");
+			root_hide_hidden_whitelist_log("attempt TweakLoader executable=%s path=%s", gExecutablePath, tweakLoaderPath);
 			if (access(tweakLoaderPath, F_OK) == 0) {
-				void *tweakLoaderHandle = dlopen(tweakLoaderPath, RTLD_NOW);
-				if (tweakLoaderHandle != NULL) {
-					dlclose(tweakLoaderHandle);
+				if (gHiddenInjection && gHiddenTweakLoading) {
+					roothide_hidden_tweak_prepare_for_loader();
 				}
+				int tweakLoaderMode = RTLD_NOW;
+				if (gHiddenInjection && gHiddenTweakLoading) {
+					tweakLoaderMode |= RTLD_GLOBAL;
+				}
+				void *tweakLoaderHandle = dlopen(tweakLoaderPath, tweakLoaderMode);
+				rhi_diag_log("TweakLoader dlopen result=%p dlerror=%s", tweakLoaderHandle, tweakLoaderHandle ? "none" : (dlerror() ?: "(null)"));
+				if (tweakLoaderHandle != NULL) {
+					root_hide_hidden_whitelist_log("TweakLoader loaded executable=%s", gExecutablePath);
+					if (gHiddenInjection && gHiddenTweakLoading) {
+						gHiddenTweakLoaderHandle = tweakLoaderHandle;
+						roothide_hidden_tweak_load_selected();
+						rhi_diag_log("POST-LOAD-SELECTED done");
+					}
+					else {
+						dlclose(tweakLoaderHandle);
+					}
+				}
+				else {
+					root_hide_hidden_whitelist_log("TweakLoader failed executable=%s error=%s", gExecutablePath, dlerror() ?: "(null)");
+				}
+			}
+			else {
+				root_hide_hidden_whitelist_log("TweakLoader missing executable=%s", gExecutablePath);
 			}
 		}
 

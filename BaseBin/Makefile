@@ -9,6 +9,11 @@
 
 all: basebin.tar
 
+TRUSTCACHE ?= $(strip $(firstword \
+	$(wildcard $(CURDIR)/trustcache) \
+	$(wildcard $(CURDIR)/../../Opamine-dopamine/BaseBin/trustcache) \
+	$(shell command -v trustcache 2>/dev/null)))
+
 subprojects: ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook boomerang jbctl idownloadd watchdoghook roothidehooks jailbreakd bootstrapper
 
 ChOma: .build .include
@@ -67,6 +72,7 @@ watchdoghook: .build .include libjailbreak
 	@cp watchdoghook/watchdoghook.dylib .build
 
 roothidehooks: .build .include libjailbreak
+	@find /var/folders -type d -path '*/C/clang/ModuleCache' -prune -exec rm -rf {} + 2>/dev/null || true
 	$(MAKE) -C roothidehooks
 	@cp roothidehooks/.theos/obj/roothidehooks.dylib .build
 
@@ -83,6 +89,7 @@ jailbreakd: .build .include libjailbreak
 	mkdir -p .build
 	cp -r _external/basebin/* .build
 	cp _external/basebin/.version .build
+	date +%s > .build/.build_id
 
 .include:
 	rm -rf .include
@@ -94,7 +101,14 @@ ifneq (,$(wildcard $(shell xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc
 endif
 
 basebin.tc: subprojects
-	trustcache create .build/basebin.tc .build
+	@if [ -z "$(TRUSTCACHE)" ]; then \
+		echo "error: trustcache binary not found. Expected one of:" >&2; \
+		echo "  1. $(CURDIR)/trustcache" >&2; \
+		echo "  2. $(CURDIR)/../../Opamine-dopamine/BaseBin/trustcache" >&2; \
+		echo "  3. trustcache in PATH" >&2; \
+		exit 1; \
+	fi
+	"$(TRUSTCACHE)" create .build/basebin.tc .build
 	cp .build/basebin.tc basebin.tc
 
 # dyldhook dylibs do not need to be added to the basebin trustcache

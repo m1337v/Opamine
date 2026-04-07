@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - 'roothide'
-      - 'zqbb-unified-mode'
+      - 'rhinject'
     paths-ignore:
       - ".gitignore"
   workflow_dispatch:
@@ -67,10 +67,10 @@ jobs:
               RELEASE_NAME="Roothide2 Beta Release"
               ASSET_NAME="Dopamine2-roothide.tipa"
               ;;
-            zqbb-unified-mode)
-              RELEASE_TAG="rhunified"
-              RELEASE_NAME="rhunified"
-              ASSET_NAME="Dopamine2-rhunified.tipa"
+            rhinject)
+              RELEASE_TAG="rhinject"
+              RELEASE_NAME="rhinject"
+              ASSET_NAME="Dopamine2-rhinject.tipa"
               ;;
             *)
               SANITIZED_BRANCH=$(echo "${BRANCH}" | tr '/[:space:]' '--')

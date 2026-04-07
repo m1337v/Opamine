@@ -1,3 +1,4 @@
+#include <bsm/audit.h>
 #import <Foundation/Foundation.h>
 #include <roothide.h>
 #import <fcntl.h>

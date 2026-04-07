@@ -7,11 +7,6 @@
 #include <dispatch/dispatch.h>
 #include "log.h"
 
-#ifdef ENABLE_LOGS
-
-bool debugLogsEnabled = true;
-bool errorLogsEnabled = true;
-
 #define LOGGING_DIR "/var/log"
 
 const char *JBLogGetProcessName(void) {
@@ -81,6 +76,19 @@ void JBDLogV(const char* path, pid_t pid, uint64_t tid, const char *prefix, cons
     }
 }
 
+void JBLogFunction(const char* path, pid_t pid, uint64_t tid, const char* prefix, const char *format, ...)
+{
+    va_list va;
+    va_start(va, format);
+    JBDLogV(path, pid, tid, prefix, format, va);
+    va_end(va);
+}
+
+#ifdef ENABLE_LOGS
+
+bool debugLogsEnabled = true;
+bool errorLogsEnabled = true;
+
 bool JBLogEnabled(void) {
     static bool enabled = false;
     static dispatch_once_t onceToken;
@@ -88,14 +96,6 @@ bool JBLogEnabled(void) {
         enabled = access("/var/.JBLogEnabled", F_OK) == 0;
     });
     return enabled;
-}
-
-void JBLogFunction(const char* path, pid_t pid, uint64_t tid, const char* prefix, const char *format, ...)
-{
-    va_list va;
-    va_start(va, format);
-    JBDLogV(path, pid, tid, prefix, format, va);
-    va_end(va);
 }
 
 void JBLogDebugFunction(const char *format, ...) {

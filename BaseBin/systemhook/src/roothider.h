@@ -36,6 +36,10 @@ bool allowInjectWithSafeMode(const char* path);
 void roothide_init();
 void roothide_init_with_checkin(const char* rootdir);
 void roothide_init_with_executable(const char* executable);
+void roothide_hidden_tweak_envbuf_apply(char ***envc);
+bool roothide_hidden_tweak_env_is_configured(void);
+void roothide_hidden_tweak_prepare_for_loader(void);
+void roothide_hidden_tweak_load_selected(void);
 
 int __sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);
 int __sysctl_hook(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);
@@ -47,4 +51,3 @@ int roothide_systemhook___execve_posthook(const char *path, char *const argv[], 
 
 int roothide_systemhook___posix_spawn_prehook(pid_t *restrict pid, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict], void *orig, int (*trust_binary)(const char *path), int (*set_process_debugged)(uint64_t pid, bool fullyDebugged), double jetsamMultiplier);
 int roothide_systemhook___posix_spawn_posthook(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict]);
-

@@ -1,4 +1,5 @@
 #include <signal.h>
+#include <syslog.h>
 #include "jbserver_global.h"
 
 #include <libjailbreak/libjailbreak.h>

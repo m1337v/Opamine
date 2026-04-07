@@ -91,10 +91,24 @@
     if (![[DOEnvironmentManager sharedManager] jailbrokenVersion])
         return NO;
 
-    NSString *jailbrokenVersion = [[DOEnvironmentManager sharedManager] jailbrokenVersion];
-    NSString *launchedVersion = [self getLaunchedReleaseTag];
-    
-    return [launchedVersion numericalVersionRepresentation] > [jailbrokenVersion numericalVersionRepresentation];
+    NSString *jailbrokenBasebinMD5 = [[DOEnvironmentManager sharedManager] jailbrokenBasebinMD5];
+    NSString *launchedBasebinMD5 = [[DOEnvironmentManager sharedManager] launchedBasebinMD5];
+    if (launchedBasebinMD5.length > 0) {
+        if (jailbrokenBasebinMD5.length == 0) {
+            return YES;
+        }
+        return ![jailbrokenBasebinMD5 isEqualToString:launchedBasebinMD5];
+    }
+
+    NSString *jailbrokenBuildID = [[DOEnvironmentManager sharedManager] jailbrokenBuildID];
+    NSString *launchedBuildID = [[DOEnvironmentManager sharedManager] launchedBuildID];
+    if (launchedBuildID.length > 0) {
+        if (jailbrokenBuildID.length == 0) {
+            return YES;
+        }
+        return ![jailbrokenBuildID isEqualToString:launchedBuildID];
+    }
+    return NO;
 }
 
 - (bool)launchedReleaseNeedsManualUpdate

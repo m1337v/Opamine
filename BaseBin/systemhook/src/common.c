@@ -12,30 +12,139 @@
 #include <math.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include "envbuf.h"
 #include "private.h"
 #include <libjailbreak/jbclient_xpc.h>
 #include <libjailbreak/jbserver_domains.h>
 #include <libjailbreak/jbroot.h>
+#include <libjailbreak/roothider/jailbreakd.h>
 
 typedef enum
 {
 	kRootHideInjectionModeStock = 0,
 	kRootHideInjectionModeBlacklist,
 	kRootHideInjectionModeWhitelist,
+	kRootHideInjectionModeHiddenWhitelist,
 } RootHideInjectionMode;
 
-#define ROOT_HIDE_MODE_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist"
-#define ROOT_HIDE_MODE_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.mode.plist"
-#define ROOT_HIDE_INJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.plist"
-#define ROOT_HIDE_INJECT_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.plist"
-#define ROOT_HIDE_INJECT_SYSTEM_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist"
-#define ROOT_HIDE_INJECT_SYSTEM_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.inject.system.plist"
-#define ROOT_HIDE_JETSAM_ADDEND_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.jetsam.addend.plist"
-#define ROOT_HIDE_JETSAM_ADDEND_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.jetsam.addend.plist"
-#define ROOT_HIDE_UNINJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/cn.zqbb.uninject.plist"
-#define ROOT_HIDE_UNINJECT_PLIST_LEGACY "/var/mobile/Library/RootHide/cn.zqbb.uninject.plist"
-#define ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD "/var/mobile/zp.unject.plist"
+#define ROOT_HIDE_MODE_PLIST_RELATIVE "/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist"
+#define ROOT_HIDE_MODE_PLIST_LEGACY NULL
+#define ROOT_HIDE_INJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/pro.m1337.inject.plist"
+#define ROOT_HIDE_INJECT_PLIST_LEGACY NULL
+#define ROOT_HIDE_INJECT_SYSTEM_PLIST_RELATIVE "/var/mobile/Library/RootHide/pro.m1337.inject.system.plist"
+#define ROOT_HIDE_INJECT_SYSTEM_PLIST_LEGACY NULL
+#define ROOT_HIDE_JETSAM_ADDEND_PLIST_RELATIVE "/var/mobile/Library/RootHide/pro.m1337.jetsam.addend.plist"
+#define ROOT_HIDE_JETSAM_ADDEND_PLIST_LEGACY NULL
+#define ROOT_HIDE_UNINJECT_PLIST_RELATIVE "/var/mobile/Library/RootHide/pro.m1337.uninject.plist"
+#define ROOT_HIDE_UNINJECT_PLIST_LEGACY NULL
+
+#define ROOT_HIDE_TRACE_BUFFER_SIZE 32768
+
+static bool gRootHideRuntimeLoggingEnabled = false;
+static bool gRootHideTraceBufferTruncated = false;
+static char gRootHideTraceBuffer[ROOT_HIDE_TRACE_BUFFER_SIZE] = {0};
+static size_t gRootHideTraceBufferLength = 0;
+
+static void root_hide_trace_emit_line(const char *line)
+{
+	if (!line || line[0] == '\0') {
+		return;
+	}
+
+	fprintf(stderr, "[RHI] %s\n", line);
+}
+
+static void root_hide_trace_buffer_line(const char *line)
+{
+	if (!line || line[0] == '\0') {
+		return;
+	}
+
+	if (gRootHideTraceBufferTruncated) {
+		return;
+	}
+
+	int written = snprintf(gRootHideTraceBuffer + gRootHideTraceBufferLength,
+		ROOT_HIDE_TRACE_BUFFER_SIZE - gRootHideTraceBufferLength,
+		"[RHI] %s\n",
+		line);
+	if (written < 0) {
+		return;
+	}
+
+	if ((size_t)written >= (ROOT_HIDE_TRACE_BUFFER_SIZE - gRootHideTraceBufferLength)) {
+		gRootHideTraceBufferTruncated = true;
+		gRootHideTraceBuffer[ROOT_HIDE_TRACE_BUFFER_SIZE - 1] = '\0';
+		gRootHideTraceBufferLength = strlen(gRootHideTraceBuffer);
+		return;
+	}
+
+	gRootHideTraceBufferLength += (size_t)written;
+}
+
+void root_hide_set_runtime_logging_enabled(bool enabled)
+{
+	if (enabled == gRootHideRuntimeLoggingEnabled) {
+		return;
+	}
+
+	gRootHideRuntimeLoggingEnabled = enabled;
+	if (!enabled) {
+		return;
+	}
+
+	if (gRootHideTraceBufferLength > 0) {
+		char *cursor = gRootHideTraceBuffer;
+		while (*cursor != '\0') {
+			char *newline = strchr(cursor, '\n');
+			if (newline) {
+				*newline = '\0';
+			}
+			if (*cursor != '\0') {
+				if (!strncmp(cursor, "[RHI] ", 6)) {
+					root_hide_trace_emit_line(cursor + 6);
+				}
+				else {
+					root_hide_trace_emit_line(cursor);
+				}
+			}
+			if (!newline) {
+				break;
+			}
+			*newline = '\n';
+			cursor = newline + 1;
+		}
+		gRootHideTraceBuffer[0] = '\0';
+		gRootHideTraceBufferLength = 0;
+	}
+
+	if (gRootHideTraceBufferTruncated) {
+		root_hide_trace_emit_line("trace buffer truncated");
+		gRootHideTraceBufferTruncated = false;
+	}
+}
+
+void root_hide_hidden_whitelist_log(const char *format, ...)
+{
+	if (!format) {
+		return;
+	}
+
+	char line[1024];
+	va_list va;
+	va_start(va, format);
+	vsnprintf(line, sizeof(line), format, va);
+	va_end(va);
+
+	if (gRootHideRuntimeLoggingEnabled) {
+		root_hide_trace_emit_line(line);
+	}
+	else {
+		root_hide_trace_buffer_line(line);
+	}
+}
 
 bool string_has_prefix(const char *str, const char* prefix)
 {
@@ -117,11 +226,17 @@ static xpc_object_t root_hide_copy_plist_for_relative_path(const char *relativeP
 	const char *jbrootPath = JBROOT_PATH(relativePath);
 	xpc_object_t xplist = root_hide_copy_plist(jbrootPath);
 	if (xplist) {
+		root_hide_hidden_whitelist_log("plist load relative=%s source=jbroot path=%s", relativePath ?: "(null)", jbrootPath ?: "(null)");
 		return xplist;
 	}
 	if (legacyPath && (!jbrootPath || strcmp(jbrootPath, legacyPath) != 0)) {
-		return root_hide_copy_plist(legacyPath);
+		xpc_object_t legacyPlist = root_hide_copy_plist(legacyPath);
+		if (legacyPlist) {
+			root_hide_hidden_whitelist_log("plist load relative=%s source=legacy path=%s", relativePath ?: "(null)", legacyPath ?: "(null)");
+			return legacyPlist;
+		}
 	}
+	root_hide_hidden_whitelist_log("plist missing relative=%s jbroot=%s legacy=%s", relativePath ?: "(null)", jbrootPath ?: "(null)", legacyPath ?: "(null)");
 	return NULL;
 }
 
@@ -186,29 +301,41 @@ static RootHideInjectionMode root_hide_injection_mode(void)
 		const char *mode = xpc_dictionary_get_string(modePlist, "mode");
 		if (mode) {
 			if (!strcmp(mode, "blacklist")) {
+				root_hide_hidden_whitelist_log("mode resolved=blacklist source=plist");
 				xpc_release(modePlist);
 				return kRootHideInjectionModeBlacklist;
 			}
 			if (!strcmp(mode, "whitelist")) {
+				root_hide_hidden_whitelist_log("mode resolved=whitelist source=plist");
 				xpc_release(modePlist);
 				return kRootHideInjectionModeWhitelist;
 			}
+			if (!strcmp(mode, "hiddenwhitelist")) {
+				root_hide_hidden_whitelist_log("mode resolved=hiddenwhitelist source=plist");
+				xpc_release(modePlist);
+				return kRootHideInjectionModeHiddenWhitelist;
+			}
 			if (!strcmp(mode, "stock")) {
+				root_hide_hidden_whitelist_log("mode resolved=stock source=plist");
 				xpc_release(modePlist);
 				return kRootHideInjectionModeStock;
 			}
+			root_hide_hidden_whitelist_log("mode unknown=%s source=plist", mode);
 		}
 	}
 	if (modePlist) {
 		xpc_release(modePlist);
 	}
 
-	if (root_hide_plist_exists(ROOT_HIDE_INJECT_PLIST_RELATIVE, ROOT_HIDE_INJECT_PLIST_LEGACY)) {
-		return kRootHideInjectionModeWhitelist;
-	}
-	if (root_hide_plist_exists(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY) || access(ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD, F_OK) == 0) {
+	if (root_hide_plist_exists(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY)) {
+		root_hide_hidden_whitelist_log("mode resolved=blacklist source=uninject-exists");
 		return kRootHideInjectionModeBlacklist;
 	}
+	if (root_hide_plist_exists(ROOT_HIDE_INJECT_PLIST_RELATIVE, ROOT_HIDE_INJECT_PLIST_LEGACY)) {
+		root_hide_hidden_whitelist_log("mode resolved=whitelist source=inject-exists");
+		return kRootHideInjectionModeWhitelist;
+	}
+	root_hide_hidden_whitelist_log("mode resolved=stock source=default");
 	return kRootHideInjectionModeStock;
 }
 
@@ -252,10 +379,53 @@ static int root_hide_jetsam_addend_for_path(const char *path)
 
 static bool root_hide_uninject_executable(const char *execName)
 {
-	if (root_hide_dictionary_get_bool(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY, execName)) {
+	return root_hide_dictionary_get_bool(ROOT_HIDE_UNINJECT_PLIST_RELATIVE, ROOT_HIDE_UNINJECT_PLIST_LEGACY, execName);
+}
+
+static bool root_hide_hidden_tweak_loading_requested(const char *const envp[])
+{
+	const char *hiddenInjection = envbuf_getenv(envp, "ROOTHIDE_HIDDEN_INJECTION");
+	const char *hiddenTweakLoading = envbuf_getenv(envp, "ROOTHIDE_ENABLE_HIDDEN_TWEAKS");
+	return hiddenInjection && !strcmp(hiddenInjection, "1")
+		&& hiddenTweakLoading && !strcmp(hiddenTweakLoading, "1");
+}
+
+static bool root_hide_should_trace_injection_path(const char *path)
+{
+	if (!path) {
+		return false;
+	}
+
+	return strstr(path, ".app/")
+		|| strstr(path, ".appex/")
+		|| strstr(path, "/PlugIns/")
+		|| strstr(path, "/Extensions/")
+		|| !strcmp(path, "/usr/libexec/xpcproxy");
+}
+
+bool root_hide_injection_mode_is_hidden_whitelist(void)
+{
+	return root_hide_injection_mode() == kRootHideInjectionModeHiddenWhitelist;
+}
+
+bool root_hide_injection_mode_uses_whitelist_rules(void)
+{
+	RootHideInjectionMode injectionMode = root_hide_injection_mode();
+	return injectionMode == kRootHideInjectionModeWhitelist;
+}
+
+bool root_hide_whitelist_allows_executable_path(const char *path)
+{
+	if (!path) {
+		return false;
+	}
+
+	const char *exec = strrchr(path, '/');
+	if (exec && root_hide_allowlisted_executable(exec + 1)) {
 		return true;
 	}
-	return root_hide_dictionary_get_bool(ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD, ROOT_HIDE_UNINJECT_PLIST_LEGACY_OLD, execName);
+
+	return root_hide_system_allowlisted_path(path);
 }
 
 kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[restrict])
@@ -271,23 +441,42 @@ kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[rest
 	size_t blacklistCount = sizeof(processBlacklist) / sizeof(processBlacklist[0]);
 	for (size_t i = 0; i < blacklistCount; i++)
 	{
-		if (!strcmp(processBlacklist[i], path)) return 0;
+		if (!strcmp(processBlacklist[i], path)) {
+			root_hide_hidden_whitelist_log("spawn config path=%s result=0x0 reason=process-blacklist", path);
+			return 0;
+		}
 	}
 
 	RootHideInjectionMode injectionMode = root_hide_injection_mode();
+	bool traceInjectionPath = root_hide_should_trace_injection_path(path);
+	if (traceInjectionPath) {
+		root_hide_hidden_whitelist_log("spawn config begin path=%s mode=%d", path, injectionMode);
+	}
 	if (injectionMode == kRootHideInjectionModeWhitelist) {
 		const char *exec = strrchr(path, '/');
 		if (exec && root_hide_allowlisted_executable(exec + 1)) {
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("spawn config path=%s result=0x%x reason=whitelist-exec exec=%s", path, (kSpawnConfigInject | kSpawnConfigTrust), exec + 1);
+			}
 			return (kSpawnConfigInject | kSpawnConfigTrust);
 		}
 		if (root_hide_system_allowlisted_path(path)) {
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("spawn config path=%s result=0x%x reason=whitelist-system", path, (kSpawnConfigInject | kSpawnConfigTrust));
+			}
 			return (kSpawnConfigInject | kSpawnConfigTrust);
+		}
+		if (traceInjectionPath) {
+			root_hide_hidden_whitelist_log("spawn config path=%s result=0x0 reason=whitelist-deny", path);
 		}
 		return 0;
 	}
 
-	if (injectionMode == kRootHideInjectionModeBlacklist) {
+	if (injectionMode == kRootHideInjectionModeBlacklist || injectionMode == kRootHideInjectionModeHiddenWhitelist) {
 		if (strstr(path, "/.jbroot-")) {
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("spawn config path=%s result=0x%x reason=jbroot-helper", path, (kSpawnConfigInject | kSpawnConfigTrust));
+			}
 			return (kSpawnConfigInject | kSpawnConfigTrust);
 		}
 
@@ -301,17 +490,27 @@ kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[rest
 			size_t patternsCount = sizeof(patterns) / sizeof(patterns[0]);
 			for (size_t i = 0; i < patternsCount; ++i) {
 				if (strstr(path, patterns[i]) != NULL) {
-					return (i == patternsCount - 1) ? 0 : (kSpawnConfigInject | kSpawnConfigTrust);
+					kSpawnConfig result = (i == patternsCount - 1) ? 0 : (kSpawnConfigInject | kSpawnConfigTrust);
+					if (traceInjectionPath) {
+						root_hide_hidden_whitelist_log("spawn config path=%s result=0x%x reason=appex-pattern pattern=%s", path, result, patterns[i]);
+					}
+					return result;
 				}
 			}
 		}
 
 		const char *exec = strrchr(path, '/');
 		if (exec && root_hide_uninject_executable(exec + 1)) {
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("spawn config path=%s result=0x0 reason=uninject exec=%s", path, exec + 1);
+			}
 			return 0;
 		}
 	}
 
+	if (traceInjectionPath) {
+		root_hide_hidden_whitelist_log("spawn config path=%s result=0x%x reason=default", path, (kSpawnConfigInject | kSpawnConfigTrust));
+	}
 	return (kSpawnConfigInject | kSpawnConfigTrust);
 }
 
@@ -345,6 +544,18 @@ static int spawn_exec_hook_common(const char *path,
 	if (desc) attr = desc->attrp;
 
 	kSpawnConfig spawnConfig = spawn_config_for_executable(path, argv);
+	bool hiddenTweakLoadingRequested = root_hide_hidden_tweak_loading_requested((const char *const *)envp);
+	bool traceInjectionPath = root_hide_should_trace_injection_path(path);
+	if (traceInjectionPath) {
+		root_hide_hidden_whitelist_log("spawn_exec path=%s spawnConfig=0x%x hiddenTweakLoadingRequested=%d", path, spawnConfig, hiddenTweakLoadingRequested);
+	}
+	if (hiddenTweakLoadingRequested) {
+		// Hidden whitelist starts from classic RootHide blacklist state, so the
+		// executable may still be present in the uninject list. Once launchd or an
+		// already-injected parent explicitly requests hidden tweak loading for this
+		// spawn, we must force the minimal injection path back on.
+		spawnConfig |= (kSpawnConfigInject | kSpawnConfigTrust);
+	}
 
 	if (spawnConfig & kSpawnConfigTrust) {
 		// Upload binary to trustcache if needed
@@ -370,6 +581,9 @@ static int spawn_exec_hook_common(const char *path,
 	do {
 		if (!(spawnConfig & kSpawnConfigInject)) {
 			shouldInsertJBEnv = false;
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("skip env insertion path=%s reason=spawnConfig", path);
+			}
 			break;
 		}
 
@@ -381,6 +595,9 @@ static int spawn_exec_hook_common(const char *path,
 			if (!strcmp(safeModeValue, "1")) {
 				if(!allowInjectWithSafeMode(path)) shouldInsertJBEnv = false;
 				hasSafeModeVariable = true;
+				if (traceInjectionPath) {
+					root_hide_hidden_whitelist_log("safe mode env detected path=%s variable=_SafeMode inject=%d", path, shouldInsertJBEnv);
+				}
 				break;
 			}
 		}
@@ -388,6 +605,9 @@ static int spawn_exec_hook_common(const char *path,
 			if (!strcmp(msSafeModeValue, "1")) {
 				if(!allowInjectWithSafeMode(path)) shouldInsertJBEnv = false;
 				hasSafeModeVariable = true;
+				if (traceInjectionPath) {
+					root_hide_hidden_whitelist_log("safe mode env detected path=%s variable=_MSSafeMode inject=%d", path, shouldInsertJBEnv);
+				}
 				break;
 			}
 		}
@@ -397,6 +617,9 @@ static int spawn_exec_hook_common(const char *path,
 			if (proctype == POSIX_SPAWN_PROC_TYPE_DRIVER) {
 				// Do not inject hook into DriverKit drivers
 				shouldInsertJBEnv = false;
+				if (traceInjectionPath) {
+					root_hide_hidden_whitelist_log("skip env insertion path=%s reason=driverkit", path);
+				}
 				break;
 			}
 		}
@@ -404,9 +627,16 @@ static int spawn_exec_hook_common(const char *path,
 		if (access(HOOK_DYLIB_PATH, F_OK) != 0) {
 			// If the hook dylib doesn't exist, don't try to inject it (would crash the process)
 			shouldInsertJBEnv = false;
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("skip env insertion path=%s reason=missingHook path=%s", path, HOOK_DYLIB_PATH ?: "(null)");
+			}
 			break;
 		}
 	} while (0);
+
+	if (traceInjectionPath) {
+		root_hide_hidden_whitelist_log("env decision path=%s shouldInsertJBEnv=%d existingHook=%d hasSafeModeVariable=%d", path, shouldInsertJBEnv, JBEnvAlreadyInsertedCount, hasSafeModeVariable);
+	}
 
 	// If systemhook is being injected and jetsam limits are set, add the per-executable RootHide jetsam addend.
 	if (shouldInsertJBEnv) {
@@ -431,6 +661,9 @@ static int spawn_exec_hook_common(const char *path,
 
 	if ((shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 1) || (!shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 0 && !hasSafeModeVariable)) {
 		// we're already good, just call orig
+		if (traceInjectionPath) {
+			root_hide_hidden_whitelist_log("env unchanged path=%s", path);
+		}
 		r = orig(envp);
 	}
 	else {
@@ -447,6 +680,9 @@ static int spawn_exec_hook_common(const char *path,
 					strcat(newLibraryInsert, existingLibraryInserts);
 				}
 				envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", newLibraryInsert);
+				if (traceInjectionPath) {
+					root_hide_hidden_whitelist_log("inserted hook dylib path=%s dylibs=%s", path, newLibraryInsert);
+				}
 			}
 		}
 		else {
@@ -472,12 +708,18 @@ static int spawn_exec_hook_common(const char *path,
 						}
 					});
 					envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", newLibraryInsert);
+					if (traceInjectionPath) {
+						root_hide_hidden_whitelist_log("removed hook dylib path=%s dylibs=%s", path, newLibraryInsert);
+					}
 
 					free(newLibraryInsert);
 				}
 			}
 			envbuf_unsetenv(&envc, "_SafeMode");
 			envbuf_unsetenv(&envc, "_MSSafeMode");
+			if (traceInjectionPath) {
+				root_hide_hidden_whitelist_log("cleared safe mode env path=%s", path);
+			}
 		}
 
 		r = orig(envc);

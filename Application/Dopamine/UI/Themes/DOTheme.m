@@ -50,7 +50,13 @@
     UIImage *backgroundImage = [self image];
     CGSize canvasSize = backgroundImage.size;
 
-    UIImage *overlayImage = [UIImage imageNamed:@"DopamineLogo"];
+    UIImage *overlayImage = [UIImage imageWithContentsOfFile:[[NSBundle mainBundle] pathForResource:@"AppIcon76x76@2x~ipad" ofType:@"png"]];
+    if (!overlayImage) {
+        overlayImage = [UIImage imageWithContentsOfFile:[[NSBundle mainBundle] pathForResource:@"AppIcon60x60@2x" ofType:@"png"]];
+    }
+    if (!overlayImage) {
+        overlayImage = [UIImage imageNamed:@"DopamineLogo"];
+    }
 
     CGSize overlaySize = CGSizeMake(350, 350);
     CGPoint overlayOrigin = CGPointMake((canvasSize.width - overlaySize.width) / 2.0,

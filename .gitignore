@@ -16,3 +16,36 @@ cmake-build-*
 jbupdate.sh
 /BaseBin/roothidehooks/packages
 BaseBin/systemhook/src/roothider_test*
+
+# Build artifacts
+BaseBin/.build/
+BaseBin/.include/
+BaseBin/basebin.tar
+BaseBin/basebin.tc
+Application/Dopamine.tipa
+Application/Checkpoint/
+
+# Sub-project build outputs
+BaseBin/systemhook/systemhook.dylib
+BaseBin/launchdhook/launchdhook.dylib
+BaseBin/forkfix/forkfix.dylib
+BaseBin/watchdoghook/watchdoghook.dylib
+BaseBin/roothidehooks/.theos/
+BaseBin/opainject/.theos/
+BaseBin/ChOma/output/
+BaseBin/XPF/output/
+BaseBin/MachOMerger/MachOMerger
+BaseBin/dyldhook/*.dylib
+BaseBin/boomerang/boomerang
+BaseBin/jbctl/jbctl
+BaseBin/idownloadd/idownloadd
+BaseBin/bootstrapper/bootstrapper
+BaseBin/jailbreakd/jailbreakd
+BaseBin/libjailbreak/libjailbreak.dylib
+BaseBin/libjailbreak/libjailbreak.dylib.dSYM/
+
+# AI session notes (not project source)
+AGENTS.md
+progress.md
+workflow.md
+/Resources/

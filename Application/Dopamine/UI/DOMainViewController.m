@@ -178,12 +178,6 @@
                 [self setupUpdateAvailable:YES];
             });
         }
-        else if ([[DOUIManager sharedInstance] isUpdateAvailable])
-        {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self setupUpdateAvailable:NO];
-            });
-        }
     });
 }
 
@@ -279,6 +273,20 @@
     }
 
     self.updateButton = [DOActionMenuButton buttonWithAction:[UIAction actionWithTitle:title image:[UIImage systemImageNamed:@"arrow.down.circle" withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"update-available" handler:^(__kindof UIAction * _Nonnull action) {
+        if (environmentUpdate) {
+            self.updateButton.enabled = NO;
+            self.updateButton.alpha = 0.5;
+            NSError *error = [[DOEnvironmentManager sharedManager] updateEnvironment];
+            if (error) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error Updating Environment" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close") style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
+                self.updateButton.enabled = YES;
+                self.updateButton.alpha = 1.0;
+            }
+            return;
+        }
+
         [self.navigationController pushViewController:[[DOUpdateViewController alloc] initFromTag:releaseFrom toTag:releaseTo] animated:YES];
     }] chevron:NO];
 

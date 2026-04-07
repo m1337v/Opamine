@@ -155,6 +155,7 @@
         DORootHideInjectionModeStock,
         DORootHideInjectionModeBlacklist,
         DORootHideInjectionModeWhitelist,
+        DORootHideInjectionModeHiddenWhitelist,
     ];
 }
 
@@ -164,6 +165,7 @@
         [NSString stringWithFormat:@"%@ (%@)", DOLocalizedString(@"Settings_Tweak_Injection_Mode_Stock"), DOLocalizedString(@"Recommended")],
         DOLocalizedString(@"Settings_Tweak_Injection_Mode_Blacklist"),
         DOLocalizedString(@"Settings_Tweak_Injection_Mode_Whitelist"),
+        DOLocalizedString(@"Settings_Tweak_Injection_Mode_HiddenWhitelist"),
     ];
 }
 

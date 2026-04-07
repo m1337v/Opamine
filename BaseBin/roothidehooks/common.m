@@ -1,3 +1,4 @@
+#include <bsm/audit.h>
 #import <Foundation/Foundation.h>
 #include <unistd.h>
 #include <stdlib.h>
