@@ -134,21 +134,9 @@ void jailbreakd_received_message(mach_port_t port)
 				}
 
 				case JBD_MSG_SYSTEMWIDE_LOG: {
-					static char logFilePath[PATH_MAX] = {0};
-					static dispatch_once_t onceToken;
-					dispatch_once(&onceToken, ^{
-						JBLogGetLogFilePath("systemwide", NULL, logFilePath);
-					});
-
-					const char* progname = NULL;
-					const char* procpath = proc_get_path(clientPid,NULL);
-					if(procpath) {
-						progname = strrchr(procpath, '/');
-						if(progname) progname++; else progname = procpath;
-					}
-					uint64_t tid = xpc_dictionary_get_uint64(message, "tid");
-					const char* log = xpc_dictionary_get_string(message, "log");
-					JBLogFunction(logFilePath, clientPid, tid, progname ? progname : "(null)", "%s", log);
+					// Hidden-whitelist diagnostics previously used a custom
+					// systemwide log path here for debugging. Keep the message id
+					// defined for compatibility, but do not write anything.
 					xpc_dictionary_set_int64(reply, "result", 0);
 					break;
 				}

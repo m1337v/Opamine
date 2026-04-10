@@ -156,6 +156,7 @@
         DORootHideInjectionModeBlacklist,
         DORootHideInjectionModeWhitelist,
         DORootHideInjectionModeHiddenWhitelist,
+        DORootHideInjectionModeBlacklistAllowlist,
     ];
 }
 
@@ -166,6 +167,7 @@
         DOLocalizedString(@"Settings_Tweak_Injection_Mode_Blacklist"),
         DOLocalizedString(@"Settings_Tweak_Injection_Mode_Whitelist"),
         DOLocalizedString(@"Settings_Tweak_Injection_Mode_HiddenWhitelist"),
+        DOLocalizedString(@"Settings_Tweak_Injection_Mode_BlacklistAllowlist"),
     ];
 }
 

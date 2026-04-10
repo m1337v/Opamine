@@ -21,12 +21,13 @@
 #include <libjailbreak/jbroot.h>
 #include <libjailbreak/roothider/jailbreakd.h>
 
-typedef enum
+typedef enum 
 {
 	kRootHideInjectionModeStock = 0,
 	kRootHideInjectionModeBlacklist,
 	kRootHideInjectionModeWhitelist,
 	kRootHideInjectionModeHiddenWhitelist,
+	kRootHideInjectionModeBlacklistAllowlist,
 } RootHideInjectionMode;
 
 #define ROOT_HIDE_MODE_PLIST_RELATIVE "/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist"
@@ -86,64 +87,16 @@ static void root_hide_trace_buffer_line(const char *line)
 
 void root_hide_set_runtime_logging_enabled(bool enabled)
 {
-	if (enabled == gRootHideRuntimeLoggingEnabled) {
-		return;
-	}
-
-	gRootHideRuntimeLoggingEnabled = enabled;
-	if (!enabled) {
-		return;
-	}
-
-	if (gRootHideTraceBufferLength > 0) {
-		char *cursor = gRootHideTraceBuffer;
-		while (*cursor != '\0') {
-			char *newline = strchr(cursor, '\n');
-			if (newline) {
-				*newline = '\0';
-			}
-			if (*cursor != '\0') {
-				if (!strncmp(cursor, "[RHI] ", 6)) {
-					root_hide_trace_emit_line(cursor + 6);
-				}
-				else {
-					root_hide_trace_emit_line(cursor);
-				}
-			}
-			if (!newline) {
-				break;
-			}
-			*newline = '\n';
-			cursor = newline + 1;
-		}
-		gRootHideTraceBuffer[0] = '\0';
-		gRootHideTraceBufferLength = 0;
-	}
-
-	if (gRootHideTraceBufferTruncated) {
-		root_hide_trace_emit_line("trace buffer truncated");
-		gRootHideTraceBufferTruncated = false;
-	}
+	(void)enabled;
+	gRootHideRuntimeLoggingEnabled = false;
+	gRootHideTraceBufferTruncated = false;
+	gRootHideTraceBuffer[0] = '\0';
+	gRootHideTraceBufferLength = 0;
 }
 
 void root_hide_hidden_whitelist_log(const char *format, ...)
 {
-	if (!format) {
-		return;
-	}
-
-	char line[1024];
-	va_list va;
-	va_start(va, format);
-	vsnprintf(line, sizeof(line), format, va);
-	va_end(va);
-
-	if (gRootHideRuntimeLoggingEnabled) {
-		root_hide_trace_emit_line(line);
-	}
-	else {
-		root_hide_trace_buffer_line(line);
-	}
+	(void)format;
 }
 
 bool string_has_prefix(const char *str, const char* prefix)
@@ -315,6 +268,11 @@ static RootHideInjectionMode root_hide_injection_mode(void)
 				xpc_release(modePlist);
 				return kRootHideInjectionModeHiddenWhitelist;
 			}
+			if (!strcmp(mode, "blacklistallowlist")) {
+				root_hide_hidden_whitelist_log("mode resolved=blacklistallowlist source=plist");
+				xpc_release(modePlist);
+				return kRootHideInjectionModeBlacklistAllowlist;
+			}
 			if (!strcmp(mode, "stock")) {
 				root_hide_hidden_whitelist_log("mode resolved=stock source=plist");
 				xpc_release(modePlist);
@@ -408,6 +366,11 @@ bool root_hide_injection_mode_is_hidden_whitelist(void)
 	return root_hide_injection_mode() == kRootHideInjectionModeHiddenWhitelist;
 }
 
+bool root_hide_injection_mode_is_blacklist_allowlist(void)
+{
+	return root_hide_injection_mode() == kRootHideInjectionModeBlacklistAllowlist;
+}
+
 bool root_hide_injection_mode_uses_whitelist_rules(void)
 {
 	RootHideInjectionMode injectionMode = root_hide_injection_mode();
@@ -472,7 +435,7 @@ kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[rest
 		return 0;
 	}
 
-	if (injectionMode == kRootHideInjectionModeBlacklist || injectionMode == kRootHideInjectionModeHiddenWhitelist) {
+	if (injectionMode == kRootHideInjectionModeBlacklist || injectionMode == kRootHideInjectionModeHiddenWhitelist || injectionMode == kRootHideInjectionModeBlacklistAllowlist) {
 		if (strstr(path, "/.jbroot-")) {
 			if (traceInjectionPath) {
 				root_hide_hidden_whitelist_log("spawn config path=%s result=0x%x reason=jbroot-helper", path, (kSpawnConfigInject | kSpawnConfigTrust));

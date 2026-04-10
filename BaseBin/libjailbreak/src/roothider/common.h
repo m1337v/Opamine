@@ -31,8 +31,11 @@ bool isBlacklistedPath(const char* path);
 
 bool isBlacklistedToken(audit_token_t* token);
 bool isBlacklistedPid(pid_t pid);
+bool isRestrictedBlacklistedToken(audit_token_t* token);
+bool isRestrictedBlacklistedPid(pid_t pid);
 
-pid_t* allocBlacklistProcessId();
+pid_t* allocBlacklistProcessId(void);
+pid_t* allocRestrictedBlacklistedProcessId(void);
 void commitBlacklistProcessId(pid_t* pidp);
 
 bool isRemovableBundlePath(const char* path);
@@ -57,7 +60,7 @@ int ensure_dyld_trustcache(const char* path);
 int ensure_randomized_cdhash(const char* inputPath, void* cdhashOut);
 int ensure_randomized_cdhash_for_slice(const char* inputPath, uint64_t offset, void* cdhashOut);
 
-char* generate_sandbox_extensions(audit_token_t *processToken, bool writable);
+char* generate_sandbox_extensions(audit_token_t *processToken, pid_t pid, const char *procPath, bool writable);
 
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath);
 

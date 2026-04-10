@@ -20,18 +20,7 @@ extern bool gInEarlyBoot;
 
 static void RootHideInjectionLaunchdLog(NSString *format, ...)
 {
-    // Only log after jailbreak is fully up (post userspace reboot, jailbreakd running).
-    // During firstLoad or earlyBoot, jailbreakd XPC is not available and logging
-    // can destabilize the bootstrap sequence.
-    if (launchdhookFirstLoad || gInEarlyBoot) {
-        return;
-    }
-
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    jbdSystemwideLog("[RHI-LD] %s", message.UTF8String);
+    (void)format;
 }
 
 static bool RootHideShouldTraceSpawnPath(const char *path)
@@ -215,10 +204,10 @@ static NSArray<NSString *> *RootHideBundleIdentifiersForSpawn(const char *path, 
 			RootHideAddBundleIdentifierCandidatesFromValue(bundleIdentifiers, value);
 		});
 
-		// Log what we found when hidden-whitelist mode is active.
+		// Log what we found when a hidden-allowlist mode is active.
 		// The guard in RootHideInjectionLaunchdLog already ensures this only runs
 		// after the jailbreak is fully up.
-		if (root_hide_injection_mode_is_hidden_whitelist()) {
+		if (root_hide_injection_mode_is_hidden_whitelist() || root_hide_injection_mode_is_blacklist_allowlist()) {
 			NSMutableString *argvDump = [NSMutableString string];
 			if (argv) {
 				for (int i = 0; argv[i]; i++) {
@@ -705,15 +694,17 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	bool roothideBlacklisted = isBlacklistedPath(path)
 		|| (hiddenWhitelistBundleIdentifier.length > 0 && isBlacklistedApp(hiddenWhitelistBundleIdentifier.UTF8String));
 	bool hiddenWhitelistMode = root_hide_injection_mode_is_hidden_whitelist();
-	bool hiddenWhitelistBootstrapEnabled = hiddenWhitelistMode && RootHideShouldEnableHiddenWhitelistBootstrap(path, argv, envp);
-	if (hiddenWhitelistMode) {
-		RootHideInjectionLaunchdLog(@"spawn path=%s bundle=%@ blacklisted=%d hiddenMode=%d hiddenBootstrap=%d", path ?: "(null)", hiddenWhitelistBundleIdentifier ?: @"(null)", roothideBlacklisted, hiddenWhitelistMode, hiddenWhitelistBootstrapEnabled);
+	bool blacklistAllowlistMode = root_hide_injection_mode_is_blacklist_allowlist();
+	bool hiddenAllowlistMode = hiddenWhitelistMode || blacklistAllowlistMode;
+	bool hiddenWhitelistBootstrapEnabled = hiddenAllowlistMode && RootHideShouldEnableHiddenWhitelistBootstrap(path, argv, envp);
+	if (hiddenAllowlistMode) {
+		RootHideInjectionLaunchdLog(@"spawn path=%s bundle=%@ blacklisted=%d hiddenMode=%d blacklistAllowlistMode=%d hiddenBootstrap=%d", path ?: "(null)", hiddenWhitelistBundleIdentifier ?: @"(null)", roothideBlacklisted, hiddenWhitelistMode, blacklistAllowlistMode, hiddenWhitelistBootstrapEnabled);
 	}
-	if (roothideBlacklisted && hiddenWhitelistMode && hiddenWhitelistBootstrapEnabled)
+	if (roothideBlacklisted && hiddenAllowlistMode && hiddenWhitelistBootstrapEnabled)
 	{
 		int ret;
 
-		RootHideInjectionLaunchdLog(@"taking hidden-whitelist branch path=%s", path ?: "(null)");
+		RootHideInjectionLaunchdLog(@"taking hidden allowlist branch path=%s mode=%s", path ?: "(null)", blacklistAllowlistMode ? "blacklistallowlist" : "hiddenwhitelist");
 
 		char **envc = envbuf_mutcopy((const char **)envp);
 
@@ -726,23 +717,26 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		}
 		else {
 
-			// CRITICAL: Do NOT register this process as blacklisted.
-			// Blacklisted PIDs are blocked by roothide_domain_allowed() in
-			// jbdomain_roothide.c, which causes jailbreakd to REFUSE the
-			// process checkin.  Without checkin, systemhook's constructor
-			// bails out and no tweaks load.
-			//
-			// Hidden-whitelist processes need the full JB infrastructure
-			// (checkin, sandbox extensions, patched dyld) to function.
-			// The ROOTHIDE_HIDDEN_INJECTION env var tells systemhook to
-			// activate hidden mode (no forkfix, no rootlesshooks, no
-			// exec/spawn hooks) while still loading selected tweaks.
 			pid_t spawnedPid = 0;
-			ret = __posix_spawn_hook(&spawnedPid, path, desc, argv, envc);
+			if (blacklistAllowlistMode) {
+				// Blacklist + Allowlist keeps the process in a restricted
+				// blacklisted class for Roothide's hiding paths, but allows
+				// roothide/systemwide domain access so systemhook can still
+				// check in and load the selected hidden tweak subset.
+				volatile pid_t *restrictedPidp = allocRestrictedBlacklistedProcessId();
+				ret = __posix_spawn_hook((pid_t *)restrictedPidp, path, desc, argv, envc);
+				spawnedPid = *restrictedPidp;
+				commitBlacklistProcessId((pid_t *)restrictedPidp);
+			}
+			else {
+				// Hidden Whitelist keeps the process fully out of the
+				// blacklisted PID state and relies on the hidden env markers.
+				ret = __posix_spawn_hook(&spawnedPid, path, desc, argv, envc);
+			}
 
 			if(pidp) *pidp = spawnedPid;
 
-			RootHideInjectionLaunchdLog(@"hidden-whitelist spawn result ret=%d pid=%d path=%s", ret, spawnedPid, path ?: "(null)");
+			RootHideInjectionLaunchdLog(@"hidden allowlist spawn result ret=%d pid=%d path=%s mode=%s", ret, spawnedPid, path ?: "(null)", blacklistAllowlistMode ? "blacklistallowlist" : "hiddenwhitelist");
 
 			envbuf_free(envc);
 

@@ -160,13 +160,10 @@ void *dyld_dlsym_hook(void *dyld, void *handle, const char *name)
 		return sandbox_apply_hook;
 	}
 
-	// NOTE: dlsym remap for hidden injection is handled at the GOT level
-	// by h_dlsym in hidden_dylib_hider.c, which correctly differentiates
-	// between app callers (remapped) and hidden callers like tweaks/ellekit
-	// (pass-through to real pointers).  Do NOT add a remap here — this
-	// vtable hook intercepts ALL callers unconditionally, which would break
-	// tweak loading by giving ellekit/TweakLoader our hooked pointers
-	// instead of the real DSC ones they need for trampoline setup.
+	// NOTE: hidden dlsym remapping is handled in hidden_dylib_hider.c via the
+	// app GOT rebind path. Do not add remap logic here: this dyld vtable hook
+	// intercepts all callers unconditionally, which breaks tweak/runtime callers
+	// that need stock DSC pointers for trampoline setup.
 
 	__attribute__((musttail)) return dyld_dlsym_orig(dyld, handle, name);
 }
@@ -447,13 +444,7 @@ static bool consume_hidden_tweak_loading_env(void)
 void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rhi_diag_log(const char *fmt, ...)
 {
-	va_list va;
-	va_start(va, fmt);
-	char line[4096];
-	int len = snprintf(line, sizeof(line), "[RHI-DIAG][%d][%s] ", getpid(), getprogname() ?: "?");
-	vsnprintf(line + len, sizeof(line) - len, fmt, va);
-	va_end(va);
-	fprintf(stderr, "%s\n", line);
+	(void)fmt;
 }
 
 __attribute__((constructor)) static void initializer(void)
@@ -592,9 +583,9 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 
 		// Diagnostic: warn if mode is hiddenwhitelist but env vars were not propagated
 		// This indicates launchdhook failed to set ROOTHIDE_HIDDEN_INJECTION for this spawn
-		if (!gHiddenInjection && root_hide_injection_mode_is_hidden_whitelist()) {
+		if (!gHiddenInjection && (root_hide_injection_mode_is_hidden_whitelist() || root_hide_injection_mode_is_blacklist_allowlist())) {
 			if (strstr(gExecutablePath, ".app/") || strstr(gExecutablePath, ".appex/")) {
-				root_hide_hidden_whitelist_log("WARNING: hiddenwhitelist mode active but hiddenInjection=0 for app executable=%s (launchdhook env propagation may have failed)", gExecutablePath);
+				root_hide_hidden_whitelist_log("WARNING: hidden allowlist mode active but hiddenInjection=0 for app executable=%s (launchdhook env propagation may have failed)", gExecutablePath);
 			}
 		}
 
@@ -680,6 +671,12 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 			else {
 				root_hide_hidden_whitelist_log("TweakLoader missing executable=%s", gExecutablePath);
 			}
+		}
+
+		if (gHiddenInjection) {
+			extern void hidden_dylib_hider_enable_strict_hooks(void);
+			hidden_dylib_hider_enable_strict_hooks();
+			rhi_diag_log("POST-HIDER-STRICT OK");
 		}
 
 #ifndef __arm64e__

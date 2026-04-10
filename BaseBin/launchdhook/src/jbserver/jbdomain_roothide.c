@@ -15,7 +15,7 @@ int roothide_unsupport_request()
 bool roothide_domain_allowed(audit_token_t clientToken)
 {
 	//its fast enough
-	if(isBlacklistedToken(&clientToken)) {
+	if(isBlacklistedToken(&clientToken) && !isRestrictedBlacklistedToken(&clientToken)) {
 		JBLogDebug("ignore xpc message from blacklisted process (%d),%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
 		return false;
 	}

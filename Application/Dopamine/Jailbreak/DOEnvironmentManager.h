@@ -14,6 +14,7 @@ FOUNDATION_EXPORT NSString * const DORootHideInjectionModeStock;
 FOUNDATION_EXPORT NSString * const DORootHideInjectionModeBlacklist;
 FOUNDATION_EXPORT NSString * const DORootHideInjectionModeWhitelist;
 FOUNDATION_EXPORT NSString * const DORootHideInjectionModeHiddenWhitelist;
+FOUNDATION_EXPORT NSString * const DORootHideInjectionModeBlacklistAllowlist;
 
 @interface DOEnvironmentManager : NSObject
 {

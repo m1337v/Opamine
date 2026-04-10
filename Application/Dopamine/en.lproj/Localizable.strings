@@ -44,6 +44,7 @@
 "Settings_Tweak_Injection_Mode_Blacklist" = "Default-On + Denylist";
 "Settings_Tweak_Injection_Mode_Whitelist" = "Default-Off + Allowlist";
 "Settings_Tweak_Injection_Mode_HiddenWhitelist" = "Hidden + Allowlist";
+"Settings_Tweak_Injection_Mode_BlacklistAllowlist" = "Blacklist + Allowlist";
 "Settings_iDownload" = "iDownload (Developer Shell)";
 "Settings_Verbose_Logs" = "Verbose Logs";
 "Settings_Apps_JIT" = "Allow JIT in Apps";

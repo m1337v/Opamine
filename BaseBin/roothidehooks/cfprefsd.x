@@ -11,6 +11,50 @@ extern pid_t xpc_connection_get_pid(xpc_connection_t connection)
 
 pid_t __thread gCurrentClientPid = 0;
 
+static NSString * const kRootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
+static NSString * const kRootHideInjectionModeBlacklistAllowlist = @"blacklistallowlist";
+static NSString * const kRootHideModeRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist";
+
+static BOOL rootHideHiddenWhitelistModeEnabled(void)
+{
+    NSString *modePath = JBROOT_PATH(kRootHideModeRelativePath);
+    if (modePath.length == 0) {
+        return NO;
+    }
+
+    NSDictionary *modeConfiguration = [NSDictionary dictionaryWithContentsOfFile:modePath];
+    NSString *mode = [modeConfiguration isKindOfClass:[NSDictionary class]] ? modeConfiguration[@"mode"] : nil;
+    return [mode isEqualToString:kRootHideInjectionModeHiddenWhitelist]
+        || [mode isEqualToString:kRootHideInjectionModeBlacklistAllowlist];
+}
+
+static BOOL currentClientIsHiddenWhitelistAppCaller(void)
+{
+    if (gCurrentClientPid <= 1) {
+        return NO;
+    }
+
+    if (!rootHideHiddenWhitelistModeEnabled()) {
+        return NO;
+    }
+
+    char procPath[PATH_MAX] = {0};
+    if (!proc_get_path(gCurrentClientPid, procPath) || procPath[0] == '\0') {
+        return NO;
+    }
+
+    if (!isRemovableBundlePath(procPath)) {
+        return NO;
+    }
+
+    char identifier[255] = {0};
+    if (!proc_get_identifier(gCurrentClientPid, identifier) || identifier[0] == '\0') {
+        return NO;
+    }
+
+    return isBlacklistedApp(identifier);
+}
+
 BOOL preferencePlistNeedsRedirection(NSString *plistPath)
 {
     NSString *pattern = @"^(/private)?/var/(\\w+)/Library/Preferences/";
@@ -57,6 +101,55 @@ BOOL preferencePlistNeedsRedirection(NSString *plistPath)
 	return ![additionalSystemPlistNames containsObject:plistName];
 }
 
+static BOOL preferenceDomainShouldStayStock(NSString *identifier, NSString *plistName)
+{
+    NSString *normalizedIdentifier = [identifier isKindOfClass:[NSString class]] ? identifier : @"";
+    NSString *normalizedPlistName = [plistName isKindOfClass:[NSString class]] ? plistName : @"";
+
+    // Keep stock behavior for direct path-style suite probes. These are a common
+    // detector trick and do not represent normal CFPreferences domain usage.
+    if ([normalizedIdentifier containsString:@"/"]) {
+        return YES;
+    }
+
+    NSString *domain = normalizedIdentifier.length > 0
+        ? normalizedIdentifier
+        : (normalizedPlistName.length > 0 ? normalizedPlistName.stringByDeletingPathExtension : @"");
+
+    static NSSet<NSString *> *suspiciousDomains;
+    static NSSet<NSString *> *suspiciousPlistNames;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        suspiciousDomains = [NSSet setWithArray:@[
+            @"com.opa334.choicyprefs",
+            @"com.opa334.craneprefs",
+            @"com.spark.snowboardprefs",
+            @"com.tigisoftware.Filza",
+            @"org.coolstar.SileoStore",
+            @"ru.domo.cocoatop64",
+            @"ws.hbang.Terminal",
+            @"xyz.willy.Zebra",
+            @"me.jjolano.shadow",
+            @"ABPattern"
+        ]];
+        suspiciousPlistNames = [NSSet setWithArray:@[
+            @"com.opa334.choicyprefs.plist",
+            @"com.opa334.craneprefs.plist",
+            @"com.spark.snowboardprefs.plist",
+            @"com.tigisoftware.Filza.plist",
+            @"org.coolstar.SileoStore.plist",
+            @"ru.domo.cocoatop64.plist",
+            @"ws.hbang.Terminal.plist",
+            @"xyz.willy.Zebra.plist",
+            @"me.jjolano.shadow.plist",
+            @"ABPattern.plist",
+            @"ABPattern"
+        ]];
+    });
+
+    return [suspiciousDomains containsObject:domain] || [suspiciousPlistNames containsObject:normalizedPlistName];
+}
+
 BOOL (*orig_CFPrefsGetPathForTriplet)(CFStringRef, CFStringRef, BOOL, CFStringRef, UInt8*);
 BOOL new_CFPrefsGetPathForTriplet(CFStringRef identifier, CFStringRef user, BOOL byHost, CFStringRef container, UInt8 *buffer)
 {
@@ -70,6 +163,15 @@ BOOL new_CFPrefsGetPathForTriplet(CFStringRef identifier, CFStringRef user, BOOL
 	{
 		NSString* origPath = [NSString stringWithUTF8String:(char*)buffer];
 		BOOL needsRedirection = preferencePlistNeedsRedirection(origPath);
+        NSString *plistName = origPath.lastPathComponent ?: @"";
+        NSString *identifierString = (__bridge NSString *)identifier;
+
+		if (needsRedirection) {
+            if (currentClientIsHiddenWhitelistAppCaller() && preferenceDomainShouldStayStock(identifierString, plistName)) {
+                NSLog(@"CFPrefsGetPathForTriplet keep stock path for suspicious probe identifier=%@ path=%@", identifierString, origPath);
+                needsRedirection = NO;
+            }
+        }
 
 		if (needsRedirection) {
 			if(gCurrentClientPid>0 && jbclient_blacklist_check_pid(gCurrentClientPid)==true) {

@@ -314,31 +314,8 @@ int jbdTestCall(int value)
 
 int jbdSystemwideLog(const char* fmt, ...)
 {
-	char* log = NULL;
-
-	va_list args;
-	va_start(args, fmt);
-	vasprintf(&log, fmt, args);
-	va_end(args);
-
-	__uint64_t tid = 0;
-	pthread_threadid_np(pthread_self(), &tid);
-
-	xpc_object_t message = xpc_dictionary_create_empty();
-	xpc_dictionary_set_uint64(message, "id", JBD_MSG_SYSTEMWIDE_LOG);
-	xpc_dictionary_set_uint64(message, "tid", tid);
-	xpc_dictionary_set_string(message, "log", log);
-
-	xpc_object_t reply = jailbreakdXpcRequest(message);
-	xpc_release(message);
-
-	free(log);
-
-	if (!reply) return -100;
-
-	int result = xpc_dictionary_get_int64(reply, "result");
-	xpc_release(reply);
-	return result;
+	(void)fmt;
+	return 0;
 }
 
 int jbdSpawnPatchChild(int pid, bool resume)

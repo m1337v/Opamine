@@ -8,6 +8,7 @@ static NSString * const kRootHideInjectionModeStock = @"stock";
 static NSString * const kRootHideInjectionModeBlacklist = @"blacklist";
 static NSString * const kRootHideInjectionModeWhitelist = @"whitelist";
 static NSString * const kRootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
+static NSString * const kRootHideInjectionModeBlacklistAllowlist = @"blacklistallowlist";
 static NSString * const kRootHideModeRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist";
 static NSString * const kRootHideInjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.plist";
 static NSString * const kRootHideInjectSystemRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.system.plist";
@@ -18,7 +19,7 @@ static NSString * const kRootHideUninjectRelativePath = @"/var/mobile/Library/Ro
 
 static NSString *normalizedRootHideInjectionMode(NSString *mode)
 {
-    if ([mode isEqualToString:kRootHideInjectionModeBlacklist] || [mode isEqualToString:kRootHideInjectionModeWhitelist] || [mode isEqualToString:kRootHideInjectionModeHiddenWhitelist]) {
+    if ([mode isEqualToString:kRootHideInjectionModeBlacklist] || [mode isEqualToString:kRootHideInjectionModeWhitelist] || [mode isEqualToString:kRootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:kRootHideInjectionModeBlacklistAllowlist]) {
         return mode;
     }
     if ([mode isEqualToString:kRootHideInjectionModeStock]) {
@@ -251,12 +252,12 @@ bool isBlacklistedPath(const char* path)
 	if(!path) return false;
 
     NSString *mode = rootHideInjectionMode();
-    if ([mode isEqualToString:kRootHideInjectionModeHiddenWhitelist]) {
+    if ([mode isEqualToString:kRootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:kRootHideInjectionModeBlacklistAllowlist]) {
         // Hidden whitelist keeps the classic RootHide hidden-app semantics.
         // Injection is separately gated by the executable allowlist at spawn time.
         bool result = isBlacklistedPathOrig(path);
         if (RootHideShouldTracePath(path)) {
-            RootHideTraceLog(@"blacklist path=%s mode=%@ result=%d reason=hiddenwhitelist-orig", path, mode, result);
+            RootHideTraceLog(@"blacklist path=%s mode=%@ result=%d reason=hidden-allowlist-orig", path, mode, result);
         }
         return result;
     }

@@ -32,16 +32,21 @@
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <sys/mount.h>
+#include <sys/statvfs.h>
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <dirent.h>
 
 #include "common.h"
 
 // From roothider_main.c — non-static after our edit
 extern bool hidden_tweak_filter_should_block_path(const char *path);
+extern bool dyld_patch_fallback_enabled;
+extern bool dlopen_fallback_hook_installed;
+extern void *dlopen_fallback_hook(const char *path, int mode);
 
 // dyld private — always available, NOT hooked by us
 extern const char *dyld_image_path_containing_address(const void *addr);
@@ -71,6 +76,7 @@ static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, 
 static const char *(*orig_class_getImageName)(Class) = NULL;
 static const char * _Nonnull *(*orig_objc_copyImageNames)(unsigned int *) = NULL;
 static const char * _Nonnull *(*orig_objc_copyClassNamesForImage)(const char *, unsigned int *) = NULL;
+static void (*orig_objc_addLoadImageFunc)(objc_func_loadImage) = NULL;
 static void *(*orig_dlopen)(const char *, int) = NULL;
 static pid_t (*orig_fork)(void) = NULL;
 static int (*orig_getfsstat)(struct statfs *, int, int) = NULL;
@@ -79,8 +85,13 @@ static char *(*orig_getenv)(const char *) = NULL;
 static int (*orig_access)(const char *, int) = NULL;
 static int (*orig_stat)(const char *, struct stat *) = NULL;
 static int (*orig_lstat)(const char *, struct stat *) = NULL;
+static int (*orig_statfs)(const char *, struct statfs *) = NULL;
+static int (*orig_statvfs)(const char *, struct statvfs *) = NULL;
 static FILE *(*orig_fopen)(const char *, const char *) = NULL;
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+static DIR *(*orig_opendir)(const char *) = NULL;
+static struct dirent *(*orig_readdir)(DIR *) = NULL;
+static int (*orig_closedir)(DIR *) = NULL;
 
 // Forward declarations of hook functions (needed by translate_hook_to_orig)
 static uint32_t h_image_count(void);
@@ -96,6 +107,7 @@ static void *h_dlsym(void *handle, const char *symbol);
 static const char *h_class_getImageName(Class cls);
 static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount);
 static const char * _Nonnull *h_objc_copyClassNamesForImage(const char *image, unsigned int *outCount);
+static void h_objc_addLoadImageFunc(objc_func_loadImage func);
 static void *h_dlopen(const char *path, int mode);
 static pid_t h_fork(void);
 static int h_getfsstat(struct statfs *buf, int bufsize, int mode);
@@ -104,8 +116,14 @@ static char *h_getenv(const char *name);
 static int h_access(const char *path, int mode);
 static int h_stat(const char *path, struct stat *buf);
 static int h_lstat(const char *path, struct stat *buf);
+static int h_statfs(const char *path, struct statfs *buf);
+static int h_statvfs(const char *path, struct statvfs *buf);
 static FILE *h_fopen(const char *path, const char *mode);
 static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+static DIR *h_opendir(const char *path);
+static struct dirent *h_readdir(DIR *dirp);
+static int h_closedir(DIR *dirp);
+static bool fs_path_should_hide(const char *path);
 
 //------------------------------------------------------------------------------
 #pragma mark - Image Entry + Dynamic Array
@@ -166,6 +184,132 @@ static image_array_t g_all     = {0};  // Every image (tweaks see this)
 static image_array_t g_visible = {0};  // Filtered (app sees this)
 static os_unfair_lock g_lock   = OS_UNFAIR_LOCK_INIT;
 
+typedef enum {
+	DIR_FILTER_NONE = 0,
+	DIR_FILTER_PREBOOT_ROOT,
+	DIR_FILTER_PREBOOT_HASH_ROOT,
+} dir_filter_kind_t;
+
+typedef struct dir_filter_entry {
+	DIR *dirp;
+	dir_filter_kind_t kind;
+	struct dir_filter_entry *next;
+} dir_filter_entry_t;
+
+static dir_filter_entry_t *g_dir_filters = NULL;
+static os_unfair_lock g_dir_filter_lock = OS_UNFAIR_LOCK_INIT;
+
+static bool path_is_preboot_root(const char *path) {
+	return path && (!strcmp(path, "/private/preboot") || !strcmp(path, "/private/preboot/"));
+}
+
+static bool path_is_preboot_hash_root(const char *path) {
+	if (!path || !string_has_prefix(path, "/private/preboot/")) {
+		return false;
+	}
+
+	const char *relative = path + sizeof("/private/preboot/") - 1;
+	if (!relative[0]) {
+		return false;
+	}
+	if (strchr(relative, '/')) {
+		return false;
+	}
+	if (!strcmp(relative, "active")) {
+		return false;
+	}
+	return true;
+}
+
+static dir_filter_kind_t dir_filter_kind_for_path(const char *path) {
+	if (path_is_preboot_root(path)) {
+		return DIR_FILTER_PREBOOT_ROOT;
+	}
+	if (path_is_preboot_hash_root(path)) {
+		return DIR_FILTER_PREBOOT_HASH_ROOT;
+	}
+	return DIR_FILTER_NONE;
+}
+
+static void register_dir_filter(DIR *dirp, dir_filter_kind_t kind) {
+	if (!dirp || kind == DIR_FILTER_NONE) {
+		return;
+	}
+
+	dir_filter_entry_t *entry = calloc(1, sizeof(*entry));
+	if (!entry) {
+		return;
+	}
+
+	entry->dirp = dirp;
+	entry->kind = kind;
+
+	os_unfair_lock_lock(&g_dir_filter_lock);
+	entry->next = g_dir_filters;
+	g_dir_filters = entry;
+	os_unfair_lock_unlock(&g_dir_filter_lock);
+}
+
+static dir_filter_kind_t lookup_dir_filter(DIR *dirp) {
+	dir_filter_kind_t kind = DIR_FILTER_NONE;
+
+	os_unfair_lock_lock(&g_dir_filter_lock);
+	for (dir_filter_entry_t *entry = g_dir_filters; entry; entry = entry->next) {
+		if (entry->dirp == dirp) {
+			kind = entry->kind;
+			break;
+		}
+	}
+	os_unfair_lock_unlock(&g_dir_filter_lock);
+
+	return kind;
+}
+
+static void unregister_dir_filter(DIR *dirp) {
+	os_unfair_lock_lock(&g_dir_filter_lock);
+	dir_filter_entry_t **cursor = &g_dir_filters;
+	while (*cursor) {
+		if ((*cursor)->dirp == dirp) {
+			dir_filter_entry_t *entry = *cursor;
+			*cursor = entry->next;
+			free(entry);
+			break;
+		}
+		cursor = &(*cursor)->next;
+	}
+	os_unfair_lock_unlock(&g_dir_filter_lock);
+}
+
+static bool preboot_root_entry_should_hide(const char *name) {
+	if (!name || !name[0]) {
+		return false;
+	}
+
+	return !strcmp(name, ".installed_palera1n")
+	    || !strcmp(name, "jb")
+	    || !strcmp(name, "procursus");
+}
+
+static bool preboot_hash_root_entry_should_hide(const char *name) {
+	if (!name || !name[0]) {
+		return false;
+	}
+
+	return string_has_prefix(name, "dopamine-")
+	    || string_has_prefix(name, "jb-");
+}
+
+static bool dir_entry_should_hide(dir_filter_kind_t kind, const char *name) {
+	switch (kind) {
+		case DIR_FILTER_PREBOOT_ROOT:
+			return preboot_root_entry_should_hide(name);
+		case DIR_FILTER_PREBOOT_HASH_ROOT:
+			return preboot_hash_root_entry_should_hide(name);
+		default:
+			return false;
+	}
+}
+
 // Callback tracking — stores app AND tweak registrations separately
 typedef struct {
 	void (*func)(const struct mach_header *, intptr_t);
@@ -178,6 +322,13 @@ static uint32_t    g_add_cb_cap = 0;
 static cb_entry_t *g_rem_cbs    = NULL;
 static uint32_t    g_rem_cb_n   = 0;
 static uint32_t    g_rem_cb_cap = 0;
+typedef struct {
+	objc_func_loadImage func;
+	bool                from_hidden;
+} objc_load_cb_entry_t;
+static objc_load_cb_entry_t *g_objc_addload_cbs = NULL;
+static uint32_t              g_objc_addload_cb_n = 0;
+static uint32_t              g_objc_addload_cb_cap = 0;
 
 // task_info(TASK_DYLD_INFO) snapshot
 static struct dyld_all_image_infos  g_ti_snap     = {0};
@@ -188,6 +339,7 @@ static uint32_t                     g_ti_uuid_cap = 0;
 static struct dyld_all_image_infos *g_real_aii    = NULL;  // cached from first task_info call
 
 static bool g_inited = false;
+static bool g_strict_hooks_enabled = false;
 
 // Cache the executable path for dladdr / class_getImageName substitution
 static const char *g_executable_path = NULL;
@@ -296,6 +448,9 @@ static void on_image_added(const struct mach_header *mh, intptr_t slide) {
 	uint32_t n = g_add_cb_n;
 	cb_entry_t *snapshot = n ? malloc(n * sizeof(cb_entry_t)) : NULL;
 	if (snapshot) memcpy(snapshot, g_add_cbs, n * sizeof(cb_entry_t));
+	uint32_t objc_n = g_objc_addload_cb_n;
+	objc_load_cb_entry_t *objc_snapshot = objc_n ? malloc(objc_n * sizeof(objc_load_cb_entry_t)) : NULL;
+	if (objc_snapshot) memcpy(objc_snapshot, g_objc_addload_cbs, objc_n * sizeof(objc_load_cb_entry_t));
 
 	os_unfair_lock_unlock(&g_lock);
 
@@ -308,9 +463,14 @@ static void on_image_added(const struct mach_header *mh, intptr_t slide) {
 	}
 	free(snapshot);
 
-	// NOTE: objc_addLoadImageFunc callbacks are handled separately —
-	// h_dlsym returns NULL for app callers resolving this symbol,
-	// forcing fallback to _dyld_register_func_for_add_image (which we hook).
+	// ObjC load-image callbacks use the objc_addLoadImageFunc signature
+	// (header only, no slide). Keep the same visibility policy as the dyld
+	// add-image callbacks without returning NULL from dlsym for a real API.
+	for (uint32_t i = 0; i < objc_n; i++) {
+		if (objc_snapshot[i].from_hidden || !hide)
+			objc_snapshot[i].func(mh);
+	}
+	free(objc_snapshot);
 }
 
 static void on_image_removed(const struct mach_header *mh, intptr_t slide) {
@@ -627,7 +787,9 @@ static const void *translate_hook_to_orig(const void *addr) {
 		{ (const void *)h_class_getImageName,            (void *const *)&orig_class_getImageName },
 		{ (const void *)h_objc_copyImageNames,           (void *const *)&orig_objc_copyImageNames },
 		{ (const void *)h_objc_copyClassNamesForImage,   (void *const *)&orig_objc_copyClassNamesForImage },
+		{ (const void *)h_objc_addLoadImageFunc,         (void *const *)&orig_objc_addLoadImageFunc },
 		{ (const void *)h_dlopen,                        (void *const *)&orig_dlopen },
+		{ (const void *)dlopen_fallback_hook,            (void *const *)&orig_dlopen },
 		{ (const void *)h_fork,                          (void *const *)&orig_fork },
 		{ (const void *)h_getfsstat,                     (void *const *)&orig_getfsstat },
 		{ (const void *)h_sysctl,                        (void *const *)&orig_sysctl },
@@ -635,8 +797,13 @@ static const void *translate_hook_to_orig(const void *addr) {
 		{ (const void *)h_access,                        (void *const *)&orig_access },
 		{ (const void *)h_stat,                          (void *const *)&orig_stat },
 		{ (const void *)h_lstat,                         (void *const *)&orig_lstat },
+		{ (const void *)h_statfs,                        (void *const *)&orig_statfs },
+		{ (const void *)h_statvfs,                       (void *const *)&orig_statvfs },
 		{ (const void *)h_fopen,                         (void *const *)&orig_fopen },
 		{ (const void *)h_sysctlbyname,                  (void *const *)&orig_sysctlbyname },
+		{ (const void *)h_opendir,                       (void *const *)&orig_opendir },
+		{ (const void *)h_readdir,                       (void *const *)&orig_readdir },
+		{ (const void *)h_closedir,                      (void *const *)&orig_closedir },
 	};
 	for (unsigned i = 0; i < sizeof(map) / sizeof(*map); i++) {
 		if (addr == map[i].hook)
@@ -668,12 +835,12 @@ static int h_dladdr(const void *addr, Dl_info *info) {
 	// because dladdr never fails for valid addresses on stock iOS.
 	// This matches h_class_getImageName's strategy of returning g_executable_path.
 	if (info && info->dli_fname && image_path_should_hide(info->dli_fname)) {
-		// Rewrite ALL fields to match the app executable — partial rewrites
-		// (only dli_fname) leave dli_fbase pointing at ellekit/tweak mach_header
-		// which detection SDKs cross-check against _dyld_get_image_header(0).
+		// Rewrite the owning image to match the app executable. Preserve the
+		// symbol name so callers that stringify dli_sname don't crash on NULL.
+		// dli_saddr stays cleared because it would otherwise still point into the
+		// hidden image even after we swap dli_fbase to the app binary.
 		info->dli_fname = g_executable_path;
 		info->dli_fbase = (void *)orig_dyld_get_image_header(0);
-		info->dli_sname = NULL;
 		info->dli_saddr = NULL;
 		return 1;
 	}
@@ -701,12 +868,10 @@ static void *h_dlsym(void *handle, const char *symbol) {
 		void *remapped = hidden_dylib_hider_dlsym_remap(symbol);
 		if (remapped) return remapped;
 
-		// Block objc_addLoadImageFunc: SF resolves this via dlsym
-		// to register image-load callbacks that bypass _dyld_register_func_for_add_image.
-		// Returning NULL forces it to fall back to _dyld_register_func_for_add_image
-		// (which we hook and filter properly).
+		// Filtered wrapper for ObjC image-load callbacks. Returning NULL here is
+		// risky for Swift callers because objc_addLoadImageFunc is a real API.
 		if (strcmp(symbol, "objc_addLoadImageFunc") == 0)
-			return NULL;
+			return (void *)h_objc_addLoadImageFunc;
 	}
 
 	// App caller: if the resolved address lives in a hidden image,
@@ -790,6 +955,38 @@ static const char * _Nonnull *h_objc_copyClassNamesForImage(const char *image, u
 	return orig_objc_copyClassNamesForImage(image, outCount);
 }
 
+__attribute__((noinline))
+static void h_objc_addLoadImageFunc(objc_func_loadImage func) {
+	if (!func) return;
+
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool hidden = caller_is_hidden(ra);
+
+	os_unfair_lock_lock(&g_lock);
+
+	if (g_objc_addload_cb_n >= g_objc_addload_cb_cap) {
+		g_objc_addload_cb_cap = g_objc_addload_cb_cap ? g_objc_addload_cb_cap * 2 : 8;
+		g_objc_addload_cbs = realloc(g_objc_addload_cbs, g_objc_addload_cb_cap * sizeof(objc_load_cb_entry_t));
+	}
+	g_objc_addload_cbs[g_objc_addload_cb_n++] = (objc_load_cb_entry_t){ .func = func, .from_hidden = hidden };
+
+	const image_array_t *a = hidden ? &g_all : &g_visible;
+	uint32_t n = a->count;
+	const struct mach_header **hdrs = NULL;
+	if (n) {
+		hdrs = malloc(n * sizeof(void *));
+		for (uint32_t i = 0; i < n; i++) {
+			hdrs[i] = a->items[i].header;
+		}
+	}
+
+	os_unfair_lock_unlock(&g_lock);
+
+	for (uint32_t i = 0; i < n; i++)
+		func(hdrs[i]);
+	free(hdrs);
+}
+
 //------------------------------------------------------------------------------
 #pragma mark - fork hook
 //
@@ -804,8 +1001,8 @@ static pid_t h_fork(void) {
 	if (caller_is_hidden(ra))
 		return orig_fork();
 
-	// App caller: deny fork as if sandboxed
-	errno = ENOSYS;
+	// App caller: deny fork the same way a stock sandboxed app usually sees it.
+	errno = EPERM;
 	return -1;
 }
 
@@ -825,6 +1022,14 @@ static bool mount_entry_should_hide(const struct statfs *fs) {
 	    (on   && (strstr(on,   ".jbroot") || strstr(on,   "procursus"))))
 		return true;
 	return false;
+}
+
+static void sanitize_mount_entry(struct statfs *fs) {
+	if (!fs) return;
+
+	strlcpy(fs->f_fstypename, "apfs", sizeof(fs->f_fstypename));
+	strlcpy(fs->f_mntonname, "/", sizeof(fs->f_mntonname));
+	strlcpy(fs->f_mntfromname, "/dev/disk1s1s1", sizeof(fs->f_mntfromname));
 }
 
 __attribute__((noinline))
@@ -868,6 +1073,43 @@ static int h_getfsstat(struct statfs *buf, int bufsize, int mode) {
 	return kept;
 }
 
+__attribute__((noinline))
+static int h_statfs(const char *path, struct statfs *buf) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra))
+		return orig_statfs(path, buf);
+
+	if (path && fs_path_should_hide(path)) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	int result = orig_statfs(path, buf);
+	if (result != 0 || !buf)
+		return result;
+
+	if (mount_entry_should_hide(buf))
+		sanitize_mount_entry(buf);
+
+	return result;
+}
+
+__attribute__((noinline))
+static int h_statvfs(const char *path, struct statvfs *buf) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra))
+		return orig_statvfs(path, buf);
+
+	// Darwin's statvfs result does not expose mount path strings, so the useful
+	// app-visible probe here is the input path itself. Keep it stock otherwise.
+	if (path && fs_path_should_hide(path)) {
+		errno = ENOENT;
+		return -1;
+	}
+
+	return orig_statvfs(path, buf);
+}
+
 //------------------------------------------------------------------------------
 #pragma mark - sysctl hook (P_TRACED)
 //
@@ -887,7 +1129,7 @@ static int h_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 		return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
 
 	int result = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-	if (result != 0 || !oldp || !name)
+	if (result != 0 || !oldp || !oldlenp || !name)
 		return result;
 
 	// Only filter KERN_PROC queries (name[0]==CTL_KERN, name[1]==KERN_PROC)
@@ -964,6 +1206,30 @@ static bool fs_path_should_hide(const char *path) {
 
 	// Paths containing .jbroot (roothide prefix)
 	if (strstr(path, "/.jbroot-") || strstr(path, "/.jbroot/")) return true;
+
+	// Rootless preboot probes recovered from TrueMoney and common jailbreak
+	// layouts. Keep the bare preboot root and /private/preboot/active stock-like:
+	// third-party apps can observe those on non-jailbroken systems too. Only hide
+	// the actual jailbreak-owned descendants and direct artifact markers.
+	static const char *preboot_exact_paths[] = {
+		"/private/preboot/.installed_palera1n",
+		"/private/preboot/jb",
+		"/private/preboot/jb/",
+		"/private/preboot/procursus",
+		"/private/preboot/procursus/",
+		NULL
+	};
+	for (int i = 0; preboot_exact_paths[i]; i++) {
+		if (strcmp(path, preboot_exact_paths[i]) == 0) return true;
+	}
+	if (string_has_prefix(path, "/private/preboot/")) {
+		const char *prebootRelative = path + sizeof("/private/preboot/") - 1;
+		if (strstr(prebootRelative, "/dopamine-") != NULL) return true;
+		if (strstr(prebootRelative, "/jb-") != NULL) return true;
+		if (strstr(prebootRelative, "/procursus") != NULL) return true;
+		if (strstr(prebootRelative, "/.installed_dopamine") != NULL) return true;
+		if (strstr(prebootRelative, "/.installed_palera1n") != NULL) return true;
+	}
 
 	// Common jailbreak artifacts from SF's needle table
 	static const char *jb_paths[] = {
@@ -1077,6 +1343,50 @@ static FILE *h_fopen(const char *path, const char *mode) {
 	return orig_fopen(path, mode);
 }
 
+__attribute__((noinline))
+static DIR *h_opendir(const char *path) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		return orig_opendir(path);
+	}
+
+	DIR *dirp = orig_opendir(path);
+	register_dir_filter(dirp, dir_filter_kind_for_path(path));
+	return dirp;
+}
+
+__attribute__((noinline))
+static struct dirent *h_readdir(DIR *dirp) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		return orig_readdir(dirp);
+	}
+
+	dir_filter_kind_t kind = lookup_dir_filter(dirp);
+	if (kind == DIR_FILTER_NONE) {
+		return orig_readdir(dirp);
+	}
+
+	struct dirent *entry = NULL;
+	while ((entry = orig_readdir(dirp)) != NULL) {
+		if (!dir_entry_should_hide(kind, entry->d_name)) {
+			return entry;
+		}
+	}
+	return NULL;
+}
+
+__attribute__((noinline))
+static int h_closedir(DIR *dirp) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		return orig_closedir(dirp);
+	}
+
+	unregister_dir_filter(dirp);
+	return orig_closedir(dirp);
+}
+
 //------------------------------------------------------------------------------
 #pragma mark - sysctlbyname hook
 //
@@ -1091,7 +1401,7 @@ static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 		return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 
 	int result = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-	if (result != 0 || !oldp || !name)
+	if (result != 0 || !oldp || !oldlenp || !name)
 		return result;
 
 	// kern.bootargs can leak jailbreak boot arguments
@@ -1150,6 +1460,7 @@ void hidden_dylib_hider_init(void)
 	orig_class_getImageName = class_getImageName;
 	orig_objc_copyImageNames = objc_copyImageNames;
 	orig_objc_copyClassNamesForImage = objc_copyClassNamesForImage;
+	orig_objc_addLoadImageFunc = objc_addLoadImageFunc;
 	orig_dlopen = dlopen;
 	orig_fork = fork;
 	orig_getfsstat = getfsstat;
@@ -1158,8 +1469,13 @@ void hidden_dylib_hider_init(void)
 	orig_access = access;
 	orig_stat = stat;
 	orig_lstat = lstat;
+	orig_statfs = statfs;
+	orig_statvfs = statvfs;
 	orig_fopen = fopen;
 	orig_sysctlbyname = sysctlbyname;
+	orig_opendir = opendir;
+	orig_readdir = readdir;
+	orig_closedir = closedir;
 
 	// Cache executable path for class_getImageName / dladdr substitution
 	g_executable_path = _dyld_get_image_name(0);
@@ -1189,36 +1505,46 @@ void hidden_dylib_hider_init(void)
 	// task_info(TASK_DYLD_INFO) — present filtered dyld_all_image_infos
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, task_info, h_task_info, NULL);
 
-	// --- Post-checkpoint3 hooks (TM detection bypass) ---
-	// These were added after the working checkpoint3 build and broke hidden
-	// tweak loading. Commented out until they can be re-enabled safely
-	// (e.g. behind a separate flag or integrated with init_dyldhooks).
+	// Early strict-app probes that matter during startup and are safe enough
+	// to bring up before the hidden loader chain. Keep the more invasive ObjC,
+	// environment, and filesystem hooks for the later strict phase.
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fork, h_fork, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctl, h_sysctl, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getfsstat, h_getfsstat, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, statfs, h_statfs, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, statvfs, h_statvfs, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctlbyname, h_sysctlbyname, NULL);
+
+	rhi_diag_log("HIDER init complete — core hooks enabled");
+}
+
+void hidden_dylib_hider_enable_strict_hooks(void)
+{
+	if (!g_inited || g_strict_hooks_enabled) {
+		return;
+	}
+
+	g_strict_hooks_enabled = true;
 
 	// ObjC runtime — hide injected images from class/image enumeration
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, class_getImageName, h_class_getImageName, NULL);
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyImageNames, h_objc_copyImageNames, NULL);
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassNamesForImage, h_objc_copyClassNamesForImage, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, class_getImageName, h_class_getImageName, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyImageNames, h_objc_copyImageNames, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassNamesForImage, h_objc_copyClassNamesForImage, NULL);
 
 	// Environment — hide DYLD_INSERT_LIBRARIES and JB markers
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getenv, h_getenv, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getenv, h_getenv, NULL);
 
-	// Sandbox / anti-debug probes
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fork, h_fork, NULL);
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctl, h_sysctl, NULL);
+	// Filesystem probes — hide jailbreak artifacts from stat/access/fopen and
+	// filter preboot descendant enumeration without lying about the preboot root.
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, access, h_access, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, stat, h_stat, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, lstat, h_lstat, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fopen, h_fopen, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, opendir, h_opendir, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, readdir, h_readdir, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, closedir, h_closedir, NULL);
 
-	// Mount point scanning — hide .jbroot / procursus mounts
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getfsstat, h_getfsstat, NULL);
-
-	// Filesystem probes — hide jailbreak artifacts from stat/access/fopen
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, access, h_access, NULL);
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, stat, h_stat, NULL);
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, lstat, h_lstat, NULL);
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fopen, h_fopen, NULL);
-
-	// sysctlbyname — sanitize kernel info queries
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctlbyname, h_sysctlbyname, NULL);
-
-	rhi_diag_log("HIDER init complete — checkpoint3-level hooks enabled");
+	rhi_diag_log("HIDER strict hooks enabled");
 }
 
 //------------------------------------------------------------------------------
@@ -1234,36 +1560,54 @@ void *hidden_dylib_hider_dlsym_remap(const char *name)
 	if (!g_inited || !name)
 		return NULL;
 
+	// Only remap dlopen when the actual GOT-level fallback hook was installed.
+	// dyld_patch_fallback_enabled is broader than that: it only means we need
+	// the fallback-capable dyld patch path, not that dlopen itself was rebound.
+	if (!strcmp(name, "dlopen") && dlopen_fallback_hook_installed)
+		return (void *)dlopen_fallback_hook;
+
 	// Table of symbol names → our hooked function pointers.
-	// These must match exactly what we hook in hidden_dylib_hider_init.
-	static const struct { const char *sym; void *func; } remap[] = {
+	// Only advertise symbols that are actually live in the current phase.
+	static const struct {
+		const char *sym;
+		void *func;
+		bool requiresStrictHooks;
+	} remap[] = {
 		{ "_dyld_image_count",                    (void *)h_image_count },
-		{ "_dyld_get_image_name",                  (void *)h_get_image_name },
-		{ "_dyld_get_image_header",                (void *)h_get_image_header },
-		{ "_dyld_get_image_vmaddr_slide",          (void *)h_get_image_vmaddr_slide },
-		{ "_dyld_register_func_for_add_image",     (void *)h_register_func_for_add_image },
-		{ "_dyld_register_func_for_remove_image",  (void *)h_register_func_for_remove_image },
-		{ "task_info",                             (void *)h_task_info },
-		{ "dladdr",                                (void *)h_dladdr },
-		{ "dlsym",                                 (void *)h_dlsym },
-		{ "class_getImageName",                    (void *)h_class_getImageName },
-		{ "objc_copyImageNames",                   (void *)h_objc_copyImageNames },
-		{ "objc_copyClassNamesForImage",           (void *)h_objc_copyClassNamesForImage },
-		{ "dlopen",                                (void *)h_dlopen },
-		{ "fork",                                  (void *)h_fork },
-		{ "getfsstat",                             (void *)h_getfsstat },
-		{ "sysctl",                                (void *)h_sysctl },
-		{ "getenv",                                (void *)h_getenv },
-		{ "access",                                (void *)h_access },
-		{ "stat",                                  (void *)h_stat },
-		{ "lstat",                                 (void *)h_lstat },
-		{ "fopen",                                 (void *)h_fopen },
-		{ "sysctlbyname",                          (void *)h_sysctlbyname },
+		{ "_dyld_get_image_name",                  (void *)h_get_image_name,               false },
+		{ "_dyld_get_image_header",                (void *)h_get_image_header,             false },
+		{ "_dyld_get_image_vmaddr_slide",          (void *)h_get_image_vmaddr_slide,       false },
+		{ "_dyld_register_func_for_add_image",     (void *)h_register_func_for_add_image,  false },
+		{ "_dyld_register_func_for_remove_image",  (void *)h_register_func_for_remove_image,false },
+		{ "task_info",                             (void *)h_task_info,                    false },
+		{ "dladdr",                                (void *)h_dladdr,                       false },
+		{ "dlsym",                                 (void *)h_dlsym,                        false },
+		{ "class_getImageName",                    (void *)h_class_getImageName,           true  },
+		{ "objc_copyImageNames",                   (void *)h_objc_copyImageNames,          true  },
+		{ "objc_copyClassNamesForImage",           (void *)h_objc_copyClassNamesForImage,  true  },
+		{ "objc_addLoadImageFunc",                 (void *)h_objc_addLoadImageFunc,        false },
+		// NOTE: keep dlopen off the remap table. The dlopen hook path remains
+		// disabled due to the iOS 15 init_dyldhooks fallback conflict.
+		// { "dlopen",                               (void *)h_dlopen,                       false },
+		{ "fork",                                  (void *)h_fork,                         false },
+		{ "getfsstat",                             (void *)h_getfsstat,                    false },
+		{ "statfs",                                (void *)h_statfs,                       false },
+		{ "statvfs",                               (void *)h_statvfs,                      false },
+		{ "sysctl",                                (void *)h_sysctl,                       false },
+		{ "getenv",                                (void *)h_getenv,                       true  },
+		{ "access",                                (void *)h_access,                       true  },
+		{ "stat",                                  (void *)h_stat,                         true  },
+		{ "lstat",                                 (void *)h_lstat,                        true  },
+		{ "fopen",                                 (void *)h_fopen,                        true  },
+		{ "sysctlbyname",                          (void *)h_sysctlbyname,                 false },
 	};
 
 	for (unsigned i = 0; i < sizeof(remap) / sizeof(*remap); i++) {
-		if (strcmp(name, remap[i].sym) == 0)
+		if (strcmp(name, remap[i].sym) == 0) {
+			if (remap[i].requiresStrictHooks && !g_strict_hooks_enabled)
+				return NULL;
 			return remap[i].func;
+		}
 	}
 
 	return NULL;

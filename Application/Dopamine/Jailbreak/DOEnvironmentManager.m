@@ -36,6 +36,7 @@ NSString * const DORootHideInjectionModeStock = @"stock";
 NSString * const DORootHideInjectionModeBlacklist = @"blacklist";
 NSString * const DORootHideInjectionModeWhitelist = @"whitelist";
 NSString * const DORootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
+NSString * const DORootHideInjectionModeBlacklistAllowlist = @"blacklistallowlist";
 
 static NSString * const DOTweakInjectionModePreferenceKey = @"tweakInjectionMode";
 static NSString * const DORootHideDirectoryRelativePath = @"/var/mobile/Library/RootHide";
@@ -48,7 +49,7 @@ static NSString * const DORootHideUninjectRelativePath = @"/var/mobile/Library/R
 
 static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
 {
-    if ([mode isEqualToString:DORootHideInjectionModeBlacklist] || [mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist]) {
+    if ([mode isEqualToString:DORootHideInjectionModeBlacklist] || [mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
         return mode;
     }
     if ([mode isEqualToString:DORootHideInjectionModeStock]) {
@@ -687,11 +688,11 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         [@{ @"mode" : mode } writeToFile:modePath atomically:YES];
         [self ensureRootHideDictionaryExistsAtPath:jetsamAddendPath defaults:DODefaultRootHideJetsamAddend()];
 
-        if ([mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist]) {
+        if ([mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
             [self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}];
             [self ensureRootHideDictionaryExistsAtPath:injectSystemPath defaults:DODefaultRootHideSystemInjection()];
             [self ensureRootHideDictionaryExistsAtPath:injectWantsBlacklistPath defaults:DODefaultRootHideWantsBlacklist()];
-            if ([mode isEqualToString:DORootHideInjectionModeHiddenWhitelist]) {
+            if ([mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
                 [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];
             }
         }

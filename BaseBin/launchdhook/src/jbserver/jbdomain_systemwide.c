@@ -292,7 +292,7 @@ int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, 
 	bool isPlatformProcess = (csflags & CS_PLATFORM_BINARY) != 0;
 
 	// Generate sandbox extensions for the requesting process
-	*sandboxExtensionsOut = generate_sandbox_extensions(processToken, isPlatformProcess);
+	*sandboxExtensionsOut = generate_sandbox_extensions(processToken, pid, procPath, isPlatformProcess);
 	if(!(*sandboxExtensionsOut)) {
 		JBLogError("Failed to generate sandbox extensions for process %d", pid);
 	}

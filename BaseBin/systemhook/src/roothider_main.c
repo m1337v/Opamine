@@ -22,6 +22,7 @@
 const char* HOOK_DYLIB_PATH = NULL;
 
 bool dyld_patch_fallback_enabled = false;
+bool dlopen_fallback_hook_installed = false;
 static bool gHiddenTweakAllowMode = true;
 static size_t gHiddenTweakNameCount = 0;
 static char **gHiddenTweakNames = NULL;
@@ -1231,6 +1232,7 @@ void init_dyldhooks()
 		hook_dyld_routine(*gDyldPtr, 18, (void *)&dyld_dlopen_preflight_hook, (void **)&dyld_dlopen_preflight_orig, 0xB1B6);
 		hook_dyld_routine(*gDyldPtr, 97, (void *)&dyld_dlopen_from_hook, (void **)&dyld_dlopen_from_orig, 0xD48C);
 		hook_dyld_routine(*gDyldPtr, 98, (void *)&dyld_dlopen_audited_hook, (void **)&dyld_dlopen_audited_orig, 0xD2A5);
+		dlopen_fallback_hook_installed = false;
 		gHiddenTweakHooksInstalled = true;
 	} else {
 		// iOS 15 / dyld3 fallback: rebind dlopen in GOT of all loaded images.
@@ -1238,6 +1240,7 @@ void init_dyldhooks()
 		dlopen_fallback_orig = dlopen;
 		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlopen, dlopen_fallback_hook,
 		                       NULL);
+		dlopen_fallback_hook_installed = true;
 		gHiddenTweakHooksInstalled = true;
 	}
 }

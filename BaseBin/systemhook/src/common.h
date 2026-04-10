@@ -13,6 +13,7 @@ typedef enum
 } kSpawnConfig;
 
 bool root_hide_injection_mode_is_hidden_whitelist(void);
+bool root_hide_injection_mode_is_blacklist_allowlist(void);
 bool root_hide_injection_mode_uses_whitelist_rules(void);
 bool root_hide_whitelist_allows_executable_path(const char *path);
 void root_hide_set_runtime_logging_enabled(bool enabled);

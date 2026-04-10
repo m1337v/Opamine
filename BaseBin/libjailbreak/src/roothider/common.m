@@ -23,6 +23,10 @@
 
 bool launchdhookFirstLoad = false;
 
+static NSString * const kRootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
+static NSString * const kRootHideInjectionModeBlacklistAllowlist = @"blacklistallowlist";
+static NSString * const kRootHideModeRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist";
+
 // To replace dyld patch, make dyld respect DYLD_ environment variables
 int proc_patch_csflags(pid_t pid)
 {
@@ -412,30 +416,163 @@ void ensure_jbroot_symlink(const char* filepath)
 	}
 }
 
-char* generate_sandbox_extensions(audit_token_t *processToken, bool writable)
+static NSString *normalizedRootHideInjectionMode(NSString *mode)
 {
-    char* sandboxExtensionsOut=NULL;
+    if ([mode isEqualToString:kRootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:kRootHideInjectionModeBlacklistAllowlist]) {
+        return mode;
+    }
+    return nil;
+}
+
+static NSString *configuredRootHideInjectionMode(void)
+{
+    NSString *modePath = JBROOT_PATH(kRootHideModeRelativePath);
+    NSDictionary *modeConfiguration = modePath.length > 0 ? [NSDictionary dictionaryWithContentsOfFile:modePath] : nil;
+    return normalizedRootHideInjectionMode(modeConfiguration[@"mode"]);
+}
+
+static bool process_should_use_restricted_hidden_extensions(pid_t pid, const char *procPath)
+{
+    if (pid <= 1 || !procPath || !isRemovableBundlePath(procPath)) {
+        return false;
+    }
+
+    NSString *configuredMode = configuredRootHideInjectionMode();
+    if (![configuredMode isEqualToString:kRootHideInjectionModeHiddenWhitelist]
+        && ![configuredMode isEqualToString:kRootHideInjectionModeBlacklistAllowlist]) {
+        return false;
+    }
+
+    char identifier[255] = {0};
+    if (!proc_get_identifier(pid, identifier) || identifier[0] == '\0') {
+        return false;
+    }
+
+    return isBlacklistedApp(identifier);
+}
+
+static void sandbox_extension_add_token(NSMutableOrderedSet<NSString *> *tokens, audit_token_t processToken, const char *extensionClass, const char *path)
+{
+    if (!tokens || !extensionClass || !path || path[0] == '\0') {
+        return;
+    }
+
+    char *extension = sandbox_extension_issue_file_to_process(extensionClass, path, 0, processToken);
+    if (!extension) {
+        return;
+    }
+
+    NSString *token = [NSString stringWithUTF8String:extension];
+    if (token.length > 0) {
+        [tokens addObject:token];
+    }
+    free(extension);
+}
+
+char* generate_sandbox_extensions(audit_token_t *processToken, pid_t pid, const char *procPath, bool writable)
+{
+    if (!processToken) {
+        return NULL;
+    }
 
     char jbroot_base[PATH_MAX];
     char jbroot_writable[PATH_MAX];
     snprintf(jbroot_base, sizeof(jbroot_base), "/private/var/containers/Bundle/Application/.jbroot-%016llX/", jbinfo(jbrand));
     snprintf(jbroot_writable, sizeof(jbroot_writable), "/private/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX/", jbinfo(jbrand));
 
-    char* fileclass = writable ? "com.apple.app-sandbox.read-write" : "com.apple.app-sandbox.read";
-    char *extension1 = sandbox_extension_issue_file_to_process(fileclass, jbroot_writable, 0, *processToken);
+    NSMutableOrderedSet<NSString *> *tokens = [NSMutableOrderedSet orderedSet];
+    const char *writableClass = writable ? "com.apple.app-sandbox.read-write" : "com.apple.app-sandbox.read";
 
-    char *extension2 = sandbox_extension_issue_file_to_process("com.apple.app-sandbox.read", jbroot_base, 0, *processToken);
-    char *extension3 = sandbox_extension_issue_file_to_process("com.apple.sandbox.executable", jbroot_base, 0, *processToken);
+    if (process_should_use_restricted_hidden_extensions(pid, procPath)) {
+        char jbroot_basebin[PATH_MAX];
+        char jbroot_usr_lib[PATH_MAX];
+        char jbroot_tweakinject[PATH_MAX];
+        char jbroot_substrate[PATH_MAX];
+        char jbroot_base_library[PATH_MAX];
+        char jbroot_base_preferences[PATH_MAX];
+        char jbroot_base_caches[PATH_MAX];
+        char jbroot_base_appsupport[PATH_MAX];
+        char jbroot_base_var_tmp[PATH_MAX];
+        char jbroot_writable_library[PATH_MAX];
+        char jbroot_writable_preferences[PATH_MAX];
+        char jbroot_writable_caches[PATH_MAX];
+        char jbroot_writable_appsupport[PATH_MAX];
+        char jbroot_writable_var_tmp[PATH_MAX];
 
-    if(extension1 && extension2 && extension3) {
-        asprintf(&sandboxExtensionsOut, "%s|%s|%s", extension1, extension2, extension3);
+        snprintf(jbroot_basebin, sizeof(jbroot_basebin), "%sbasebin/", jbroot_base);
+        snprintf(jbroot_usr_lib, sizeof(jbroot_usr_lib), "%susr/lib/", jbroot_base);
+        snprintf(jbroot_tweakinject, sizeof(jbroot_tweakinject), "%susr/lib/TweakInject/", jbroot_base);
+        snprintf(jbroot_substrate, sizeof(jbroot_substrate), "%sLibrary/MobileSubstrate/DynamicLibraries/", jbroot_base);
+        snprintf(jbroot_base_library, sizeof(jbroot_base_library), "%sprivate/var/mobile/Library/", jbroot_base);
+        snprintf(jbroot_base_preferences, sizeof(jbroot_base_preferences), "%sprivate/var/mobile/Library/Preferences/", jbroot_base);
+        snprintf(jbroot_base_caches, sizeof(jbroot_base_caches), "%sprivate/var/mobile/Library/Caches/", jbroot_base);
+        snprintf(jbroot_base_appsupport, sizeof(jbroot_base_appsupport), "%sprivate/var/mobile/Library/Application Support/", jbroot_base);
+        snprintf(jbroot_base_var_tmp, sizeof(jbroot_base_var_tmp), "%sprivate/var/tmp/", jbroot_base);
+        snprintf(jbroot_writable_library, sizeof(jbroot_writable_library), "%svar/mobile/Library/", jbroot_writable);
+        snprintf(jbroot_writable_preferences, sizeof(jbroot_writable_preferences), "%svar/mobile/Library/Preferences/", jbroot_writable);
+        snprintf(jbroot_writable_caches, sizeof(jbroot_writable_caches), "%svar/mobile/Library/Caches/", jbroot_writable);
+        snprintf(jbroot_writable_appsupport, sizeof(jbroot_writable_appsupport), "%svar/mobile/Library/Application Support/", jbroot_writable);
+        snprintf(jbroot_writable_var_tmp, sizeof(jbroot_writable_var_tmp), "%svar/tmp/", jbroot_writable);
+
+        const char *readPaths[] = {
+            jbroot_basebin,
+            jbroot_usr_lib,
+            jbroot_tweakinject,
+            jbroot_substrate,
+            jbroot_base_library,
+            jbroot_base_preferences,
+            jbroot_base_caches,
+            jbroot_base_appsupport,
+            jbroot_base_var_tmp,
+            jbroot_writable_library,
+            jbroot_writable_preferences,
+            jbroot_writable_caches,
+            jbroot_writable_appsupport,
+            jbroot_writable_var_tmp,
+            NULL
+        };
+        const char *executablePaths[] = {
+            jbroot_basebin,
+            jbroot_usr_lib,
+            jbroot_tweakinject,
+            jbroot_substrate,
+            NULL
+        };
+
+        for (int i = 0; readPaths[i]; i++) {
+            sandbox_extension_add_token(tokens, *processToken, "com.apple.app-sandbox.read", readPaths[i]);
+        }
+        for (int i = 0; executablePaths[i]; i++) {
+            sandbox_extension_add_token(tokens, *processToken, "com.apple.sandbox.executable", executablePaths[i]);
+        }
+        for (const char **path = (const char *[]){
+                jbroot_writable_library,
+                jbroot_writable_preferences,
+                jbroot_writable_caches,
+                jbroot_writable_appsupport,
+                jbroot_writable_var_tmp,
+                jbroot_base_library,
+                jbroot_base_preferences,
+                jbroot_base_caches,
+                jbroot_base_appsupport,
+                jbroot_base_var_tmp,
+                NULL
+            }; *path; path++) {
+            sandbox_extension_add_token(tokens, *processToken, writableClass, *path);
+        }
     }
-    
-    if (extension1) free(extension1);
-    if (extension2) free(extension2);
-    if (extension3) free(extension3);
+    else {
+        sandbox_extension_add_token(tokens, *processToken, writableClass, jbroot_writable);
+        sandbox_extension_add_token(tokens, *processToken, "com.apple.app-sandbox.read", jbroot_base);
+        sandbox_extension_add_token(tokens, *processToken, "com.apple.sandbox.executable", jbroot_base);
+    }
 
-    return sandboxExtensionsOut;
+    if (tokens.count == 0) {
+        return NULL;
+    }
+
+    NSString *joined = [tokens.array componentsJoinedByString:@"|"];
+    return joined.length > 0 ? strdup(joined.UTF8String) : NULL;
 }
 
 struct sysctl_oid {
@@ -976,4 +1113,3 @@ int wait_for_exit(pid_t pid)
         }
     }
 }
-
