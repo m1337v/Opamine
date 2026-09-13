@@ -177,7 +177,10 @@ extern "C" void commitBlacklistProcessId(pid_t* pidp)
     {
         int pidversion = proc_get_pidversion(pid);
         if (pidversion > 0) {
-            (*blacklistedProcessesState)[pid] = { pidversion, state };
+            BlacklistedProcessState processState;
+            processState.pidversion = pidversion;
+            processState.state = state;
+            (*blacklistedProcessesState)[pid] = processState;
         }
     }
 
