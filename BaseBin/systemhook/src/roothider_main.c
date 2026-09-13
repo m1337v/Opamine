@@ -42,6 +42,8 @@ typedef struct {
 static HiddenTweakBinary *gHiddenTweakBinaries = NULL;
 static size_t gHiddenTweakBinaryCount = 0;
 
+static bool hidden_tweak_binary_should_load(const HiddenTweakBinary *binary);
+
 static void clear_hidden_tweak_binaries(void)
 {
 	if (!gHiddenTweakBinaries) {
@@ -379,34 +381,99 @@ static void hidden_tweak_store_loaded_handle(void *handle)
 	gHiddenTweakLoadedHandles[gHiddenTweakLoadedHandleCount++] = handle;
 }
 
-static void hidden_tweak_load_runtime_support_libraries(void)
+static void hidden_tweak_load_support_library(const char *libraryPath)
 {
-	const char *supportLibraries[] = {
-		JBROOT_PATH("/usr/lib/libroothide.dylib"),
-		JBROOT_PATH("/usr/lib/libellekit.dylib"),
-	};
+	if (!libraryPath || libraryPath[0] == '\0') {
+		return;
+	}
 
-	for (size_t i = 0; i < sizeof(supportLibraries) / sizeof(*supportLibraries); i++) {
-		const char *libraryPath = supportLibraries[i];
-		if (!libraryPath || libraryPath[0] == '\0') {
+	if (access(libraryPath, F_OK) != 0) {
+		root_hide_hidden_whitelist_log("support library missing path=%s", libraryPath);
+		return;
+	}
+
+	jbclient_trust_library_recurse(libraryPath, NULL);
+	root_hide_hidden_whitelist_log("support library dlopen attempt path=%s", libraryPath);
+	void *handle = dlopen(libraryPath, RTLD_NOW | RTLD_GLOBAL);
+	if (handle) {
+		hidden_tweak_store_loaded_handle(handle);
+		root_hide_hidden_whitelist_log("support library dlopen success path=%s handle=%p", libraryPath, handle);
+	}
+	else {
+		root_hide_hidden_whitelist_log("support library dlopen failed path=%s error=%s", libraryPath, dlerror() ?: "(null)");
+	}
+}
+
+static bool hidden_tweak_selected_binary_depends_on_name(const char *dependencyName)
+{
+	if (!dependencyName || dependencyName[0] == '\0') {
+		return false;
+	}
+
+	for (size_t i = 0; i < gHiddenTweakBinaryCount; i++) {
+		HiddenTweakBinary *binary = &gHiddenTweakBinaries[i];
+		if (!hidden_tweak_binary_should_load(binary)) {
 			continue;
 		}
 
-		if (access(libraryPath, F_OK) != 0) {
-			root_hide_hidden_whitelist_log("support library missing path=%s", libraryPath);
+		for (size_t j = 0; j < binary->dependencyCount; j++) {
+			if (!strcmp(binary->dependencies[j], dependencyName)) {
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static bool hidden_tweak_selected_binary_has_patch_companion(void)
+{
+	for (size_t i = 0; i < gHiddenTweakBinaryCount; i++) {
+		HiddenTweakBinary *binary = &gHiddenTweakBinaries[i];
+		if (!hidden_tweak_binary_should_load(binary) || !binary->path) {
 			continue;
 		}
 
-		jbclient_trust_library_recurse(libraryPath, NULL);
-		root_hide_hidden_whitelist_log("support library dlopen attempt path=%s", libraryPath);
-		void *handle = dlopen(libraryPath, RTLD_NOW | RTLD_GLOBAL);
-		if (handle) {
-			hidden_tweak_store_loaded_handle(handle);
-			root_hide_hidden_whitelist_log("support library dlopen success path=%s handle=%p", libraryPath, handle);
+		char patcherPath[PATH_MAX];
+		snprintf(patcherPath, sizeof(patcherPath), "%s.roothidepatch", binary->path);
+		if (lstat(patcherPath, &(struct stat){0}) == 0) {
+			return true;
 		}
-		else {
-			root_hide_hidden_whitelist_log("support library dlopen failed path=%s error=%s", libraryPath, dlerror() ?: "(null)");
+	}
+
+	return false;
+}
+
+static void hidden_tweak_load_runtime_support_libraries(bool minimalRuntime)
+{
+	if (!minimalRuntime) {
+		const char *supportLibraries[] = {
+			JBROOT_PATH("/usr/lib/libroothide.dylib"),
+			JBROOT_PATH("/usr/lib/libellekit.dylib"),
+		};
+
+		for (size_t i = 0; i < sizeof(supportLibraries) / sizeof(*supportLibraries); i++) {
+			hidden_tweak_load_support_library(supportLibraries[i]);
 		}
+		return;
+	}
+
+	// Lower-footprint runtime for Blacklist + Allowlist:
+	// keep ElleKit for broad hook compatibility, then only load the
+	// compatibility layers that the selected tweak set actually needs.
+	hidden_tweak_load_support_library(JBROOT_PATH("/usr/lib/libellekit.dylib"));
+
+	if (hidden_tweak_selected_binary_depends_on_name("libroothide")) {
+		hidden_tweak_load_support_library(JBROOT_PATH("/usr/lib/libroothide.dylib"));
+	}
+	if (hidden_tweak_selected_binary_depends_on_name("libroot")) {
+		hidden_tweak_load_support_library(JBROOT_PATH("/usr/lib/libroot.dylib"));
+	}
+	if (hidden_tweak_selected_binary_depends_on_name("libsandy")) {
+		hidden_tweak_load_support_library(JBROOT_PATH("/usr/lib/libsandy.dylib"));
+	}
+	if (hidden_tweak_selected_binary_has_patch_companion()) {
+		hidden_tweak_load_support_library(JBROOT_PATH("/usr/lib/roothidepatch.dylib"));
 	}
 }
 
@@ -593,7 +660,29 @@ void roothide_hidden_tweak_prepare_for_loader(void)
 
 	hidden_tweak_build_binary_index_if_needed();
 	root_hide_hidden_whitelist_log("prepare selected tweaks count=%zu indexed=%zu", gHiddenTweakNameCount, gHiddenTweakBinaryCount);
-	hidden_tweak_load_runtime_support_libraries();
+	hidden_tweak_load_runtime_support_libraries(false);
+	for (size_t i = 0; i < gHiddenTweakBinaryCount; i++) {
+		HiddenTweakBinary *binary = &gHiddenTweakBinaries[i];
+		if (!hidden_tweak_binary_should_load(binary)) {
+			root_hide_hidden_whitelist_log("prepare skip blocked binary=%s path=%s", binary->name ?: "(null)", binary->path ?: "(null)");
+			continue;
+		}
+
+		root_hide_hidden_whitelist_log("prepare trust binary=%s path=%s", binary->name ?: "(null)", binary->path ?: "(null)");
+		jbclient_trust_library_recurse(binary->path, NULL);
+	}
+}
+
+void roothide_hidden_tweak_prepare_minimal_runtime(void)
+{
+	if (gHiddenTweakNameCount == 0) {
+		root_hide_hidden_whitelist_log("prepare minimal selected tweaks skipped count=0");
+		return;
+	}
+
+	hidden_tweak_build_binary_index_if_needed();
+	root_hide_hidden_whitelist_log("prepare minimal selected tweaks count=%zu indexed=%zu", gHiddenTweakNameCount, gHiddenTweakBinaryCount);
+	hidden_tweak_load_runtime_support_libraries(true);
 	for (size_t i = 0; i < gHiddenTweakBinaryCount; i++) {
 		HiddenTweakBinary *binary = &gHiddenTweakBinaries[i];
 		if (!hidden_tweak_binary_should_load(binary)) {

@@ -39,6 +39,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <dirent.h>
+#include <strings.h>
 
 #include "common.h"
 
@@ -59,6 +60,7 @@ extern void litehook_rebind_symbol(const mach_header_u *targetHeader, void *repl
 
 // ObjC runtime functions we hook via GOT rebinding
 extern const char *class_getImageName(Class cls);
+extern Class *objc_copyClassList(unsigned int *outCount);
 extern const char * _Nonnull * objc_copyImageNames(unsigned int *outCount);
 extern const char * _Nonnull * objc_copyClassNamesForImage(const char *image, unsigned int *outCount);
 
@@ -74,6 +76,7 @@ static void (*orig_dyld_register_func_for_add_image)(void (*)(const struct mach_
 static void (*orig_dyld_register_func_for_remove_image)(void (*)(const struct mach_header *, intptr_t)) = NULL;
 static kern_return_t (*orig_task_info)(task_name_t, task_flavor_t, task_info_t, mach_msg_type_number_t *) = NULL;
 static const char *(*orig_class_getImageName)(Class) = NULL;
+static Class *(*orig_objc_copyClassList)(unsigned int *) = NULL;
 static const char * _Nonnull *(*orig_objc_copyImageNames)(unsigned int *) = NULL;
 static const char * _Nonnull *(*orig_objc_copyClassNamesForImage)(const char *, unsigned int *) = NULL;
 static void (*orig_objc_addLoadImageFunc)(objc_func_loadImage) = NULL;
@@ -92,6 +95,10 @@ static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) 
 static DIR *(*orig_opendir)(const char *) = NULL;
 static struct dirent *(*orig_readdir)(DIR *) = NULL;
 static int (*orig_closedir)(DIR *) = NULL;
+static kern_return_t (*orig_mach_port_get_refs)(ipc_space_t, mach_port_name_t, mach_port_right_t, mach_port_urefs_t *) = NULL;
+static IMP orig_UIApplication_canOpenURL = NULL;
+static IMP orig_UIApplication_openURL = NULL;
+static IMP orig_UIApplication_openURL_options_completion = NULL;
 
 // Forward declarations of hook functions (needed by translate_hook_to_orig)
 static uint32_t h_image_count(void);
@@ -105,6 +112,7 @@ static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
 static int h_dladdr(const void *addr, Dl_info *info);
 static void *h_dlsym(void *handle, const char *symbol);
 static const char *h_class_getImageName(Class cls);
+static Class *h_objc_copyClassList(unsigned int *outCount);
 static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount);
 static const char * _Nonnull *h_objc_copyClassNamesForImage(const char *image, unsigned int *outCount);
 static void h_objc_addLoadImageFunc(objc_func_loadImage func);
@@ -123,6 +131,10 @@ static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *n
 static DIR *h_opendir(const char *path);
 static struct dirent *h_readdir(DIR *dirp);
 static int h_closedir(DIR *dirp);
+static kern_return_t h_mach_port_get_refs(ipc_space_t task, mach_port_name_t name, mach_port_right_t right, mach_port_urefs_t *refs);
+static BOOL h_UIApplication_canOpenURL(id self, SEL _cmd, id url);
+static BOOL h_UIApplication_openURL(id self, SEL _cmd, id url);
+static void h_UIApplication_openURL_options_completion(id self, SEL _cmd, id url, id options, void *completion);
 static bool fs_path_should_hide(const char *path);
 
 //------------------------------------------------------------------------------
@@ -340,9 +352,91 @@ static struct dyld_all_image_infos *g_real_aii    = NULL;  // cached from first 
 
 static bool g_inited = false;
 static bool g_strict_hooks_enabled = false;
+static bool g_hook_objc_runtime_enabled = true;
+static bool g_hook_objc_copy_class_list_enabled = true;
+static bool g_hook_url_schemes_enabled = true;
+static bool g_hook_environment_enabled = true;
+static bool g_hook_filesystem_enabled = true;
+static bool g_hook_directory_enabled = true;
 
 // Cache the executable path for dladdr / class_getImageName substitution
 static const char *g_executable_path = NULL;
+
+static bool hider_component_list_contains(const char *list, const char *needle) {
+	if (!list || !needle || !needle[0]) return false;
+
+	size_t needle_len = strlen(needle);
+	const char *cursor = list;
+	while (*cursor) {
+		while (*cursor == ':' || *cursor == ',' || *cursor == ';' ||
+		       *cursor == ' ' || *cursor == '\t' || *cursor == '\n')
+			cursor++;
+
+		const char *start = cursor;
+		while (*cursor && *cursor != ':' && *cursor != ',' && *cursor != ';' &&
+		       *cursor != ' ' && *cursor != '\t' && *cursor != '\n')
+			cursor++;
+
+		if ((size_t)(cursor - start) == needle_len && strncmp(start, needle, needle_len) == 0)
+			return true;
+	}
+
+	return false;
+}
+
+static void disable_all_strict_profile_hooks(void) {
+	g_hook_objc_runtime_enabled = false;
+	g_hook_objc_copy_class_list_enabled = false;
+	g_hook_url_schemes_enabled = false;
+	g_hook_environment_enabled = false;
+	g_hook_filesystem_enabled = false;
+	g_hook_directory_enabled = false;
+}
+
+static void load_hider_profile_from_environment(void) {
+	const char *profile = getenv("ROOTHIDE_HIDER_PROFILE");
+	const char *disabled = getenv("ROOTHIDE_HIDER_DISABLED_HOOKS");
+
+	if (profile && (!strcmp(profile, "core") || !strcmp(profile, "minimal"))) {
+		disable_all_strict_profile_hooks();
+	}
+	else if (profile && !strcmp(profile, "lite")) {
+		g_hook_objc_copy_class_list_enabled = false;
+		g_hook_url_schemes_enabled = false;
+	}
+
+	if (hider_component_list_contains(disabled, "all-strict")) {
+		disable_all_strict_profile_hooks();
+	}
+	if (hider_component_list_contains(disabled, "objc-runtime")) {
+		g_hook_objc_runtime_enabled = false;
+		g_hook_objc_copy_class_list_enabled = false;
+	}
+	if (hider_component_list_contains(disabled, "objc-copy-class-list") ||
+	    hider_component_list_contains(disabled, "copy-class-list")) {
+		g_hook_objc_copy_class_list_enabled = false;
+	}
+	if (hider_component_list_contains(disabled, "url-schemes") ||
+	    hider_component_list_contains(disabled, "can-open-url")) {
+		g_hook_url_schemes_enabled = false;
+	}
+	if (hider_component_list_contains(disabled, "environment") ||
+	    hider_component_list_contains(disabled, "getenv")) {
+		g_hook_environment_enabled = false;
+	}
+	if (hider_component_list_contains(disabled, "filesystem") ||
+	    hider_component_list_contains(disabled, "fs")) {
+		g_hook_filesystem_enabled = false;
+		g_hook_directory_enabled = false;
+	}
+	if (hider_component_list_contains(disabled, "directory") ||
+	    hider_component_list_contains(disabled, "dir")) {
+		g_hook_directory_enabled = false;
+	}
+
+	unsetenv("ROOTHIDE_HIDER_PROFILE");
+	unsetenv("ROOTHIDE_HIDER_DISABLED_HOOKS");
+}
 
 //------------------------------------------------------------------------------
 #pragma mark - Path Filter
@@ -785,6 +879,7 @@ static const void *translate_hook_to_orig(const void *addr) {
 		{ (const void *)h_register_func_for_remove_image,(void *const *)&orig_dyld_register_func_for_remove_image },
 		{ (const void *)h_task_info,                     (void *const *)&orig_task_info },
 		{ (const void *)h_class_getImageName,            (void *const *)&orig_class_getImageName },
+		{ (const void *)h_objc_copyClassList,            (void *const *)&orig_objc_copyClassList },
 		{ (const void *)h_objc_copyImageNames,           (void *const *)&orig_objc_copyImageNames },
 		{ (const void *)h_objc_copyClassNamesForImage,   (void *const *)&orig_objc_copyClassNamesForImage },
 		{ (const void *)h_objc_addLoadImageFunc,         (void *const *)&orig_objc_addLoadImageFunc },
@@ -804,9 +899,14 @@ static const void *translate_hook_to_orig(const void *addr) {
 		{ (const void *)h_opendir,                       (void *const *)&orig_opendir },
 		{ (const void *)h_readdir,                       (void *const *)&orig_readdir },
 		{ (const void *)h_closedir,                      (void *const *)&orig_closedir },
+		{ (const void *)h_mach_port_get_refs,            (void *const *)&orig_mach_port_get_refs },
+		{ (const void *)h_UIApplication_canOpenURL,       (void *const *)&orig_UIApplication_canOpenURL },
+		{ (const void *)h_UIApplication_openURL,          (void *const *)&orig_UIApplication_openURL },
+		{ (const void *)h_UIApplication_openURL_options_completion,
+		                                                   (void *const *)&orig_UIApplication_openURL_options_completion },
 	};
 	for (unsigned i = 0; i < sizeof(map) / sizeof(*map); i++) {
-		if (addr == map[i].hook)
+		if (addr == map[i].hook && map[i].orig && *map[i].orig)
 			return *map[i].orig;
 	}
 	return addr;
@@ -904,6 +1004,75 @@ static const char *h_class_getImageName(Class cls) {
 	return result;
 }
 
+static bool class_name_should_hide_from_app(const char *name) {
+	if (!name || !name[0]) return false;
+
+	static const char *hidden_names[] = {
+		// Marriott/Appdome residue scan false-positive classes.
+		"NSSubstituteWebResource",
+		"GEODisplayHeaderSubstitute",
+		"GEOPDDisplayHeaderSubstitute",
+		"_UIContextBinderSubstrate",
+		"_UINullSubstrate",
+		"_UIFBSSceneSubstrate",
+		// Common jailbreak/bypass runtime class names.
+		"ShadowRuleset",
+		"Shadow",
+		"ABypass",
+		"FlyJB",
+		"FLEXManager",
+		"FridaGadget",
+		"FridaAgent",
+		"EKHook",
+		"EKHookClass",
+		"TweakInjectLoader",
+		NULL
+	};
+
+	for (int i = 0; hidden_names[i]; i++) {
+		if (!strcmp(name, hidden_names[i]))
+			return true;
+	}
+
+	return false;
+}
+
+static bool class_should_hide_from_app(Class cls) {
+	if (!cls) return false;
+
+	const char *name = class_getName(cls);
+	if (class_name_should_hide_from_app(name))
+		return true;
+
+	const char *image = orig_class_getImageName ? orig_class_getImageName(cls) : NULL;
+	return image && image_path_should_hide(image);
+}
+
+__attribute__((noinline))
+static Class *h_objc_copyClassList(unsigned int *outCount) {
+	Class *result = orig_objc_copyClassList(outCount);
+
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra) || !result || !outCount)
+		return result;
+
+	unsigned int total = *outCount;
+	Class *filtered = total ? malloc(total * sizeof(Class)) : NULL;
+	if (total && !filtered)
+		return result;
+
+	unsigned int kept = 0;
+	for (unsigned int i = 0; i < total; i++) {
+		Class cls = result[i];
+		if (!class_should_hide_from_app(cls))
+			filtered[kept++] = cls;
+	}
+
+	free(result);
+	*outCount = kept;
+	return filtered;
+}
+
 __attribute__((noinline))
 static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount) {
 	const char * _Nonnull *result = orig_objc_copyImageNames(outCount);
@@ -985,6 +1154,149 @@ static void h_objc_addLoadImageFunc(objc_func_loadImage func) {
 	for (uint32_t i = 0; i < n; i++)
 		func(hdrs[i]);
 	free(hdrs);
+}
+
+//------------------------------------------------------------------------------
+#pragma mark - UIApplication URL scheme hook
+
+static bool jailbreak_url_scheme_should_hide(const char *scheme) {
+	if (!scheme || !scheme[0])
+		return false;
+
+	static const char *blocked_schemes[] = {
+		"cydia",
+		"sileo",
+		"zbra",
+		"zebra",
+		"filza",
+		"frida",
+		"apt",
+		"apt-repo",
+		"pkg",
+		"substrate",
+		"activator",
+		"taurine",
+		"checkra1n",
+		"unc0ver",
+		"undecimus",
+		"dopamine",
+		"palera1n",
+		"roothide",
+		"iclean",
+		NULL
+	};
+
+	for (int i = 0; blocked_schemes[i]; i++) {
+		if (!strcasecmp(scheme, blocked_schemes[i]))
+			return true;
+	}
+
+	return false;
+}
+
+static const char *url_scheme_utf8(id url) {
+	if (!url)
+		return NULL;
+
+	SEL schemeSel = sel_registerName("scheme");
+	if (!schemeSel || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(url, sel_registerName("respondsToSelector:"), schemeSel))
+		return NULL;
+
+	id scheme = ((id (*)(id, SEL))objc_msgSend)(url, schemeSel);
+	if (!scheme)
+		return NULL;
+
+	SEL utf8Sel = sel_registerName("UTF8String");
+	if (!utf8Sel || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(scheme, sel_registerName("respondsToSelector:"), utf8Sel))
+		return NULL;
+
+	return ((const char *(*)(id, SEL))objc_msgSend)(scheme, utf8Sel);
+}
+
+__attribute__((noinline))
+static BOOL h_UIApplication_canOpenURL(id self, SEL _cmd, id url) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		return ((BOOL (*)(id, SEL, id))orig_UIApplication_canOpenURL)(self, _cmd, url);
+	}
+
+	if (jailbreak_url_scheme_should_hide(url_scheme_utf8(url)))
+		return NO;
+
+	return ((BOOL (*)(id, SEL, id))orig_UIApplication_canOpenURL)(self, _cmd, url);
+}
+
+__attribute__((noinline))
+static BOOL h_UIApplication_openURL(id self, SEL _cmd, id url) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		return ((BOOL (*)(id, SEL, id))orig_UIApplication_openURL)(self, _cmd, url);
+	}
+
+	if (jailbreak_url_scheme_should_hide(url_scheme_utf8(url)))
+		return NO;
+
+	return ((BOOL (*)(id, SEL, id))orig_UIApplication_openURL)(self, _cmd, url);
+}
+
+typedef struct {
+	void *isa;
+	int flags;
+	int reserved;
+	void (*invoke)(void *, ...);
+	void *descriptor;
+} block_literal_t;
+
+static void invoke_bool_completion(void *completion, BOOL success) {
+	if (!completion)
+		return;
+
+	block_literal_t *block = (block_literal_t *)completion;
+	if (!block->invoke)
+		return;
+
+	((void (*)(void *, BOOL))block->invoke)(completion, success);
+}
+
+__attribute__((noinline))
+static void h_UIApplication_openURL_options_completion(id self, SEL _cmd, id url, id options, void *completion) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		((void (*)(id, SEL, id, id, void *))orig_UIApplication_openURL_options_completion)(self, _cmd, url, options, completion);
+		return;
+	}
+
+	if (jailbreak_url_scheme_should_hide(url_scheme_utf8(url))) {
+		invoke_bool_completion(completion, NO);
+		return;
+	}
+
+	((void (*)(id, SEL, id, id, void *))orig_UIApplication_openURL_options_completion)(self, _cmd, url, options, completion);
+}
+
+static void install_url_scheme_hooks(void) {
+	Class applicationClass = objc_getClass("UIApplication");
+	if (!applicationClass)
+		return;
+
+	SEL canOpenURLSel = sel_registerName("canOpenURL:");
+	Method canOpenURLMethod = class_getInstanceMethod(applicationClass, canOpenURLSel);
+	if (!canOpenURLMethod)
+		return;
+
+	orig_UIApplication_canOpenURL = method_setImplementation(canOpenURLMethod, (IMP)h_UIApplication_canOpenURL);
+
+	SEL openURLSel = sel_registerName("openURL:");
+	Method openURLMethod = class_getInstanceMethod(applicationClass, openURLSel);
+	if (openURLMethod) {
+		orig_UIApplication_openURL = method_setImplementation(openURLMethod, (IMP)h_UIApplication_openURL);
+	}
+
+	SEL openURLOptionsCompletionSel = sel_registerName("openURL:options:completionHandler:");
+	Method openURLOptionsCompletionMethod = class_getInstanceMethod(applicationClass, openURLOptionsCompletionSel);
+	if (openURLOptionsCompletionMethod) {
+		orig_UIApplication_openURL_options_completion = method_setImplementation(openURLOptionsCompletionMethod, (IMP)h_UIApplication_openURL_options_completion);
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -1154,6 +1466,7 @@ static bool env_name_should_hide(const char *name) {
 	if (!name) return false;
 	// Block all DYLD_* variables — they reveal injection
 	if (strncmp(name, "DYLD_", 5) == 0) return true;
+	if (strncmp(name, "ROOTHIDE_", 9) == 0) return true;
 	// JB safe-mode / injection markers
 	if (strcmp(name, "_MSSafeMode") == 0) return true;
 	if (strcmp(name, "_SafeMode") == 0) return true;
@@ -1414,6 +1727,32 @@ static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 }
 
 //------------------------------------------------------------------------------
+#pragma mark - mach_port_get_refs hook
+//
+// Hidden injection can leave extra self-task send rights around. Some app-side
+// detectors treat that as proof that the task port was obtained. Normalize only
+// that narrow self-query back to a stock-like count for app callers.
+
+__attribute__((noinline))
+static kern_return_t h_mach_port_get_refs(ipc_space_t task, mach_port_name_t name,
+                                          mach_port_right_t right, mach_port_urefs_t *refs) {
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra))
+		return orig_mach_port_get_refs(task, name, right, refs);
+
+	kern_return_t kr = orig_mach_port_get_refs(task, name, right, refs);
+	if (kr != KERN_SUCCESS || !refs)
+		return kr;
+
+	if (task == mach_task_self_ && name == mach_task_self_ && right == MACH_PORT_RIGHT_SEND) {
+		if (*refs > 2)
+			*refs = 2;
+	}
+
+	return kr;
+}
+
+//------------------------------------------------------------------------------
 #pragma mark - Public Init
 
 extern void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1458,6 +1797,7 @@ void hidden_dylib_hider_init(void)
 	orig_dyld_register_func_for_remove_image = _dyld_register_func_for_remove_image;
 	orig_task_info = task_info;
 	orig_class_getImageName = class_getImageName;
+	orig_objc_copyClassList = objc_copyClassList;
 	orig_objc_copyImageNames = objc_copyImageNames;
 	orig_objc_copyClassNamesForImage = objc_copyClassNamesForImage;
 	orig_objc_addLoadImageFunc = objc_addLoadImageFunc;
@@ -1476,9 +1816,11 @@ void hidden_dylib_hider_init(void)
 	orig_opendir = opendir;
 	orig_readdir = readdir;
 	orig_closedir = closedir;
+	orig_mach_port_get_refs = mach_port_get_refs;
 
 	// Cache executable path for class_getImageName / dladdr substitution
 	g_executable_path = _dyld_get_image_name(0);
+	load_hider_profile_from_environment();
 
 	// 4. GOT rebinding for all hooks.
 	//    Uses GOT rebinding (not in-place DSC patching) so the DSC functions
@@ -1514,6 +1856,7 @@ void hidden_dylib_hider_init(void)
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, statfs, h_statfs, NULL);
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, statvfs, h_statvfs, NULL);
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctlbyname, h_sysctlbyname, NULL);
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, mach_port_get_refs, h_mach_port_get_refs, NULL);
 
 	rhi_diag_log("HIDER init complete — core hooks enabled");
 }
@@ -1527,22 +1870,36 @@ void hidden_dylib_hider_enable_strict_hooks(void)
 	g_strict_hooks_enabled = true;
 
 	// ObjC runtime — hide injected images from class/image enumeration
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, class_getImageName, h_class_getImageName, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyImageNames, h_objc_copyImageNames, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassNamesForImage, h_objc_copyClassNamesForImage, NULL);
+	if (g_hook_objc_runtime_enabled) {
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, class_getImageName, h_class_getImageName, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyImageNames, h_objc_copyImageNames, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassNamesForImage, h_objc_copyClassNamesForImage, NULL);
+	}
+	if (g_hook_objc_copy_class_list_enabled) {
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassList, h_objc_copyClassList, NULL);
+	}
+	if (g_hook_url_schemes_enabled) {
+		install_url_scheme_hooks();
+	}
 
 	// Environment — hide DYLD_INSERT_LIBRARIES and JB markers
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getenv, h_getenv, NULL);
+	if (g_hook_environment_enabled) {
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getenv, h_getenv, NULL);
+	}
 
 	// Filesystem probes — hide jailbreak artifacts from stat/access/fopen and
 	// filter preboot descendant enumeration without lying about the preboot root.
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, access, h_access, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, stat, h_stat, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, lstat, h_lstat, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fopen, h_fopen, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, opendir, h_opendir, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, readdir, h_readdir, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, closedir, h_closedir, NULL);
+	if (g_hook_filesystem_enabled) {
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, access, h_access, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, stat, h_stat, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, lstat, h_lstat, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fopen, h_fopen, NULL);
+	}
+	if (g_hook_directory_enabled) {
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, opendir, h_opendir, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, readdir, h_readdir, NULL);
+		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, closedir, h_closedir, NULL);
+	}
 
 	rhi_diag_log("HIDER strict hooks enabled");
 }
@@ -1572,39 +1929,47 @@ void *hidden_dylib_hider_dlsym_remap(const char *name)
 		const char *sym;
 		void *func;
 		bool requiresStrictHooks;
+		const bool *enabled;
 	} remap[] = {
-		{ "_dyld_image_count",                    (void *)h_image_count },
-		{ "_dyld_get_image_name",                  (void *)h_get_image_name,               false },
-		{ "_dyld_get_image_header",                (void *)h_get_image_header,             false },
-		{ "_dyld_get_image_vmaddr_slide",          (void *)h_get_image_vmaddr_slide,       false },
-		{ "_dyld_register_func_for_add_image",     (void *)h_register_func_for_add_image,  false },
-		{ "_dyld_register_func_for_remove_image",  (void *)h_register_func_for_remove_image,false },
-		{ "task_info",                             (void *)h_task_info,                    false },
-		{ "dladdr",                                (void *)h_dladdr,                       false },
-		{ "dlsym",                                 (void *)h_dlsym,                        false },
-		{ "class_getImageName",                    (void *)h_class_getImageName,           true  },
-		{ "objc_copyImageNames",                   (void *)h_objc_copyImageNames,          true  },
-		{ "objc_copyClassNamesForImage",           (void *)h_objc_copyClassNamesForImage,  true  },
-		{ "objc_addLoadImageFunc",                 (void *)h_objc_addLoadImageFunc,        false },
+		{ "_dyld_image_count",                    (void *)h_image_count,                   false, NULL },
+		{ "_dyld_get_image_name",                  (void *)h_get_image_name,               false, NULL },
+		{ "_dyld_get_image_header",                (void *)h_get_image_header,             false, NULL },
+		{ "_dyld_get_image_vmaddr_slide",          (void *)h_get_image_vmaddr_slide,       false, NULL },
+		{ "_dyld_register_func_for_add_image",     (void *)h_register_func_for_add_image,  false, NULL },
+		{ "_dyld_register_func_for_remove_image",  (void *)h_register_func_for_remove_image,false, NULL },
+		{ "task_info",                             (void *)h_task_info,                    false, NULL },
+		{ "dladdr",                                (void *)h_dladdr,                       false, NULL },
+		{ "dlsym",                                 (void *)h_dlsym,                        false, NULL },
+		{ "class_getImageName",                    (void *)h_class_getImageName,           true,  &g_hook_objc_runtime_enabled },
+		{ "objc_copyClassList",                    (void *)h_objc_copyClassList,           true,  &g_hook_objc_copy_class_list_enabled },
+		{ "objc_copyImageNames",                   (void *)h_objc_copyImageNames,          true,  &g_hook_objc_runtime_enabled },
+		{ "objc_copyClassNamesForImage",           (void *)h_objc_copyClassNamesForImage,  true,  &g_hook_objc_runtime_enabled },
+		{ "objc_addLoadImageFunc",                 (void *)h_objc_addLoadImageFunc,        false, NULL },
 		// NOTE: keep dlopen off the remap table. The dlopen hook path remains
 		// disabled due to the iOS 15 init_dyldhooks fallback conflict.
-		// { "dlopen",                               (void *)h_dlopen,                       false },
-		{ "fork",                                  (void *)h_fork,                         false },
-		{ "getfsstat",                             (void *)h_getfsstat,                    false },
-		{ "statfs",                                (void *)h_statfs,                       false },
-		{ "statvfs",                               (void *)h_statvfs,                      false },
-		{ "sysctl",                                (void *)h_sysctl,                       false },
-		{ "getenv",                                (void *)h_getenv,                       true  },
-		{ "access",                                (void *)h_access,                       true  },
-		{ "stat",                                  (void *)h_stat,                         true  },
-		{ "lstat",                                 (void *)h_lstat,                        true  },
-		{ "fopen",                                 (void *)h_fopen,                        true  },
-		{ "sysctlbyname",                          (void *)h_sysctlbyname,                 false },
+		// { "dlopen",                               (void *)h_dlopen,                       false, NULL },
+		{ "fork",                                  (void *)h_fork,                         false, NULL },
+		{ "getfsstat",                             (void *)h_getfsstat,                    false, NULL },
+		{ "statfs",                                (void *)h_statfs,                       false, NULL },
+		{ "statvfs",                               (void *)h_statvfs,                      false, NULL },
+		{ "sysctl",                                (void *)h_sysctl,                       false, NULL },
+		{ "getenv",                                (void *)h_getenv,                       true,  &g_hook_environment_enabled },
+		{ "access",                                (void *)h_access,                       true,  &g_hook_filesystem_enabled },
+		{ "stat",                                  (void *)h_stat,                         true,  &g_hook_filesystem_enabled },
+		{ "lstat",                                 (void *)h_lstat,                        true,  &g_hook_filesystem_enabled },
+		{ "fopen",                                 (void *)h_fopen,                        true,  &g_hook_filesystem_enabled },
+		{ "opendir",                               (void *)h_opendir,                      true,  &g_hook_directory_enabled },
+		{ "readdir",                               (void *)h_readdir,                      true,  &g_hook_directory_enabled },
+		{ "closedir",                              (void *)h_closedir,                     true,  &g_hook_directory_enabled },
+		{ "sysctlbyname",                          (void *)h_sysctlbyname,                 false, NULL },
+		{ "mach_port_get_refs",                    (void *)h_mach_port_get_refs,           false, NULL },
 	};
 
 	for (unsigned i = 0; i < sizeof(remap) / sizeof(*remap); i++) {
 		if (strcmp(name, remap[i].sym) == 0) {
 			if (remap[i].requiresStrictHooks && !g_strict_hooks_enabled)
+				return NULL;
+			if (remap[i].enabled && !*remap[i].enabled)
 				return NULL;
 			return remap[i].func;
 		}

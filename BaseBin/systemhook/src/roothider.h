@@ -39,6 +39,7 @@ void roothide_init_with_executable(const char* executable);
 void roothide_hidden_tweak_envbuf_apply(char ***envc);
 bool roothide_hidden_tweak_env_is_configured(void);
 void roothide_hidden_tweak_prepare_for_loader(void);
+void roothide_hidden_tweak_prepare_minimal_runtime(void);
 void roothide_hidden_tweak_load_selected(void);
 
 int __sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);

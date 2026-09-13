@@ -4,6 +4,8 @@
 #include <substrate.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
+#include <dlfcn.h>
+#include <IOKit/IOKitLib.h>
 #include <libjailbreak/libjailbreak.h>
 #include <libjailbreak/roothider.h>
 
@@ -54,6 +56,16 @@ static NSArray<NSString *> *RootHideNormalizedTweakNames(id value)
 		}
 	}
 	return orderedValues.array;
+}
+
+static NSString *RootHideNormalizedString(id value)
+{
+	if (![value isKindOfClass:[NSString class]]) {
+		return nil;
+	}
+
+	NSString *trimmedValue = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	return trimmedValue.length > 0 ? trimmedValue : nil;
 }
 
 static NSString *RootHideBundleIdentifierForExecutablePath(const char *path)
@@ -304,6 +316,17 @@ static BOOL RootHideApplyHiddenWhitelistTweakEnvironment(char ***envc, const cha
 	envbuf_setenv(envc, "ROOTHIDE_ENABLE_HIDDEN_TWEAKS", "1");
 	envbuf_setenv(envc, "ROOTHIDE_HIDDEN_TWEAK_MODE", modeString.UTF8String);
 	envbuf_setenv(envc, "ROOTHIDE_HIDDEN_TWEAK_LIST", [selectedTweaks componentsJoinedByString:@":"].UTF8String);
+
+	NSString *hiderProfile = RootHideNormalizedString(entry[@"hiderProfile"]);
+	if (hiderProfile.length > 0) {
+		envbuf_setenv(envc, "ROOTHIDE_HIDER_PROFILE", hiderProfile.UTF8String);
+	}
+
+	NSArray<NSString *> *disabledHiderHooks = RootHideNormalizedTweakNames(entry[@"disabledHiderHooks"]);
+	if (disabledHiderHooks.count > 0) {
+		envbuf_setenv(envc, "ROOTHIDE_HIDER_DISABLED_HOOKS", [disabledHiderHooks componentsJoinedByString:@":"].UTF8String);
+	}
+
 	envbuf_unsetenv(envc, "DISABLE_TWEAKS");
 	envbuf_unsetenv(envc, "CHOICY_SKIP_TWEAKLOADER");
 	RootHideInjectionLaunchdLog(@"apply hidden env path=%s bundle=%@ mode=%@ tweaks=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp) ?: @"(null)", modeString, [selectedTweaks componentsJoinedByString:@":"]);
@@ -513,41 +536,36 @@ void roothide_launchd_postinit(bool firstLoad)
 	assert(initJailbreakd(firstLoad) == 0);
 }
 
-#include <dlfcn.h>
-#include <IOKit/IOKitLib.h>
-void fix__iosConnect()
+static void RootHideRefreshLaunchdIOSurfaceConnectForAppSpawn(void)
 {
-    MSImageRef IOSurfaceImage = MSGetImageByName("/System/Library/Frameworks/IOSurface.framework/IOSurface");
-    JBLogDebug("IOSurfaceImage=%p\n", IOSurfaceImage);
-    assert(IOSurfaceImage != NULL);
+	MSImageRef iosurfaceImage = MSGetImageByName("/System/Library/Frameworks/IOSurface.framework/IOSurface");
+	if (!iosurfaceImage) {
+		return;
+	}
 
-    io_service_t* __iosService = MSFindSymbol(IOSurfaceImage, "__iosService");
-    io_connect_t* __iosConnect = MSFindSymbol(IOSurfaceImage, "__iosConnect");
-    assert(__iosService != NULL && __iosConnect != NULL);
+	io_service_t *iosService = MSFindSymbol(iosurfaceImage, "__iosService");
+	io_connect_t *iosConnect = MSFindSymbol(iosurfaceImage, "__iosConnect");
+	if (!iosService || !iosConnect || *iosService == IO_OBJECT_NULL || *iosConnect == IO_OBJECT_NULL) {
+		return;
+	}
 
-    JBLogDebug("__iosService=%p __iosConnect=%p\n", __iosService, __iosConnect);
-    JBLogDebug("*__iosService=%d *__iosConnect=%d\n", *__iosService, *__iosConnect);
+	kern_return_t (*ioServiceOpen)(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t *connect) = NULL;
+	kern_return_t (*ioServiceClose)(io_connect_t connect) = NULL;
+	*(void **)&ioServiceOpen = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+	*(void **)&ioServiceClose = dlsym(RTLD_DEFAULT, "IOServiceClose");
+	if (!ioServiceOpen || !ioServiceClose) {
+		return;
+	}
 
-    kern_return_t (*IOServiceClose)(io_connect_t connect);
-    kern_return_t (*IOServiceOpen)(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t* connect);
+	io_connect_t oldConnect = *iosConnect;
+	io_connect_t newConnect = IO_OBJECT_NULL;
+	kern_return_t kr = ioServiceOpen(*iosService, mach_task_self(), 0, &newConnect);
+	if (kr != KERN_SUCCESS || newConnect == IO_OBJECT_NULL) {
+		return;
+	}
 
-    *(void **)&IOServiceOpen = dlsym(RTLD_DEFAULT, "IOServiceOpen");
-    *(void **)&IOServiceClose = dlsym(RTLD_DEFAULT, "IOServiceClose");
-    assert(IOServiceOpen != NULL && IOServiceClose != NULL);
-    
-    io_connect_t old__iosConnect = *__iosConnect;
-
-    if(old__iosConnect) {
-
-        assert(*__iosService != 0);
-
-        kern_return_t kr = IOServiceOpen(*__iosService, mach_task_self(), 0, __iosConnect);
-        JBLogDebug("IOServiceOpen kr=%x, new iosConnect=%d\n", kr, *__iosConnect);
-        assert(kr == KERN_SUCCESS);
-
-        kr = IOServiceClose(old__iosConnect);
-        assert(kr == KERN_SUCCESS);
-    }
+	*iosConnect = newConnect;
+	ioServiceClose(oldConnect);
 }
 
 int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray);
@@ -684,9 +702,9 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	}
 
 	if(isRemovableBundlePath(path)) {
-		static dispatch_once_t onceToken = {0};
+		static dispatch_once_t onceToken = 0;
 		dispatch_once(&onceToken, ^{
-			fix__iosConnect();
+			RootHideRefreshLaunchdIOSurfaceConnectForAppSpawn();
 		});
 	}
 

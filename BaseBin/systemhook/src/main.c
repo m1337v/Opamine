@@ -42,8 +42,21 @@ static bool hidden_tweak_loading_should_apply_runtime_patch(void)
 		return false;
 	}
 
+	if (root_hide_injection_mode_is_blacklist_allowlist()) {
+		return false;
+	}
+
 	const char *progname = getprogname();
 	return !(progname && !strcmp(progname, "xpcproxy"));
+}
+
+static bool hidden_tweak_loading_uses_minimal_runtime(void)
+{
+	if (!gHiddenInjection || !gHiddenTweakLoading) {
+		return false;
+	}
+
+	return root_hide_injection_mode_is_blacklist_allowlist();
 }
 
 static void sanitize_dyld_insert_libraries_env(void)
@@ -221,10 +234,31 @@ int necp_session_action_hook(int necp_fd, uint32_t action, uint8_t *in_buffer, s
 	return syscall(SYS_necp_session_action, necp_fd, action, in_buffer, in_buffer_length, out_buffer, out_buffer_length);
 }
 
+#endif
+
 // For the userland, there are multiple processes that will check CS_VALID for one reason or another
 // As we inject system wide (or at least almost system wide), we can just patch the source of the info though - csops itself
 // Additionally we also remove CS_DEBUGGED while we're at it, as on arm64e this also is not set and everything is fine
 // That way we have unified behaviour between both arm64 and arm64e
+
+static void normalize_csops_status_flags(pid_t pid, uint32_t *csflag)
+{
+	if (!csflag) return;
+
+	*csflag |= CS_VALID;
+	*csflag &= ~CS_DEBUGGED;
+	if (pid == getpid() && gFullyDebugged) {
+		*csflag |= CS_DEBUGGED;
+	}
+
+	// Hidden app processes should look like ordinary App Store processes to
+	// userland csops probes even though the jailbreak may have relaxed the
+	// kernel-side flags to allow injection/debug semantics.
+	if (pid == getpid() && gHiddenInjection) {
+		*csflag |= (CS_HARD | CS_KILL);
+		*csflag &= ~CS_GET_TASK_ALLOW;
+	}
+}
 
 int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
 {
@@ -233,16 +267,7 @@ int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
 	if (ops == CS_OPS_STATUS) {
 		if (useraddr && usersize == sizeof(uint32_t)) {
 			uint32_t* csflag = (uint32_t *)useraddr;
-			*csflag |= CS_VALID;
-			*csflag &= ~CS_DEBUGGED;
-			if (pid == getpid() && gFullyDebugged) {
-				*csflag |= CS_DEBUGGED;
-			}
-			// For hidden injection: strip debug entitlement flag and ensure
-			// enforcement flags match stock App Store profile.
-			if (pid == getpid() && gHiddenInjection) {
-				*csflag &= ~CS_GET_TASK_ALLOW;
-			}
+			normalize_csops_status_flags(pid, csflag);
 		}
 	}
 	return rv;
@@ -255,20 +280,11 @@ int csops_audittoken_hook(pid_t pid, unsigned int ops, void *useraddr, size_t us
 	if (ops == CS_OPS_STATUS) {
 		if (useraddr && usersize == sizeof(uint32_t)) {
 			uint32_t* csflag = (uint32_t *)useraddr;
-			*csflag |= CS_VALID;
-			*csflag &= ~CS_DEBUGGED;
-			if (pid == getpid() && gFullyDebugged) {
-				*csflag |= CS_DEBUGGED;
-			}
-			if (pid == getpid() && gHiddenInjection) {
-				*csflag &= ~CS_GET_TASK_ALLOW;
-			}
+			normalize_csops_status_flags(pid, csflag);
 		}
 	}
 	return rv;
 }
-
-#endif
 
 bool should_enable_tweaks(void)
 {
@@ -490,6 +506,7 @@ __attribute__((constructor)) static void initializer(void)
 	gHiddenTweakLoading = consume_hidden_tweak_loading_env();
 	rhi_diag_log("POST-CONSUME hiddenInjection=%d hiddenTweakLoading=%d", gHiddenInjection, gHiddenTweakLoading);
 	bool hiddenTweakRuntimeSupport = hidden_tweak_loading_should_apply_runtime_patch();
+	bool hiddenTweakMinimalRuntime = hidden_tweak_loading_uses_minimal_runtime();
 	rhi_diag_log("POST-RUNTIME-PATCH hiddenTweakRuntimeSupport=%d", hiddenTweakRuntimeSupport);
 	sanitize_dyld_insert_libraries_env();
 	rhi_diag_log("POST-SANITIZE DYLD_INSERT_LIBRARIES=%s", getenv("DYLD_INSERT_LIBRARIES") ?: "(null)");
@@ -610,12 +627,13 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 			}
 		}
 
-#ifndef __arm64e__
-		// On arm64, writing to executable pages removes CS_VALID from the csflags of the process
-		// These hooks are neccessary to get the system to behave with this (since multiple system APIs check for CS_VALID and produce failures if it's not set)
-		// They are ugly but needed
+		// csops normalization is now needed on all architectures for hidden app
+		// processes so userland flag snapshots stay stock-like.
 		litehook_hook_function(csops, csops_hook);
 		litehook_hook_function(csops_audittoken, csops_audittoken_hook);
+#ifndef __arm64e__
+		// On arm64, writing to executable pages removes CS_VALID from the csflags of the process.
+		// These hooks are still only needed there for the older non-pmap_cs behavior.
 		if (__builtin_available(iOS 16.0, *)) {
 			litehook_hook_function(necp_match_policy, necp_match_policy_hook);
 			litehook_hook_function(necp_open, necp_open_hook);
@@ -638,40 +656,48 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 
 		// Load tweaks if desired
 		// We can hardcode /var/jb here since if it doesn't exist, loading TweakLoader.dylib is not going to work anyways
-		bool tweaksEnabled = should_enable_tweaks();
-		rhi_diag_log("should_enable_tweaks=%d gHiddenInjection=%d gHiddenTweakLoading=%d", tweaksEnabled, gHiddenInjection, gHiddenTweakLoading);
-		if (tweaksEnabled) {
-			const char *tweakLoaderPath = JBROOT_PATH("/usr/lib/TweakLoader.dylib");
-			root_hide_hidden_whitelist_log("attempt TweakLoader executable=%s path=%s", gExecutablePath, tweakLoaderPath);
-			if (access(tweakLoaderPath, F_OK) == 0) {
-				if (gHiddenInjection && gHiddenTweakLoading) {
-					roothide_hidden_tweak_prepare_for_loader();
-				}
-				int tweakLoaderMode = RTLD_NOW;
-				if (gHiddenInjection && gHiddenTweakLoading) {
-					tweakLoaderMode |= RTLD_GLOBAL;
-				}
-				void *tweakLoaderHandle = dlopen(tweakLoaderPath, tweakLoaderMode);
-				rhi_diag_log("TweakLoader dlopen result=%p dlerror=%s", tweakLoaderHandle, tweakLoaderHandle ? "none" : (dlerror() ?: "(null)"));
-				if (tweakLoaderHandle != NULL) {
-					root_hide_hidden_whitelist_log("TweakLoader loaded executable=%s", gExecutablePath);
-					if (gHiddenInjection && gHiddenTweakLoading) {
-						gHiddenTweakLoaderHandle = tweakLoaderHandle;
-						roothide_hidden_tweak_load_selected();
-						rhi_diag_log("POST-LOAD-SELECTED done");
-					}
-					else {
-						dlclose(tweakLoaderHandle);
-					}
+			bool tweaksEnabled = should_enable_tweaks();
+			rhi_diag_log("should_enable_tweaks=%d gHiddenInjection=%d gHiddenTweakLoading=%d", tweaksEnabled, gHiddenInjection, gHiddenTweakLoading);
+			if (tweaksEnabled) {
+				if (hiddenTweakMinimalRuntime) {
+					root_hide_hidden_whitelist_log("attempt minimal hidden tweak runtime executable=%s", gExecutablePath);
+					roothide_hidden_tweak_prepare_minimal_runtime();
+					roothide_hidden_tweak_load_selected();
+					rhi_diag_log("POST-MINIMAL-LOAD-SELECTED done");
 				}
 				else {
-					root_hide_hidden_whitelist_log("TweakLoader failed executable=%s error=%s", gExecutablePath, dlerror() ?: "(null)");
+					const char *tweakLoaderPath = JBROOT_PATH("/usr/lib/TweakLoader.dylib");
+					root_hide_hidden_whitelist_log("attempt TweakLoader executable=%s path=%s", gExecutablePath, tweakLoaderPath);
+					if (access(tweakLoaderPath, F_OK) == 0) {
+						if (gHiddenInjection && gHiddenTweakLoading) {
+							roothide_hidden_tweak_prepare_for_loader();
+						}
+						int tweakLoaderMode = RTLD_NOW;
+						if (gHiddenInjection && gHiddenTweakLoading) {
+							tweakLoaderMode |= RTLD_GLOBAL;
+						}
+						void *tweakLoaderHandle = dlopen(tweakLoaderPath, tweakLoaderMode);
+						rhi_diag_log("TweakLoader dlopen result=%p dlerror=%s", tweakLoaderHandle, tweakLoaderHandle ? "none" : (dlerror() ?: "(null)"));
+						if (tweakLoaderHandle != NULL) {
+							root_hide_hidden_whitelist_log("TweakLoader loaded executable=%s", gExecutablePath);
+							if (gHiddenInjection && gHiddenTweakLoading) {
+								gHiddenTweakLoaderHandle = tweakLoaderHandle;
+								roothide_hidden_tweak_load_selected();
+								rhi_diag_log("POST-LOAD-SELECTED done");
+							}
+							else {
+								dlclose(tweakLoaderHandle);
+							}
+						}
+						else {
+							root_hide_hidden_whitelist_log("TweakLoader failed executable=%s error=%s", gExecutablePath, dlerror() ?: "(null)");
+						}
+					}
+					else {
+						root_hide_hidden_whitelist_log("TweakLoader missing executable=%s", gExecutablePath);
+					}
 				}
 			}
-			else {
-				root_hide_hidden_whitelist_log("TweakLoader missing executable=%s", gExecutablePath);
-			}
-		}
 
 		if (gHiddenInjection) {
 			extern void hidden_dylib_hider_enable_strict_hooks(void);
