@@ -13,6 +13,62 @@
 #include "common.h"
 #include "log.h"
 
+NSDictionary* cachedJobInfo(pid_t pid, bool blacklised)
+{
+	static NSMutableDictionary* cachedData = nil;
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+		cachedData = [NSMutableDictionary new];
+	});
+
+	volatile NSDictionary* jobInfo = nil;
+	volatile uint64_t cacheKey = get_job_cache(pid);
+	if(cacheKey==0 && blacklised) {
+		//spawn--->register race
+		register_job(pid); cacheKey = get_job_cache(pid);
+	}
+	if (cacheKey != 0)
+	{
+		@synchronized (cachedData)
+		{
+			jobInfo = cachedData[@(cacheKey)];
+			if (!jobInfo)
+			{
+				char path[PATH_MAX] = {0};
+				proc_get_path(pid, path);
+
+				char identifier[255] = {0};
+				proc_get_identifier(pid, identifier);
+
+				jobInfo = @{
+					@"identifier":@(identifier),
+					@"path":@(path)
+				};
+				
+				cachedData[@(cacheKey)] = jobInfo;
+			}
+		}
+	}
+	return jobInfo;
+}
+
+//not work for jbroot:/var/...
+static bool check_path_in_jbroot(const char* real_path)
+{
+	static char real_jbroot[PATH_MAX]={0};
+
+	static dispatch_once_t onceToken;
+    dispatch_once(&onceToken,^{
+		assert(realpath(JBROOT_PATH("/"), real_jbroot) != NULL);
+	});
+
+	if(!string_has_prefix(real_path, real_jbroot))
+		return false;
+
+	return real_path[strlen(real_jbroot)] == '/';
+}
+
 xpc_object_t (*orig_xpc_dictionary_create_reply)(xpc_object_t original);
 xpc_object_t new_xpc_dictionary_create_reply(xpc_object_t original)
 {
@@ -44,8 +100,8 @@ int new_xpc_pipe_routine_reply(xpc_object_t reply)
 			audit_token_t clientToken = {0};
 			xpc_dictionary_get_audit_token(original, &clientToken);
 
-			uint64_t routine = xpc_dictionary_get_uint64(original, "routine");
-			uint64_t subsystem = xpc_dictionary_get_uint64(original, "subsystem");
+			volatile uint64_t routine = xpc_dictionary_get_uint64(original, "routine");
+			volatile uint64_t subsystem = xpc_dictionary_get_uint64(original, "subsystem");
 
 			/*
 			if(subsystem==2 && routine==708)
@@ -93,8 +149,8 @@ int new_xpc_pipe_routine_reply(xpc_object_t reply)
 
 				volatile const char *bundle = bundle_identifier ? bundle_identifier : (name ? name : "");
 
-				volatile char client_identifier[255] = {0};
-				proc_get_identifier(audit_token_to_pid(clientToken), client_identifier);
+				volatile int clientPid = audit_token_to_pid(clientToken);
+				volatile char* client_identifier = [cachedJobInfo(clientPid,true)[@"identifier"] UTF8String] ?: ""; //app exit race
 
 				volatile bool isSafeBundleIdentifier = is_safe_bundle_identifier(bundle);
 				volatile bool isSelfBundleIdentifier = client_identifier[0] && string_has_prefix(bundle, client_identifier);
@@ -175,29 +231,15 @@ void check_usreboot_msg(xpc_object_t xmsg)
 	}
 }
 
-void roothide_handle_xpc_msg(xpc_object_t xmsg)
+bool roothide_handle_xpc_msg(xpc_object_t xmsg)
 {
-	check_usreboot_msg(xmsg);
-
 	audit_token_t clientToken = {0};
 	xpc_dictionary_get_audit_token(xmsg, &clientToken);
 
-#ifdef ENABLE_LOGS
-	if (xpc_dictionary_get_value(xmsg, "jb-domain") && xpc_dictionary_get_value(xmsg, "action"))
-	{
-		const char *desc = NULL;
-		JBLogDebug("jbserver received xpc message from (%d) %s :\n%s",
-				   audit_token_to_pid(clientToken),
-				   proc_get_path(audit_token_to_pid(clientToken), NULL),
-				   (desc = xpc_copy_description(xmsg)));
-		if (desc) free((void *)desc);
-	}
-#endif
-
 	if (isBlacklistedToken(&clientToken))
 	{
-		uint64_t routine = xpc_dictionary_get_uint64(xmsg, "routine");
-		uint64_t subsystem = xpc_dictionary_get_uint64(xmsg, "subsystem");
+		volatile uint64_t routine = xpc_dictionary_get_uint64(xmsg, "routine");
+		volatile uint64_t subsystem = xpc_dictionary_get_uint64(xmsg, "subsystem");
 		if (subsystem == 2 && routine == 708)
 		{
 			volatile char *bundle = NULL;
@@ -220,8 +262,7 @@ void roothide_handle_xpc_msg(xpc_object_t xmsg)
 
 			volatile int clientPid = audit_token_to_pid(clientToken);
 
-			volatile char client_identifier[255] = {0};
-			proc_get_identifier(clientPid, client_identifier);
+			volatile char* client_identifier = [cachedJobInfo(clientPid,true)[@"identifier"] UTF8String] ?: ""; //app exit race
 
 			volatile bool isSafeBundleIdentifier = is_safe_bundle_identifier(bundle);
 			volatile bool isSelfBundleIdentifier = client_identifier[0] && string_has_prefix(bundle, client_identifier);
@@ -239,16 +280,13 @@ void roothide_handle_xpc_msg(xpc_object_t xmsg)
 			volatile int pid = xpc_dictionary_get_int64(xmsg, "pid");
 			volatile int clientPid = audit_token_to_pid(clientToken);
 
-			volatile char path[PATH_MAX] = {0};
-			proc_get_path(pid, path);
+			volatile char* path = [cachedJobInfo(pid,false)[@"path"] UTF8String] ?: "";
 
-			volatile char proc_identifier[255] = {0};
-			proc_get_identifier(pid, proc_identifier);
+			volatile char* proc_identifier = [cachedJobInfo(pid,false)[@"identifier"] UTF8String] ?: "";
 
-			volatile char client_identifier[255] = {0};
-			proc_get_identifier(clientPid, client_identifier);
+			volatile char* client_identifier = [cachedJobInfo(clientPid,true)[@"identifier"] UTF8String] ?: ""; //app exit race
 
-			volatile bool isJailbrokenPath = !path[0] || hasTrollstoreMarker(path) || isSubPathOf(path, JBROOT_PATH("/"));
+			volatile bool isJailbrokenPath = !path[0] || check_path_in_jbroot(path);
 			volatile bool isSafeBundleIdentifier = proc_identifier[0] && is_safe_bundle_identifier(proc_identifier);
 			volatile bool isSelfBundleIdentifier = proc_identifier[0] && client_identifier[0] && string_has_prefix(proc_identifier, client_identifier);
 
@@ -258,5 +296,35 @@ void roothide_handle_xpc_msg(xpc_object_t xmsg)
 				xpc_dictionary_set_int64(xmsg, "pid", INT_MAX);
 			}
 		}
+		else if (subsystem == 3 && routine == 829) //don't touch
+		{
+			//...
+		}
+		else //don't touch
+		{
+			if(is_safe_bundle_identifier("com.roothide.manager")) {
+				launchd_panic("consistency corruption");
+			}
+		}
+
+		return true;
+	}
+	else
+	{
+#ifdef ENABLE_LOGS
+		if (xpc_dictionary_get_value(xmsg, "jb-domain") && xpc_dictionary_get_value(xmsg, "action"))
+		{
+			const char *desc = NULL;
+			JBLogDebug("jbserver received xpc message from (%d) %s :\n%s",
+					audit_token_to_pid(clientToken),
+					proc_get_path(audit_token_to_pid(clientToken), NULL),
+					(desc = xpc_copy_description(xmsg)));
+			if (desc) free((void *)desc);
+		}
+#endif
+
+		check_usreboot_msg(xmsg);
+
+		return false;
 	}
 }

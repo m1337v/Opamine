@@ -513,6 +513,43 @@ void roothide_launchd_postinit(bool firstLoad)
 	assert(initJailbreakd(firstLoad) == 0);
 }
 
+#include <dlfcn.h>
+#include <IOKit/IOKitLib.h>
+void fix__iosConnect()
+{
+    MSImageRef IOSurfaceImage = MSGetImageByName("/System/Library/Frameworks/IOSurface.framework/IOSurface");
+    JBLogDebug("IOSurfaceImage=%p\n", IOSurfaceImage);
+    assert(IOSurfaceImage != NULL);
+
+    io_service_t* __iosService = MSFindSymbol(IOSurfaceImage, "__iosService");
+    io_connect_t* __iosConnect = MSFindSymbol(IOSurfaceImage, "__iosConnect");
+    assert(__iosService != NULL && __iosConnect != NULL);
+
+    JBLogDebug("__iosService=%p __iosConnect=%p\n", __iosService, __iosConnect);
+    JBLogDebug("*__iosService=%d *__iosConnect=%d\n", *__iosService, *__iosConnect);
+
+    kern_return_t (*IOServiceClose)(io_connect_t connect);
+    kern_return_t (*IOServiceOpen)(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t* connect);
+
+    *(void **)&IOServiceOpen = dlsym(RTLD_DEFAULT, "IOServiceOpen");
+    *(void **)&IOServiceClose = dlsym(RTLD_DEFAULT, "IOServiceClose");
+    assert(IOServiceOpen != NULL && IOServiceClose != NULL);
+    
+    io_connect_t old__iosConnect = *__iosConnect;
+
+    if(old__iosConnect) {
+
+        assert(*__iosService != 0);
+
+        kern_return_t kr = IOServiceOpen(*__iosService, mach_task_self(), 0, __iosConnect);
+        JBLogDebug("IOServiceOpen kr=%x, new iosConnect=%d\n", kr, *__iosConnect);
+        assert(kr == KERN_SUCCESS);
+
+        kr = IOServiceClose(old__iosConnect);
+        assert(kr == KERN_SUCCESS);
+    }
+}
+
 int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray);
 int roothide_launchd_trust_executable(const char* path)
 {
@@ -553,7 +590,8 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 	}
 #endif
 
-	int pid = 0;
+	pid_t pidval = 0;
+	if (!pidp) pidp = &pidval;
 	// Diagnostic: log ROOTHIDE_* env vars right before the actual syscall
 	if (strstr(path, ".app/")) {
 		const char *hi_val = envbuf_getenv((const char **)envc, "ROOTHIDE_HIDDEN_INJECTION");
@@ -561,8 +599,8 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 		const char *dil_val = envbuf_getenv((const char **)envc, "DYLD_INSERT_LIBRARIES");
 		RootHideInjectionLaunchdLog(@"posthook PRE-SYSCALL path=%s HI=%s HT=%s DYLD=%s", path, hi_val ?: "(null)", ht_val ?: "(null)", dil_val ?: "(null)");
 	}
-	int ret = __posix_spawn_orig_wrapper(&pid, path, desc, argv, envc);
-	if(pidp) *pidp = pid;
+	int ret = __posix_spawn_orig_wrapper(pidp, path, desc, argv, envc);
+	pid_t pid = *pidp;
 
 	envbuf_free(envc);
 	
@@ -608,9 +646,10 @@ int roothide_launchd___posix_spawn__spinlock_fix_only(pid_t *restrict pidp, cons
 
 	posix_spawnattr_setflags(attrp, flags | POSIX_SPAWN_START_SUSPENDED);
 
-	int pid = 0;
-	int ret = __posix_spawn_orig_wrapper(&pid, path, desc, argv, envp);
-	if(pidp) *pidp = pid;
+	pid_t pidval = 0;
+	if (!pidp) pidp = &pidval;
+	int ret = __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
+	pid_t pid = *pidp;
 	
 	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
 
@@ -644,6 +683,13 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		return __posix_spawn_hook(pidp, path, desc, argv, envp);
 	}
 
+	if(isRemovableBundlePath(path)) {
+		static dispatch_once_t onceToken = {0};
+		dispatch_once(&onceToken, ^{
+			fix__iosConnect();
+		});
+	}
+
 	if(strcmp(path, "/sbin/launchd") == 0) {
 		short flags = 0;
 		posix_spawnattr_getflags(attrp, &flags);
@@ -651,7 +697,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		return __posix_spawn_hook(pidp, path, desc, argv, envp);
 	}
 
-	if(path && string_has_suffix(path, "/Dopamine.app/Dopamine"))
+	if(path && isRemovableBundlePath(path) && string_has_suffix(path, "/Dopamine"))
 	{
 		/* if the jailbreak activation is interrupted for some reason, 
 			we prevent the app from relaunching to prevent the system from being in an unknown state */

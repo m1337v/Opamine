@@ -346,7 +346,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         return @"iOS 15.0 - 16.5.1 (arm64e)";
     }
     else {
-        return @"iOS 15.0 - 15.8.6 / 16.0 - 16.6.1 (arm64)";
+        return @"iOS 15.0 - 16.7.16 (arm64)";
     }
 }
 
@@ -618,6 +618,9 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
                 else {
                     [[NSData data] writeToFile:safeModePath atomically:YES];
                 }
+/*************************** roothide specific *******************/
+                setBasebinDependency(enabled);
+/*************************** roothide specific *******************/
             }];
         }];
     }

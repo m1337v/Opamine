@@ -219,6 +219,7 @@ sets[idx] = NULL;
 {
     int r = [[DOExploitManager sharedManager] cleanUpExploits];
     if (r != 0) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedCleanup userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"Failed to cleanup exploits: %d", r]}];
+    IOSurface_map_cleanup();
     return nil;
 }
 
@@ -601,6 +602,9 @@ void *boomerang_server(struct boomerang_info *info)
         printf("Creating safe mode marker file since tweaks were disabled in settings\n");
         [[NSData data] writeToFile:JBROOT_PATH(@"/basebin/.safe_mode") atomically:YES];
     }
+/*************************** roothide specific *******************/
+    setBasebinDependency(tweaksEnabled);
+/*************************** roothide specific *******************/
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Loading BaseBin TrustCache") debug:NO];
     *errOut = [self loadBasebinTrustcache];

@@ -8,6 +8,8 @@ extern bool launchdhookFirstLoad;
 /* as abort_with_* causes a SIGABRT, we need to use this instead */
 void launchd_panic(const char* fmt, ...);
 
+int setBasebinDependency(bool present);
+
 bool dyld_patch_enabled();
 bool process_force_dyld_patch(const char* path, const char** argv);
 int roothide_config_set_spinlock_fix(bool enabled);
@@ -20,6 +22,7 @@ int proc_fix_spinlock(pid_t pid);
 int proc_patch_csflags(pid_t pid);
 pid_t proc_get_ppid(pid_t pid);
 int proc_get_pidversion(pid_t pid);
+uint64_t proc_get_uniqueid(pid_t pid);
 int proc_paused(pid_t pid, bool* paused);
 char* proc_get_path(pid_t pid, char buffer[PATH_MAX]);
 char* proc_get_identifier(pid_t pid, char buffer[255]);
@@ -38,8 +41,11 @@ pid_t* allocBlacklistProcessId(void);
 pid_t* allocRestrictedBlacklistedProcessId(void);
 void commitBlacklistProcessId(pid_t* pidp);
 
+void register_job(pid_t pid);
+uint64_t get_job_cache(pid_t pid);
+
 bool isRemovableBundlePath(const char* path);
-bool isSubPathOf(const char* parent, const char* child);
+bool isSubPathOf(const char* parent, const char* child); //not work for jbroot:/var/...
 
 bool string_has_prefix(const char *str, const char* prefix);
 bool string_has_suffix(const char* str, const char* suffix);
@@ -71,13 +77,15 @@ void hideDeveloperMode();
 void exec_set_patch(bool enabled);
 int exec_cmd_roothide_spawn(pid_t* pidp, const char* path, const posix_spawn_file_actions_t *fap, const posix_spawnattr_t *attrp, char *const argv[], char *const envp[]);
 
-void roothide_handle_xpc_msg(xpc_object_t xmsg);
+bool roothide_handle_xpc_msg(xpc_object_t xmsg);
 
 void loadAppStoredIdentifiers();
 
 bool is_safe_bundle_identifier(const char* identifier);
 bool is_sensitive_app_identifier(const char* identifier);
 bool is_apple_internal_identifier(const char* identifier);
+
+#ifdef __OBJC__
 
 #define APPLE_INTERNAL_IDENTIFIERS @[\
     @"com.apple.atrun",\
@@ -113,3 +121,7 @@ bool is_apple_internal_identifier(const char* identifier);
 ]
 
 // CocoaTop, Derootifier, ESign, Flex3, Geranium, Postbox
+@class NSSet;
+NSSet* SensitiveAppIdentifiers();
+
+#endif

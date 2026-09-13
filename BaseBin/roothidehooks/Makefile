@@ -13,10 +13,9 @@ roothidehooks_CFLAGS = -Werror -fobjc-arc -fno-modules -I../.include
 roothidehooks_LDFLAGS = -rpath @loader_path/.jbroot/Library/Frameworks -rpath @loader_path/fallback -L../libjailbreak -ljailbreak
 roothidehooks_INSTALL_PATH = /basebin
 
-lsd.x_CFLAGS = -fno-objc-arc #lsd using mrc
-
 include $(THEOS_MAKE_PATH)/tweak.mk
 
 after-roothidehooks-all::
+	install_name_tool -rpath @loader_path/.jbroot/Library/Frameworks @loader_path/present $(THEOS_OBJ_DIR)/roothidehooks.dylib
 	install_name_tool -change @loader_path/.jbroot/usr/lib/libsubstrate.dylib @rpath/CydiaSubstrate.framework/CydiaSubstrate $(THEOS_OBJ_DIR)/roothidehooks.dylib
 	ldid -S $(THEOS_OBJ_DIR)/roothidehooks.dylib

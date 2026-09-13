@@ -121,7 +121,9 @@ __attribute__((constructor)) static void initializer(void)
 			remove("/var/mobile/Library/Preferences/com.apple.NanoRegistry.NRLaunchNotificationController.volatile.plist");
 		}
 
+/*********************** roothide specific ********************
 		draw_boot_logo(JBROOT_PATH("/basebin/bootlogo.jp2"));
+/*********************** roothide specific ********************/
 	}
 	else {
 		// Here we should have been injected into a live launchd on the fly

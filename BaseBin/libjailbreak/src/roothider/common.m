@@ -95,6 +95,15 @@ int proc_get_pidversion(pid_t pid)
 	}
 	return uniqidinfo.p_idversion;
 }
+uint64_t proc_get_uniqueid(pid_t pid)
+{
+	struct proc_uniqidentifierinfo uniqidinfo = {0};
+	int ret = proc_pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, 0, &uniqidinfo, sizeof(uniqidinfo));
+	if (ret <= 0) {
+        return 0;
+	}
+	return uniqidinfo.p_uniqueid;
+}
 
 char* proc_get_identifier(pid_t pid, char buffer[255])
 {
@@ -342,7 +351,7 @@ bool hasTrollstoreLiteMarker(const char* path)
 	return ret==0;
 }
 
-bool isSubPathOf(const char* child, const char* parent)
+bool isSubPathOf(const char* child, const char* parent) //not work for jbroot:/var/...
 {
 	char real_child[PATH_MAX]={0};
 	char real_parent[PATH_MAX]={0};
@@ -843,7 +852,7 @@ int exec_cmd_roothide_spawn(pid_t* pidp, const char* path, const posix_spawn_fil
         need_patch_child = false;
     }
 
-    if(need_patch_child && !dyld_patch_enabled()) {
+    if(need_patch_child && !dyld_patch_enabled() && getpid()!=1) {
         if(jbclient_trust_executable_recurse(path, NULL) != 0) {
             JBLogError("Failed to trust executable: %s", path);
             return 999;
@@ -860,9 +869,10 @@ int exec_cmd_roothide_spawn(pid_t* pidp, const char* path, const posix_spawn_fil
 
     posix_spawnattr_setflags(attrp, flags | POSIX_SPAWN_START_SUSPENDED);
 
-    pid_t pid = 0;
-    int ret = posix_spawn(&pid, path, fap, attrp, argv, envp);
-    if(pidp) *pidp = pid;
+	pid_t pidval = 0;
+	if (!pidp) pidp = &pidval;
+    int ret = posix_spawn(pidp, path, fap, attrp, argv, envp);
+    pid_t pid = *pidp;
 
     JBLogDebug("spawn ret=%d pid=%d", ret, pid);
 
@@ -923,11 +933,11 @@ int ensure_dyld_trustcache(const char* path)
     return 0;
 }
 
-NSMutableArray<NSString*>* StoredAppIdentifiers = nil;
+NSMutableSet<NSString*>* StoredAppIdentifiers = nil;
 
 void loadAppStoredIdentifiers()
 {
-    StoredAppIdentifiers = [[NSMutableArray alloc] init];
+    StoredAppIdentifiers = [[NSMutableSet alloc] init];
 
     NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *applicationsPath = @"/private/var/containers/Bundle/Application/";
@@ -1048,11 +1058,29 @@ bool is_apple_internal_identifier(const char* identifier)
     return false;
 }
 
+NSSet* SensitiveAppIdentifiers()
+{
+    static NSSet* apps = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        JBLogDebug("Initializing sensitive app identifiers set");
+        apps = [NSSet setWithArray:SENSITIVE_APP_IDENTIFIERS];
+        NSString* customBundleId = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.AppIdentifier") encoding:NSUTF8StringEncoding error:nil];
+        if(customBundleId) {
+            if(customBundleId && customBundleId.length > 0) {
+                JBLogDebug("Added custom sensitive app identifier: %s", customBundleId.UTF8String);
+                apps = [apps setByAddingObject:customBundleId];
+            }
+        }
+    });
+    return apps;
+}
+
 bool is_sensitive_app_identifier(const char* identifier)
 {
     if(!identifier || !*identifier) return false;
 
-    for(NSString* item in SENSITIVE_APP_IDENTIFIERS) {
+    for(NSString* item in SensitiveAppIdentifiers()) {
         if([@(identifier) hasPrefix:item]) {
             return true;
         }
@@ -1062,14 +1090,12 @@ bool is_sensitive_app_identifier(const char* identifier)
 
 bool is_safe_bundle_identifier(const char* identifier)
 {
-    if(!identifier || !*identifier) return false;
+    //don't touch
+    if(!identifier || !*identifier) identifier="";
 
-    /* ios15 /System/Library/LaunchDaemons/com.apple.tvremoted.plist */
-    if(strcmp(identifier, "$(PRODUCT_BUNDLE_IDENTIFIER)")==0) {
-        return true;
-    }
-
-    if(string_has_prefix(identifier, "lockdown.") && strstr(identifier, ".com.apple.")) {
+    //don't touch
+    assert(StoredAppIdentifiers != nil);
+    if([StoredAppIdentifiers containsObject:@(identifier)]) {
         return true;
     }
 
@@ -1086,8 +1112,12 @@ bool is_safe_bundle_identifier(const char* identifier)
         return false;
     }
 
-    assert(StoredAppIdentifiers != nil);
-    if([StoredAppIdentifiers containsObject:@(identifier)]) {
+    /* ios15 /System/Library/LaunchDaemons/com.apple.tvremoted.plist */
+    if(strcmp(identifier, "$(PRODUCT_BUNDLE_IDENTIFIER)")==0) {
+        return true;
+    }
+
+    if(string_has_prefix(identifier, "lockdown.") && strstr(identifier, ".com.apple.")) {
         return true;
     }
 
@@ -1111,5 +1141,13 @@ int wait_for_exit(pid_t pid)
         } else if (WIFSIGNALED(status)) {
             return 128 + WTERMSIG(status);
         }
+    }
+}
+int setBasebinDependency(bool present)
+{
+    if(present) {
+        return symlink(JBROOT_PATH("/Library/Frameworks"), JBROOT_PATH("/basebin/present"));
+    } else {
+        return unlink(JBROOT_PATH("/basebin/present"));
     }
 }
