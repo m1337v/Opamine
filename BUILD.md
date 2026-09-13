@@ -7,7 +7,7 @@
 | **Xcode 16+** | `/usr/bin/xcodebuild` | Builds `Dopamine.app` (iOS target) |
 | **iOS SDK** | Ships with Xcode (iPhoneOS SDK) | `xcrun --sdk iphoneos --show-sdk-path` |
 | **theos** | `$THEOS` (default: `~/theos`) | Builds `opainject` and `roothidehooks` subprojects |
-| **ldid** | `$(brew --prefix)/bin/ldid` | Ad-hoc codesigning for dylibs and the app |
+| **Procursus ldid** | `$(brew --prefix)/bin/ldid` | Ad-hoc codesigning for dylibs and recursive app-bundle signing |
 | **trustcache** | `BaseBin/trustcache` OR `../../Opamine-dopamine/BaseBin/trustcache` OR `$PATH` | Generates `basebin.tc` trust cache |
 | **libarchive** | `$(brew --prefix)/opt/libarchive` | Required by `libjailbreak` (archive extraction) |
 | **dpkg-deb** | `$(brew --prefix)/bin/dpkg-deb` | Builds `.deb` packages in `Packages/` |
@@ -16,11 +16,15 @@
 
 ```bash
 # homebrew packages
-brew install ldid libarchive dpkg
+brew install ldid-procursus libarchive dpkg
 
 # theos (if not installed)
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
 ```
+
+`ldid-procursus` conflicts with Homebrew's `ldid` formula. If the latter is
+already installed, run `brew unlink ldid` before installing
+`ldid-procursus`.
 
 ### Environment
 

@@ -4,19 +4,18 @@ ifeq ($(NIGHTLY), 1)
 export COMMIT_HASH = $(shell git rev-parse HEAD)
 endif
 
-all: tipa
+all: full
 
 basebin:
 	@$(MAKE) -C BaseBin
 
-tipa: basebin
-	@$(MAKE) -C Application
-
-packages:
+packages: basebin
 	@$(MAKE) -C Packages
 
-full: basebin packages
+tipa: packages
 	@$(MAKE) -C Application
+
+full: tipa
 
 clean:
 	@$(MAKE) -C BaseBin clean
