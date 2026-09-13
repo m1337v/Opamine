@@ -138,6 +138,10 @@ static pid_t* _allocBlacklistProcessIdWithState(int state)
     initBlacklistState();
 
     pid_t* pidp = (pid_t*)malloc(sizeof(pid_t));
+	if (!pidp)
+	{
+		return NULL;
+	}
 
     *pidp = 0;
 
@@ -162,6 +166,10 @@ extern "C" pid_t* allocRestrictedBlacklistedProcessId(void)
 
 extern "C" void commitBlacklistProcessId(pid_t* pidp)
 {
+	if (!pidp)
+	{
+		return;
+	}
     initBlacklistState();
 
     stateWriteLock();

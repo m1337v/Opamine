@@ -1,5 +1,9 @@
+#include "envbuf.h"
+
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 int envbuf_len(const char *envp[])
 {
@@ -18,12 +22,17 @@ char **envbuf_mutcopy(const char *envp[])
 	if (envp == NULL) return NULL;
 
 	int len = envbuf_len(envp);
-	char **envcopy = malloc(len * sizeof(char *));
+	if (len <= 0 || (size_t)len > SIZE_MAX / sizeof(char *)) return NULL;
+	char **envcopy = calloc((size_t)len, sizeof(*envcopy));
+	if (!envcopy) return NULL;
 
 	for (int i = 0; i < len-1; i++) {
 		envcopy[i] = strdup(envp[i]);
+		if (!envcopy[i]) {
+			envbuf_free(envcopy);
+			return NULL;
+		}
 	}
-	envcopy[len-1] = NULL;
 
 	return envcopy;
 }
@@ -39,9 +48,9 @@ void envbuf_free(char *envp[])
 	free(envp);
 }
 
-int envbuf_find(const char *envp[], const char *name)
+int envbuf_find(const char * const envp[], const char *name)
 {
-	if (envp) {
+	if (envp && name && name[0]) {
 		unsigned long nameLen = strlen(name);
 		int k = 0;
 		const char *env = envp[k++];
@@ -60,7 +69,7 @@ int envbuf_find(const char *envp[], const char *name)
 	return -1;
 }
 
-const char *envbuf_getenv(const char *envp[], const char *name)
+const char *envbuf_getenv(const char * const envp[], const char *name)
 {
 	if (envp) {
 		unsigned long nameLen = strlen(name);
@@ -72,52 +81,82 @@ const char *envbuf_getenv(const char *envp[], const char *name)
 	return NULL;
 }
 
-void envbuf_setenv(char **envpp[], const char *name, const char *value)
+bool envbuf_setenv(char **envpp[], const char *name, const char *value)
 {
-	if (envpp) {
-		char **envp = *envpp;
-		if (!envp) {
-			// treat NULL as [NULL]
-			envp = malloc(sizeof(const char *));
-			envp[0] = NULL;
-		}
-
-		char *envToSet = malloc(strlen(name)+strlen(value)+2);
-		strcpy(envToSet, name);
-		strcat(envToSet, "=");
-		strcat(envToSet, value);
-
-		int existingEnvIndex = envbuf_find((const char **)envp, name);
-		if (existingEnvIndex >= 0) {
-			// if already exists: deallocate old variable, then replace pointer
-			free(envp[existingEnvIndex]);
-			envp[existingEnvIndex] = envToSet;
-		}
-		else {
-			// if doesn't exist yet: increase env buffer size, place at end
-			int prevLen = envbuf_len((const char **)envp);
-			*envpp = realloc(envp, (prevLen+1)*sizeof(const char *));
-			envp = *envpp;
-			envp[prevLen-1] = envToSet;
-			envp[prevLen] = NULL;
-		}
+	if (!envpp || !name || !name[0] || !value) {
+		return false;
 	}
+
+	char **envp = *envpp;
+	bool created_empty_buffer = false;
+	if (!envp) {
+		// Treat NULL as [NULL], but publish it only after all allocation works.
+		envp = calloc(1, sizeof(*envp));
+		if (!envp) return false;
+		created_empty_buffer = true;
+	}
+
+	size_t name_len = strlen(name);
+	size_t value_len = strlen(value);
+	if (name_len > SIZE_MAX - value_len - 2) {
+		if (created_empty_buffer) free(envp);
+		return false;
+	}
+	char *envToSet = malloc(name_len + value_len + 2);
+	if (!envToSet) {
+		if (created_empty_buffer) free(envp);
+		return false;
+	}
+	memcpy(envToSet, name, name_len);
+	envToSet[name_len] = '=';
+	memcpy(envToSet + name_len + 1, value, value_len + 1);
+
+	int existingEnvIndex = envbuf_find((const char **)envp, name);
+	if (existingEnvIndex >= 0) {
+		// The new allocation exists before the old value is released.
+		free(envp[existingEnvIndex]);
+		envp[existingEnvIndex] = envToSet;
+		if (created_empty_buffer) *envpp = envp;
+		return true;
+	}
+
+	// If it doesn't exist yet, grow before publishing either the new value or
+	// (for a NULL input) the newly-created empty environment.
+	int prevLen = envbuf_len((const char **)envp);
+	if (prevLen <= 0 || (size_t)prevLen > (SIZE_MAX / sizeof(*envp)) - 1) {
+		free(envToSet);
+		if (created_empty_buffer) free(envp);
+		return false;
+	}
+	char **resized = realloc(envp, (size_t)(prevLen + 1) * sizeof(*envp));
+	if (!resized) {
+		free(envToSet);
+		if (created_empty_buffer) free(envp);
+		return false;
+	}
+	resized[prevLen-1] = envToSet;
+	resized[prevLen] = NULL;
+	*envpp = resized;
+	return true;
 }
 
-void envbuf_unsetenv(char **envpp[], const char *name)
+bool envbuf_unsetenv(char **envpp[], const char *name)
 {
-	if (envpp) {
-		char **envp = *envpp;
-		if (!envp) return;
-
-		int existingEnvIndex = envbuf_find((const char **)envp, name);
-		if (existingEnvIndex >= 0) {
-			free(envp[existingEnvIndex]);
-			int prevLen = envbuf_len((const char **)envp);
-			for (int i = existingEnvIndex; i < (prevLen-1); i++) {
-				envp[i] = envp[i+1];
-			}
-			*envpp = realloc(envp, (prevLen-1)*sizeof(const char *));
-		}
+	if (!envpp || !name || !name[0]) {
+		return false;
 	}
+	char **envp = *envpp;
+	if (!envp) return true;
+
+	int existingEnvIndex = envbuf_find((const char **)envp, name);
+	if (existingEnvIndex < 0) return true;
+
+	free(envp[existingEnvIndex]);
+	int prevLen = envbuf_len((const char **)envp);
+	for (int i = existingEnvIndex; i < (prevLen-1); i++) {
+		envp[i] = envp[i+1];
+	}
+	/* Keep the existing allocation. Shrinking is only an optimization, while a
+	 * failed realloc would otherwise make ownership ambiguous after removal. */
+	return true;
 }

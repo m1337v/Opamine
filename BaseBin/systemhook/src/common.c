@@ -496,7 +496,8 @@ static int spawn_exec_hook_common(const char *path,
 								  char *const envp[restrict],
 			   struct _posix_spawn_args_desc *desc,
 										int (*trust_binary)(const char *path),
-									   double jetsamMultiplier,
+									 double jetsamMultiplier,
+									 int mutationErrorReturn,
 									    int (^orig)(char *const envp[restrict]))
 {
 	if (!path) {
@@ -633,6 +634,13 @@ static int spawn_exec_hook_common(const char *path,
 		// the state we want to be in is not the state we are in right now
 
 		char **envc = envbuf_mutcopy((const char **)envp);
+		if (!envc) {
+			// This path must add or remove an inherited jailbreak marker. Passing
+			// NULL would accidentally create an empty child environment, while the
+			// untouched input would violate the selected injection policy.
+			errno = ENOMEM;
+			return mutationErrorReturn;
+		}
 
 		if (shouldInsertJBEnv) {
 			if (!systemHookAlreadyInserted) {
@@ -642,7 +650,11 @@ static int spawn_exec_hook_common(const char *path,
 					strcat(newLibraryInsert, ":");
 					strcat(newLibraryInsert, existingLibraryInserts);
 				}
-				envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", newLibraryInsert);
+				if (!envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", newLibraryInsert)) {
+					envbuf_free(envc);
+					errno = ENOMEM;
+					return mutationErrorReturn;
+				}
 				if (traceInjectionPath) {
 					root_hide_hidden_whitelist_log("inserted hook dylib path=%s dylibs=%s", path, newLibraryInsert);
 				}
@@ -651,10 +663,19 @@ static int spawn_exec_hook_common(const char *path,
 		else {
 			if (systemHookAlreadyInserted && existingLibraryInserts) {
 				if (!strcmp(existingLibraryInserts, HOOK_DYLIB_PATH)) {
-					envbuf_unsetenv(&envc, "DYLD_INSERT_LIBRARIES");
+					if (!envbuf_unsetenv(&envc, "DYLD_INSERT_LIBRARIES")) {
+						envbuf_free(envc);
+						errno = ENOMEM;
+						return mutationErrorReturn;
+					}
 				}
 				else {
 					char *newLibraryInsert = malloc(strlen(existingLibraryInserts)+1);
+					if (!newLibraryInsert) {
+						envbuf_free(envc);
+						errno = ENOMEM;
+						return mutationErrorReturn;
+					}
 					newLibraryInsert[0] = '\0';
 
 					__block bool first = true;
@@ -670,7 +691,12 @@ static int spawn_exec_hook_common(const char *path,
 							}
 						}
 					});
-					envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", newLibraryInsert);
+					if (!envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", newLibraryInsert)) {
+						free(newLibraryInsert);
+						envbuf_free(envc);
+						errno = ENOMEM;
+						return mutationErrorReturn;
+					}
 					if (traceInjectionPath) {
 						root_hide_hidden_whitelist_log("removed hook dylib path=%s dylibs=%s", path, newLibraryInsert);
 					}
@@ -678,8 +704,11 @@ static int spawn_exec_hook_common(const char *path,
 					free(newLibraryInsert);
 				}
 			}
-			envbuf_unsetenv(&envc, "_SafeMode");
-			envbuf_unsetenv(&envc, "_MSSafeMode");
+			if (!envbuf_unsetenv(&envc, "_SafeMode") || !envbuf_unsetenv(&envc, "_MSSafeMode")) {
+				envbuf_free(envc);
+				errno = ENOMEM;
+				return mutationErrorReturn;
+			}
 			if (traceInjectionPath) {
 				root_hide_hidden_whitelist_log("cleared safe mode env path=%s", path);
 			}
@@ -705,7 +734,7 @@ int posix_spawn_hook_shared(pid_t *restrict pid,
 {
 	int (*posix_spawn_orig)(pid_t *restrict, const char *restrict, struct _posix_spawn_args_desc *, char *const[restrict], char *const[restrict]) = orig;
 
-	int r = spawn_exec_hook_common(path, argv, envp, desc, trust_binary, jetsamMultiplier, ^int(char *const envp_patched[restrict]) {
+	int r = spawn_exec_hook_common(path, argv, envp, desc, trust_binary, jetsamMultiplier, ENOMEM, ^int(char *const envp_patched[restrict]) {
 		return posix_spawn_orig(pid, path, desc, argv, envp_patched);
 	});
 
@@ -733,7 +762,7 @@ int execve_hook_shared(const char *path,
 {
 	int (*execve_orig)(const char *, char *const[], char *const[]) = orig;
 
-	int r = spawn_exec_hook_common(path, argv, envp, NULL, trust_binary, 0, ^int(char *const envp_patched[restrict]){
+	int r = spawn_exec_hook_common(path, argv, envp, NULL, trust_binary, 0, -1, ^int(char *const envp_patched[restrict]){
 		return execve_orig(path, argv, envp_patched);
 	});
 

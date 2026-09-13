@@ -1,4 +1,5 @@
 #include "common.h"
+#include "hider_internal.h"
 #include "roothider.h"
 
 #include <mach-o/dyld.h>
@@ -527,7 +528,6 @@ __attribute__((constructor)) static void initializer(void)
 	// TweakLoader (which triggers image-add callbacks).
 	if (gHiddenInjection) {
 		rhi_diag_log("PRE-HIDER-INIT gHiddenInjection=%d", gHiddenInjection);
-		extern void hidden_dylib_hider_init(void);
 		hidden_dylib_hider_init();
 		rhi_diag_log("POST-HIDER-INIT OK");
 	}
@@ -661,36 +661,46 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 			if (tweaksEnabled) {
 				if (hiddenTweakMinimalRuntime) {
 					root_hide_hidden_whitelist_log("attempt minimal hidden tweak runtime executable=%s", gExecutablePath);
-					roothide_hidden_tweak_prepare_minimal_runtime();
-					roothide_hidden_tweak_load_selected();
-					rhi_diag_log("POST-MINIMAL-LOAD-SELECTED done");
+					if (roothide_hidden_tweak_prepare_minimal_runtime()) {
+						bool selectedTweaksLoaded = roothide_hidden_tweak_load_selected();
+						rhi_diag_log("POST-MINIMAL-LOAD-SELECTED loaded=%d state=%d", selectedTweaksLoaded, roothide_hidden_tweak_load_state());
+					}
+					else {
+						root_hide_hidden_whitelist_log("skip minimal selected tweaks after failed prepare executable=%s state=%d", gExecutablePath, roothide_hidden_tweak_load_state());
+					}
 				}
 				else {
 					const char *tweakLoaderPath = JBROOT_PATH("/usr/lib/TweakLoader.dylib");
 					root_hide_hidden_whitelist_log("attempt TweakLoader executable=%s path=%s", gExecutablePath, tweakLoaderPath);
 					if (access(tweakLoaderPath, F_OK) == 0) {
-						if (gHiddenInjection && gHiddenTweakLoading) {
-							roothide_hidden_tweak_prepare_for_loader();
-						}
-						int tweakLoaderMode = RTLD_NOW;
-						if (gHiddenInjection && gHiddenTweakLoading) {
-							tweakLoaderMode |= RTLD_GLOBAL;
-						}
-						void *tweakLoaderHandle = dlopen(tweakLoaderPath, tweakLoaderMode);
-						rhi_diag_log("TweakLoader dlopen result=%p dlerror=%s", tweakLoaderHandle, tweakLoaderHandle ? "none" : (dlerror() ?: "(null)"));
-						if (tweakLoaderHandle != NULL) {
-							root_hide_hidden_whitelist_log("TweakLoader loaded executable=%s", gExecutablePath);
-							if (gHiddenInjection && gHiddenTweakLoading) {
-								gHiddenTweakLoaderHandle = tweakLoaderHandle;
-								roothide_hidden_tweak_load_selected();
-								rhi_diag_log("POST-LOAD-SELECTED done");
-							}
-							else {
-								dlclose(tweakLoaderHandle);
-							}
+						bool loaderPrepareSucceeded = !gHiddenInjection || !gHiddenTweakLoading || roothide_hidden_tweak_prepare_for_loader();
+						if (!loaderPrepareSucceeded) {
+							root_hide_hidden_whitelist_log("skip TweakLoader after failed selected-tweak prepare executable=%s state=%d", gExecutablePath, roothide_hidden_tweak_load_state());
 						}
 						else {
-							root_hide_hidden_whitelist_log("TweakLoader failed executable=%s error=%s", gExecutablePath, dlerror() ?: "(null)");
+							int tweakLoaderMode = RTLD_NOW;
+							if (gHiddenInjection && gHiddenTweakLoading) {
+								tweakLoaderMode |= RTLD_GLOBAL;
+							}
+							void *tweakLoaderHandle = dlopen(tweakLoaderPath, tweakLoaderMode);
+							rhi_diag_log("TweakLoader dlopen result=%p dlerror=%s", tweakLoaderHandle, tweakLoaderHandle ? "none" : (dlerror() ?: "(null)"));
+							if (gHiddenInjection && gHiddenTweakLoading) {
+								roothide_hidden_tweak_note_loader_result(tweakLoaderHandle != NULL);
+							}
+							if (tweakLoaderHandle != NULL) {
+								root_hide_hidden_whitelist_log("TweakLoader loaded executable=%s", gExecutablePath);
+								if (gHiddenInjection && gHiddenTweakLoading) {
+									gHiddenTweakLoaderHandle = tweakLoaderHandle;
+									bool selectedTweaksLoaded = roothide_hidden_tweak_load_selected();
+									rhi_diag_log("POST-LOAD-SELECTED loaded=%d state=%d", selectedTweaksLoaded, roothide_hidden_tweak_load_state());
+								}
+								else {
+									dlclose(tweakLoaderHandle);
+								}
+							}
+							else {
+								root_hide_hidden_whitelist_log("TweakLoader failed executable=%s error=%s", gExecutablePath, dlerror() ?: "(null)");
+							}
 						}
 					}
 					else {
@@ -700,7 +710,6 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 			}
 
 		if (gHiddenInjection) {
-			extern void hidden_dylib_hider_enable_strict_hooks(void);
 			hidden_dylib_hider_enable_strict_hooks();
 			rhi_diag_log("POST-HIDER-STRICT OK");
 		}

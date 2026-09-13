@@ -68,60 +68,15 @@ static NSString *RootHideNormalizedString(id value)
 	return trimmedValue.length > 0 ? trimmedValue : nil;
 }
 
-static NSString *RootHideBundleIdentifierForExecutablePath(const char *path)
-{
-	if (!path) {
-		return nil;
-	}
+typedef NS_ENUM(NSUInteger, RootHideBundleIdentifierSource) {
+	RootHideBundleIdentifierSourceNone,
+	RootHideBundleIdentifierSourceAuthoritative,
+	RootHideBundleIdentifierSourceUniqueHeuristic,
+	RootHideBundleIdentifierSourceAmbiguousHeuristic,
+};
 
-	NSString *bundlePath = [@(path) stringByDeletingLastPathComponent];
-	if (bundlePath.length == 0) {
-		return nil;
-	}
-
-	NSDictionary *infoDictionary = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
-	NSString *bundleIdentifier = [infoDictionary[@"CFBundleIdentifier"] isKindOfClass:[NSString class]] ? infoDictionary[@"CFBundleIdentifier"] : nil;
-	return bundleIdentifier.length > 0 ? bundleIdentifier : nil;
-}
-
-static NSString *RootHideBundleIdentifierFromLaunchName(const char *launchName)
-{
-	if (!launchName || launchName[0] == '\0') {
-		return nil;
-	}
-
-	NSString *rawName = @(launchName);
-	if ([rawName hasPrefix:@"UIKitApplication:"]) {
-		rawName = [rawName substringFromIndex:sizeof("UIKitApplication:") - 1];
-		NSRange bracketRange = [rawName rangeOfString:@"["];
-		if (bracketRange.location != NSNotFound) {
-			rawName = [rawName substringToIndex:bracketRange.location];
-		}
-	}
-
-	rawName = [rawName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-	if (rawName.length == 0 || [rawName containsString:@"/"]) {
-		return nil;
-	}
-
-	return rawName;
-}
-
-static void RootHideEnumerateCStringList(char *const values[restrict], void (^block)(NSString *value, bool *stop))
-{
-	if (!values || !block) {
-		return;
-	}
-
-	for (NSUInteger index = 0; values[index] != NULL; index++) {
-		NSString *value = @(values[index]);
-		bool stop = false;
-		block(value, &stop);
-		if (stop) {
-			break;
-		}
-	}
-}
+static const NSUInteger kRootHideMaxSpawnArgumentEntries = 128;
+static const NSUInteger kRootHideMaxHeuristicBundleIdentifiers = 16;
 
 static NSString *RootHideNormalizedBundleIdentifierCandidate(NSString *candidate)
 {
@@ -130,7 +85,10 @@ static NSString *RootHideNormalizedBundleIdentifierCandidate(NSString *candidate
 	}
 
 	NSString *trimmedCandidate = [candidate stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-	if (trimmedCandidate.length == 0 || [trimmedCandidate containsString:@"/"]) {
+	// Structured key=value data is never a direct identity. Callers must split
+	// recognized identity labels first, otherwise a harmless dotted setting can
+	// silently turn into an app/service selection.
+	if (trimmedCandidate.length == 0 || [trimmedCandidate containsString:@"/"] || [trimmedCandidate containsString:@"="]) {
 		return nil;
 	}
 
@@ -147,29 +105,106 @@ static NSString *RootHideNormalizedBundleIdentifierCandidate(NSString *candidate
 	return trimmedCandidate;
 }
 
+static NSString *RootHideBundleIdentifierForExecutablePath(const char *path)
+{
+	if (!path) {
+		return nil;
+	}
+
+	NSString *bundlePath = [@(path) stringByDeletingLastPathComponent];
+	if (bundlePath.length == 0) {
+		return nil;
+	}
+
+	NSDictionary *infoDictionary = [NSDictionary dictionaryWithContentsOfFile:[bundlePath stringByAppendingPathComponent:@"Info.plist"]];
+	return RootHideNormalizedBundleIdentifierCandidate(infoDictionary[@"CFBundleIdentifier"]);
+}
+
+static NSString *RootHideBundleIdentifierFromUIKitApplicationLaunchName(const char *launchName)
+{
+	if (!launchName || launchName[0] == '\0') {
+		return nil;
+	}
+
+	NSString *rawName = @(launchName);
+	if (![rawName hasPrefix:@"UIKitApplication:"]) {
+		return nil;
+	}
+
+	rawName = [rawName substringFromIndex:sizeof("UIKitApplication:") - 1];
+	NSRange bracketRange = [rawName rangeOfString:@"["];
+	if (bracketRange.location != NSNotFound) {
+		rawName = [rawName substringToIndex:bracketRange.location];
+	}
+
+	return RootHideNormalizedBundleIdentifierCandidate(rawName);
+}
+
+static BOOL RootHideIsIdentityEnvironmentKey(NSString *key)
+{
+	return [key isEqualToString:@"XPC_SERVICE_NAME"]
+		|| [key isEqualToString:@"CFBundleIdentifier"]
+		|| [key isEqualToString:@"BUNDLE_IDENTIFIER"];
+}
+
+static NSString *RootHideBundleIdentifierFromStructuredIdentityValue(NSString *value)
+{
+	if (![value isKindOfClass:[NSString class]]) {
+		return nil;
+	}
+
+	NSRange equalsRange = [value rangeOfString:@"="];
+	if (equalsRange.location == NSNotFound || equalsRange.location + 1 >= value.length) {
+		return nil;
+	}
+	NSString *key = [value substringToIndex:equalsRange.location];
+	if (!RootHideIsIdentityEnvironmentKey(key)) {
+		return nil;
+	}
+	NSString *candidate = [value substringFromIndex:equalsRange.location + 1];
+	return RootHideBundleIdentifierFromUIKitApplicationLaunchName(candidate.UTF8String)
+		?: RootHideNormalizedBundleIdentifierCandidate(candidate);
+}
+
+static void RootHideEnumerateCStringList(char *const values[restrict], void (^block)(NSString *value, bool *stop))
+{
+	if (!values || !block) {
+		return;
+	}
+
+	for (NSUInteger index = 0; index < kRootHideMaxSpawnArgumentEntries && values[index] != NULL; index++) {
+		NSString *value = @(values[index]);
+		bool stop = false;
+		block(value, &stop);
+		if (stop) {
+			break;
+		}
+	}
+}
+
 static void RootHideAddBundleIdentifierCandidatesFromValue(NSMutableOrderedSet<NSString *> *bundleIdentifiers, NSString *value)
 {
 	if (!bundleIdentifiers || ![value isKindOfClass:[NSString class]]) {
 		return;
 	}
 
-	NSString *directBundleIdentifier = RootHideBundleIdentifierFromLaunchName(value.UTF8String);
+	if (bundleIdentifiers.count >= kRootHideMaxHeuristicBundleIdentifiers) {
+		return;
+	}
+
+	NSString *directBundleIdentifier = RootHideBundleIdentifierFromUIKitApplicationLaunchName(value.UTF8String);
 	if (directBundleIdentifier.length > 0) {
 		[bundleIdentifiers addObject:directBundleIdentifier];
+		return;
 	}
 
 	NSRange equalsRange = [value rangeOfString:@"="];
-	if (equalsRange.location != NSNotFound && equalsRange.location + 1 < value.length) {
-		NSString *valueAfterEquals = [value substringFromIndex:equalsRange.location + 1];
-		NSString *bundleIdentifierAfterEquals = RootHideBundleIdentifierFromLaunchName(valueAfterEquals.UTF8String);
+	if (equalsRange.location != NSNotFound) {
+		NSString *bundleIdentifierAfterEquals = RootHideBundleIdentifierFromStructuredIdentityValue(value);
 		if (bundleIdentifierAfterEquals.length > 0) {
 			[bundleIdentifiers addObject:bundleIdentifierAfterEquals];
 		}
-
-		NSString *normalizedAfterEquals = RootHideNormalizedBundleIdentifierCandidate(valueAfterEquals);
-		if (normalizedAfterEquals.length > 0) {
-			[bundleIdentifiers addObject:normalizedAfterEquals];
-		}
+		return;
 	}
 
 	NSString *normalizedCandidate = RootHideNormalizedBundleIdentifierCandidate(value);
@@ -177,71 +212,71 @@ static void RootHideAddBundleIdentifierCandidatesFromValue(NSMutableOrderedSet<N
 		[bundleIdentifiers addObject:normalizedCandidate];
 	}
 
-	NSArray<NSString *> *components = [value componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"=:[]"]];
-	for (NSString *component in components) {
-		NSString *normalizedComponent = RootHideNormalizedBundleIdentifierCandidate(component);
-		if (normalizedComponent.length > 0) {
-			[bundleIdentifiers addObject:normalizedComponent];
-		}
-	}
 }
 
-static NSArray<NSString *> *RootHideBundleIdentifiersForSpawn(const char *path, char *const argv[restrict], char *const envp[restrict])
+static NSString *RootHideAuthoritativeBundleIdentifierForSpawn(const char *path, char *const argv[restrict])
+{
+	if (path && strcmp(path, "/usr/libexec/xpcproxy") != 0) {
+		return RootHideBundleIdentifierForExecutablePath(path);
+	}
+
+	if (!path || strcmp(path, "/usr/libexec/xpcproxy") != 0 || !argv || !argv[1]) {
+		return nil;
+	}
+
+	// launchd's primary xpcproxy label is the only argv value that carries
+	// ownership.  A UIKitApplication label identifies the app; an exact dotted
+	// service label identifies the service.  Other argv/env values are merely
+	// discovery hints and must not win over this source.
+	NSString *uikitBundleIdentifier = RootHideBundleIdentifierFromUIKitApplicationLaunchName(argv[1]);
+	if (uikitBundleIdentifier.length > 0) {
+		return uikitBundleIdentifier;
+	}
+	NSString *structuredPrimaryLabel = RootHideBundleIdentifierFromStructuredIdentityValue(@(argv[1]));
+	if (structuredPrimaryLabel.length > 0) {
+		return structuredPrimaryLabel;
+	}
+
+	return RootHideNormalizedBundleIdentifierCandidate(@(argv[1]));
+}
+
+static NSArray<NSString *> *RootHideHeuristicBundleIdentifiersForSpawn(char *const argv[restrict], char *const envp[restrict])
 {
 	NSMutableOrderedSet<NSString *> *bundleIdentifiers = [NSMutableOrderedSet orderedSet];
-
-	if (path && !strcmp(path, "/usr/libexec/xpcproxy")) {
-		// argv[1] is the most reliable source for xpcproxy — it's the service/app
-		// label passed by launchd (e.g. "UIKitApplication:com.example.App[0xABC]"
-		// or "com.example.service"). Prioritize it by processing it first.
-		if (argv && argv[0] && argv[1]) {
-			NSString *primaryLabel = @(argv[1]);
-			// Direct UIKitApplication: extraction has highest priority
-			NSString *directBundleId = RootHideBundleIdentifierFromLaunchName(argv[1]);
-			if (directBundleId.length > 0) {
-				[bundleIdentifiers addObject:directBundleId];
-			}
-			RootHideAddBundleIdentifierCandidatesFromValue(bundleIdentifiers, primaryLabel);
-		}
-
-		// Then scan remaining argv entries
-		RootHideEnumerateCStringList(argv, ^(NSString *value, bool *stop) {
-			(void)stop;
-			RootHideAddBundleIdentifierCandidatesFromValue(bundleIdentifiers, value);
-		});
-
-		// Then scan envp for any additional candidates
-		RootHideEnumerateCStringList(envp, ^(NSString *value, bool *stop) {
-			(void)stop;
-			RootHideAddBundleIdentifierCandidatesFromValue(bundleIdentifiers, value);
-		});
-
-		// Log what we found when a hidden-allowlist mode is active.
-		// The guard in RootHideInjectionLaunchdLog already ensures this only runs
-		// after the jailbreak is fully up.
-		if (root_hide_injection_mode_is_hidden_whitelist() || root_hide_injection_mode_is_blacklist_allowlist()) {
-			NSMutableString *argvDump = [NSMutableString string];
-			if (argv) {
-				for (int i = 0; argv[i]; i++) {
-					if (i > 0) [argvDump appendString:@" "];
-					[argvDump appendFormat:@"[%d]=%s", i, argv[i]];
-				}
-			}
-			RootHideInjectionLaunchdLog(@"xpcproxy argv: %@ candidates: %@", argvDump, [bundleIdentifiers.array componentsJoinedByString:@","]);
-		}
-	}
-
-	NSString *bundleIdentifierForExecutablePath = RootHideBundleIdentifierForExecutablePath(path);
-	if (bundleIdentifierForExecutablePath.length > 0) {
-		[bundleIdentifiers addObject:bundleIdentifierForExecutablePath];
-	}
-
+	RootHideEnumerateCStringList(argv, ^(NSString *value, bool *stop) {
+		RootHideAddBundleIdentifierCandidatesFromValue(bundleIdentifiers, value);
+		*stop = bundleIdentifiers.count >= kRootHideMaxHeuristicBundleIdentifiers;
+	});
+	RootHideEnumerateCStringList(envp, ^(NSString *value, bool *stop) {
+		RootHideAddBundleIdentifierCandidatesFromValue(bundleIdentifiers, value);
+		*stop = bundleIdentifiers.count >= kRootHideMaxHeuristicBundleIdentifiers;
+	});
 	return bundleIdentifiers.array;
 }
 
-static NSString *RootHideBundleIdentifierForSpawn(const char *path, char *const argv[restrict], char *const envp[restrict])
+static NSString *RootHideBundleIdentifierForSpawn(const char *path, char *const argv[restrict], char *const envp[restrict], RootHideBundleIdentifierSource *sourceOut)
 {
-	return RootHideBundleIdentifiersForSpawn(path, argv, envp).firstObject;
+	RootHideBundleIdentifierSource source = RootHideBundleIdentifierSourceNone;
+	NSString *bundleIdentifier = RootHideAuthoritativeBundleIdentifierForSpawn(path, argv);
+	if (bundleIdentifier.length > 0) {
+		source = RootHideBundleIdentifierSourceAuthoritative;
+	}
+	else {
+		NSArray<NSString *> *candidates = RootHideHeuristicBundleIdentifiersForSpawn(argv, envp);
+		if (candidates.count == 1) {
+			bundleIdentifier = candidates.firstObject;
+			source = RootHideBundleIdentifierSourceUniqueHeuristic;
+		}
+		else if (candidates.count > 1) {
+			source = RootHideBundleIdentifierSourceAmbiguousHeuristic;
+			RootHideInjectionLaunchdLog(@"reject hidden bootstrap due to ambiguous bundle candidates path=%s candidates=%@", path ?: "(null)", [candidates componentsJoinedByString:@","]);
+		}
+	}
+
+	if (sourceOut) {
+		*sourceOut = source;
+	}
+	return bundleIdentifier;
 }
 
 static NSString *RootHideExecutableNameForPath(const char *path)
@@ -264,14 +299,20 @@ static NSDictionary *RootHideHiddenWhitelistSettings(void)
 static NSDictionary *RootHideHiddenWhitelistEntryForSpawn(const char *path, char *const argv[restrict], char *const envp[restrict])
 {
 	NSDictionary *allSettings = RootHideHiddenWhitelistSettings();
-
-	for (NSString *bundleIdentifier in RootHideBundleIdentifiersForSpawn(path, argv, envp)) {
+	RootHideBundleIdentifierSource source = RootHideBundleIdentifierSourceNone;
+	NSString *bundleIdentifier = RootHideBundleIdentifierForSpawn(path, argv, envp, &source);
+	if (bundleIdentifier.length > 0) {
 		NSDictionary *entry = [allSettings[bundleIdentifier] isKindOfClass:[NSDictionary class]] ? allSettings[bundleIdentifier] : nil;
 		if (entry) {
 			return entry;
 		}
 	}
+	else if (source == RootHideBundleIdentifierSourceAmbiguousHeuristic) {
+		return nil;
+	}
 
+	// Preserve the historical executable-name fallback for non-bundle services,
+	// but never let it override an ambiguous argv/env-derived identity.
 	NSString *executableName = RootHideExecutableNameForPath(path);
 	if (executableName.length > 0) {
 		NSDictionary *entry = [allSettings[executableName] isKindOfClass:[NSDictionary class]] ? allSettings[executableName] : nil;
@@ -296,10 +337,15 @@ static BOOL RootHideHiddenWhitelistEntryHasSelection(NSDictionary *entry)
 
 static BOOL RootHideApplyHiddenWhitelistTweakEnvironment(char ***envc, const char *path, char *const argv[restrict], char *const envp[restrict])
 {
+	if (!envc || !*envc) {
+		RootHideInjectionLaunchdLog(@"hidden env allocation failed path=%s", path ?: "(null)");
+		return NO;
+	}
+
 	NSDictionary *entry = RootHideHiddenWhitelistEntryForSpawn(path, argv, envp);
 	if (!entry) {
 		// No per-app tweak config exists.  Fall through to stock blacklist.
-		RootHideInjectionLaunchdLog(@"hidden config missing, falling back to blacklist path=%s bundle=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp) ?: @"(null)");
+		RootHideInjectionLaunchdLog(@"hidden config missing, falling back to blacklist path=%s bundle=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp, NULL) ?: @"(null)");
 		return NO;
 	}
 
@@ -308,28 +354,40 @@ static BOOL RootHideApplyHiddenWhitelistTweakEnvironment(char ***envc, const cha
 	NSArray<NSString *> *selectedTweaks = RootHideNormalizedTweakNames(entry[allowDenyMode == kRootHideHiddenTweakDenyMode ? @"deniedTweaks" : @"allowedTweaks"]);
 	if (selectedTweaks.count == 0) {
 		// Entry exists but no tweaks selected.  Fall through to stock blacklist.
-		RootHideInjectionLaunchdLog(@"hidden tweak list empty, falling back to blacklist path=%s bundle=%@ mode=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp) ?: @"(null)", modeString);
+		RootHideInjectionLaunchdLog(@"hidden tweak list empty, falling back to blacklist path=%s bundle=%@ mode=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp, NULL) ?: @"(null)", modeString);
 		return NO;
 	}
 
-	envbuf_setenv(envc, "ROOTHIDE_HIDDEN_INJECTION", "1");
-	envbuf_setenv(envc, "ROOTHIDE_ENABLE_HIDDEN_TWEAKS", "1");
-	envbuf_setenv(envc, "ROOTHIDE_HIDDEN_TWEAK_MODE", modeString.UTF8String);
-	envbuf_setenv(envc, "ROOTHIDE_HIDDEN_TWEAK_LIST", [selectedTweaks componentsJoinedByString:@":"].UTF8String);
-
-	NSString *hiderProfile = RootHideNormalizedString(entry[@"hiderProfile"]);
-	if (hiderProfile.length > 0) {
-		envbuf_setenv(envc, "ROOTHIDE_HIDER_PROFILE", hiderProfile.UTF8String);
-	}
-
+	// Build the complete hidden handoff on a second owned buffer.  A partial
+	// marker set is worse than a clean blacklist fallback: it can start the
+	// child with systemhook but without the matching selected-tweak policy.
+	char **candidateEnvc = envbuf_mutcopy((const char **)*envc);
+	NSString *hiderProfile = RootHideNormalizedString(entry[@"hiderProfile"]) ?: @"full";
 	NSArray<NSString *> *disabledHiderHooks = RootHideNormalizedTweakNames(entry[@"disabledHiderHooks"]);
-	if (disabledHiderHooks.count > 0) {
-		envbuf_setenv(envc, "ROOTHIDE_HIDER_DISABLED_HOOKS", [disabledHiderHooks componentsJoinedByString:@":"].UTF8String);
+	NSString *selectedTweakList = [selectedTweaks componentsJoinedByString:@":"];
+	NSString *disabledHookList = [disabledHiderHooks componentsJoinedByString:@":"];
+	BOOL mutationsSucceeded = candidateEnvc != NULL
+		&& envbuf_setenv(&candidateEnvc, "ROOTHIDE_HIDDEN_INJECTION", "1")
+		&& envbuf_setenv(&candidateEnvc, "ROOTHIDE_ENABLE_HIDDEN_TWEAKS", "1")
+		&& envbuf_setenv(&candidateEnvc, "ROOTHIDE_HIDDEN_TWEAK_MODE", modeString.UTF8String)
+		&& envbuf_setenv(&candidateEnvc, "ROOTHIDE_HIDDEN_TWEAK_LIST", selectedTweakList.UTF8String)
+		&& envbuf_setenv(&candidateEnvc, "ROOTHIDE_HIDER_PROFILE", hiderProfile.UTF8String)
+		&& (disabledHiderHooks.count > 0
+			? envbuf_setenv(&candidateEnvc, "ROOTHIDE_HIDER_DISABLED_HOOKS", disabledHookList.UTF8String)
+			: envbuf_unsetenv(&candidateEnvc, "ROOTHIDE_HIDER_DISABLED_HOOKS"))
+		&& envbuf_unsetenv(&candidateEnvc, "_SafeMode")
+		&& envbuf_unsetenv(&candidateEnvc, "_MSSafeMode")
+		&& envbuf_unsetenv(&candidateEnvc, "DISABLE_TWEAKS")
+		&& envbuf_unsetenv(&candidateEnvc, "CHOICY_SKIP_TWEAKLOADER");
+	if (!mutationsSucceeded) {
+		envbuf_free(candidateEnvc);
+		RootHideInjectionLaunchdLog(@"hidden env transaction failed path=%s", path ?: "(null)");
+		return NO;
 	}
 
-	envbuf_unsetenv(envc, "DISABLE_TWEAKS");
-	envbuf_unsetenv(envc, "CHOICY_SKIP_TWEAKLOADER");
-	RootHideInjectionLaunchdLog(@"apply hidden env path=%s bundle=%@ mode=%@ tweaks=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp) ?: @"(null)", modeString, [selectedTweaks componentsJoinedByString:@":"]);
+	envbuf_free(*envc);
+	*envc = candidateEnvc;
+	RootHideInjectionLaunchdLog(@"apply hidden env path=%s bundle=%@ mode=%@ tweaks=%@", path ?: "(null)", RootHideBundleIdentifierForSpawn(path, argv, envp, NULL) ?: @"(null)", modeString, [selectedTweaks componentsJoinedByString:@":"]);
 	return YES;
 }
 
@@ -345,13 +403,20 @@ static BOOL RootHideIsAppWhitelisted(const char *path, char *const argv[restrict
 		return NO;
 	}
 
-	for (NSString *bundleIdentifier in RootHideBundleIdentifiersForSpawn(path, argv, envp)) {
+	RootHideBundleIdentifierSource source = RootHideBundleIdentifierSourceNone;
+	NSString *bundleIdentifier = RootHideBundleIdentifierForSpawn(path, argv, envp, &source);
+	if (bundleIdentifier.length > 0) {
 		id value = injectRules[bundleIdentifier];
 		if ([value respondsToSelector:@selector(boolValue)] && [value boolValue]) {
 			return YES;
 		}
 	}
+	else if (source == RootHideBundleIdentifierSourceAmbiguousHeuristic) {
+		return NO;
+	}
 
+	// See the matching settings fallback above: service-name compatibility is
+	// retained only where bundle identification found no conflicting candidates.
 	NSString *executableName = RootHideExecutableNameForPath(path);
 	if (executableName.length > 0) {
 		id value = injectRules[executableName];
@@ -498,8 +563,14 @@ void roothide_launchd_postinit(bool firstLoad)
 		
 		assert(unsandbox("/usr/lib", systemhookFilePath.fileSystemRepresentation) == 0);
 
-		//new "real path"
-		asprintf(&HOOK_DYLIB_PATH, "/usr/lib/systemhook-%016llX.dylib", jbinfo(jbrand));
+		// New real path. Keep the existing first-load literal untouched: it may
+		// not be heap allocated, so only publish a fully allocated replacement.
+		char *hookDylibPath = NULL;
+		if (asprintf(&hookDylibPath, "/usr/lib/systemhook-%016llX.dylib", jbinfo(jbrand)) < 0 || !hookDylibPath) {
+			launchd_panic("failed to allocate systemhook path");
+			return;
+		}
+		HOOK_DYLIB_PATH = hookDylibPath;
 	}
 
 	if (__builtin_available(iOS 16.0, *))
@@ -594,16 +665,34 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 
 	// on some devices dyldhook may fail due to vm_protect(VM_PROT_READ|VM_PROT_WRITE), 2, (os/kern) protection failure in dsc::__DATA_CONST:__const, 
 	// so we need to disable dyld-in-cache here. (or we can use VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)
+	const bool needsDyldInCacheMutation = envbuf_getenv((const char **)envp, "DYLD_INSERT_LIBRARIES") != NULL;
+	bool needsSpinlockFixMutation = false;
+#ifdef __arm64e__
+	if (!__builtin_available(iOS 16.0, *)) {
+		needsSpinlockFixMutation = !dyld_patch_enabled() && process_force_dyld_patch(path, (const char **)argv);
+	}
+#endif
 	char **envc = envbuf_mutcopy((const char **)envp);
-	if(envbuf_getenv(envc, "DYLD_INSERT_LIBRARIES")) {
-		envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
+	bool ownsEnvc = envc != NULL;
+	if (!envc) {
+		if (needsDyldInCacheMutation || needsSpinlockFixMutation) {
+			posix_spawnattr_setflags(attrp, flags);
+			return ENOMEM;
+		}
+		envc = (char **)envp;
+	}
+	if (needsDyldInCacheMutation && !envbuf_setenv(&envc, "DYLD_IN_CACHE", "0")) {
+		if (ownsEnvc) envbuf_free(envc);
+		posix_spawnattr_setflags(attrp, flags);
+		return ENOMEM;
 	}
 
 #ifdef __arm64e__
-	if (!__builtin_available(iOS 16.0, *))
-	{
-		if(!dyld_patch_enabled() && process_force_dyld_patch(path, argv)) {
-			envbuf_setenv(&envc, "SPINLOCK_FIX_DISABLED", "1");
+	if (needsSpinlockFixMutation) {
+		if (!envbuf_setenv(&envc, "SPINLOCK_FIX_DISABLED", "1")) {
+			if (ownsEnvc) envbuf_free(envc);
+			posix_spawnattr_setflags(attrp, flags);
+			return ENOMEM;
 		}
 	}
 #endif
@@ -620,7 +709,7 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 	int ret = __posix_spawn_orig_wrapper(pidp, path, desc, argv, envc);
 	pid_t pid = *pidp;
 
-	envbuf_free(envc);
+	if (ownsEnvc) envbuf_free(envc);
 	
 	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
 
@@ -746,7 +835,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	if (!__builtin_available(iOS 16.0, *))
 	{
 		iOS15Arm64e = true;
-		if(envbuf_getenv(envp, "_SafeMode") || envbuf_getenv(envp, "_MSSafeMode")) {
+		if(envbuf_getenv((const char * const *)envp, "_SafeMode") || envbuf_getenv((const char * const *)envp, "_MSSafeMode")) {
 			if(path && isRemovableBundlePath(path) && !hasTrollstoreMarker(path)) {
 				choicyBlocked = true;
 			}
@@ -754,7 +843,8 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	}
 #endif
 
-	NSString *hiddenWhitelistBundleIdentifier = RootHideBundleIdentifierForSpawn(path, argv, envp);
+	RootHideBundleIdentifierSource hiddenWhitelistBundleIdentifierSource = RootHideBundleIdentifierSourceNone;
+	NSString *hiddenWhitelistBundleIdentifier = RootHideBundleIdentifierForSpawn(path, argv, envp, &hiddenWhitelistBundleIdentifierSource);
 	bool roothideBlacklisted = isBlacklistedPath(path)
 		|| (hiddenWhitelistBundleIdentifier.length > 0 && isBlacklistedApp(hiddenWhitelistBundleIdentifier.UTF8String));
 	bool hiddenWhitelistMode = root_hide_injection_mode_is_hidden_whitelist();
@@ -762,7 +852,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	bool hiddenAllowlistMode = hiddenWhitelistMode || blacklistAllowlistMode;
 	bool hiddenWhitelistBootstrapEnabled = hiddenAllowlistMode && RootHideShouldEnableHiddenWhitelistBootstrap(path, argv, envp);
 	if (hiddenAllowlistMode) {
-		RootHideInjectionLaunchdLog(@"spawn path=%s bundle=%@ blacklisted=%d hiddenMode=%d blacklistAllowlistMode=%d hiddenBootstrap=%d", path ?: "(null)", hiddenWhitelistBundleIdentifier ?: @"(null)", roothideBlacklisted, hiddenWhitelistMode, blacklistAllowlistMode, hiddenWhitelistBootstrapEnabled);
+		RootHideInjectionLaunchdLog(@"spawn path=%s bundle=%@ bundleSource=%lu blacklisted=%d hiddenMode=%d blacklistAllowlistMode=%d hiddenBootstrap=%d", path ?: "(null)", hiddenWhitelistBundleIdentifier ?: @"(null)", (unsigned long)hiddenWhitelistBundleIdentifierSource, roothideBlacklisted, hiddenWhitelistMode, blacklistAllowlistMode, hiddenWhitelistBootstrapEnabled);
 	}
 	if (roothideBlacklisted && hiddenAllowlistMode && hiddenWhitelistBootstrapEnabled)
 	{
@@ -771,10 +861,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		RootHideInjectionLaunchdLog(@"taking hidden allowlist branch path=%s mode=%s", path ?: "(null)", blacklistAllowlistMode ? "blacklistallowlist" : "hiddenwhitelist");
 
 		char **envc = envbuf_mutcopy((const char **)envp);
-
-		envbuf_unsetenv(&envc, "_SafeMode");
-		envbuf_unsetenv(&envc, "_MSSafeMode");
-		if (!RootHideApplyHiddenWhitelistTweakEnvironment(&envc, path, argv, envp)) {
+		if (!envc || !RootHideApplyHiddenWhitelistTweakEnvironment(&envc, path, argv, envp)) {
 			envbuf_free(envc);
 			hiddenWhitelistBootstrapEnabled = false;
 			RootHideInjectionLaunchdLog(@"hidden-whitelist branch fell back to blacklist path=%s", path ?: "(null)");
@@ -787,10 +874,15 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 				// blacklisted class for Roothide's hiding paths, but allows
 				// roothide/systemwide domain access so systemhook can still
 				// check in and load the selected hidden tweak subset.
-				volatile pid_t *restrictedPidp = allocRestrictedBlacklistedProcessId();
-				ret = __posix_spawn_hook((pid_t *)restrictedPidp, path, desc, argv, envc);
-				spawnedPid = *restrictedPidp;
-				commitBlacklistProcessId((pid_t *)restrictedPidp);
+				pid_t *restrictedPidp = allocRestrictedBlacklistedProcessId();
+				if (!restrictedPidp) {
+					ret = ENOMEM;
+				}
+				else {
+					ret = __posix_spawn_hook(restrictedPidp, path, desc, argv, envc);
+					spawnedPid = *restrictedPidp;
+					commitBlacklistProcessId(restrictedPidp);
+				}
 			}
 			else {
 				// Hidden Whitelist keeps the process fully out of the
@@ -825,17 +917,22 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 			JBLogDebug("prevent blacklisted app's extension from running: ", path);
 			ret = EPERM;
 		}
-		else if(dyld_patch_enabled() && iOS15Arm64e && roothideBlacklisted && (envbuf_getenv(envp, "ActivePrewarm") || envbuf_getenv(envp, "DYLD_USE_CLOSURES"))) {
+		else if(dyld_patch_enabled() && iOS15Arm64e && roothideBlacklisted && (envbuf_getenv((const char * const *)envp, "ActivePrewarm") || envbuf_getenv((const char * const *)envp, "DYLD_USE_CLOSURES"))) {
 			JBLogDebug("prevent blacklisted app from prewarming: ", path);
 			ret = EPERM;
 		}
 		else
 		{
 			char **envc = envbuf_mutcopy((const char **)envp);
+			if (!envc) {
+				return ENOMEM;
+			}
 
 			//choicy may set these 
-			envbuf_unsetenv(&envc, "_SafeMode");
-			envbuf_unsetenv(&envc, "_MSSafeMode");
+			if (!envbuf_unsetenv(&envc, "_SafeMode") || !envbuf_unsetenv(&envc, "_MSSafeMode")) {
+				envbuf_free(envc);
+				return ENOMEM;
+			}
 	
 			/* According to xnu, the new thread in new process will not run in userland until after copyout pid
 			https://github.com/apple-oss-distributions/xnu/blob/8d741a5de7ff4191bf97d57b9f54c2f6d4a15585/bsd/kern/kern_exec.c#L4321
@@ -845,7 +942,11 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	
 			/* and posix_spawn->kernel->amfid->launchd may cause xpc dead loop so we can't use lock-spawn-unlock here */
 	
-			volatile pid_t* blacklistedPidp = allocBlacklistProcessId();
+			pid_t* blacklistedPidp = allocBlacklistProcessId();
+			if (!blacklistedPidp) {
+				envbuf_free(envc);
+				return ENOMEM;
+			}
 	
 			if(roothideBlacklisted || !dyld_patch_enabled() || !iOS15Arm64e) {
 				ret = __posix_spawn_orig_wrapper(blacklistedPidp, path, desc, argv, envc);
@@ -856,8 +957,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 			pid_t pid = *blacklistedPidp;
 			if(pidp) *pidp = *blacklistedPidp;
 
-			commitBlacklistProcessId(blacklistedPidp); // will release blacklistedPidp
-			blacklistedPidp = NULL;
+			commitBlacklistProcessId(blacklistedPidp); // releases blacklistedPidp
 
 			envbuf_free(envc);
 				

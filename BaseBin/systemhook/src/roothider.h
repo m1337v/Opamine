@@ -36,11 +36,28 @@ bool allowInjectWithSafeMode(const char* path);
 void roothide_init();
 void roothide_init_with_checkin(const char* rootdir);
 void roothide_init_with_executable(const char* executable);
-void roothide_hidden_tweak_envbuf_apply(char ***envc);
+
+typedef enum {
+	HIDDEN_TWEAK_LOAD_NOT_ATTEMPTED,
+	HIDDEN_TWEAK_LOAD_PREPARED,
+	HIDDEN_TWEAK_LOAD_ACTIVE,
+	HIDDEN_TWEAK_LOAD_FAILED,
+	HIDDEN_TWEAK_LOAD_PARTIAL,
+	HIDDEN_TWEAK_LOAD_UNKNOWN,
+} HiddenTweakLoadState;
+
+/*
+ * Hidden-tweak loading is an explicit one-way transaction.  PREPARED has not
+ * loaded selected tweak code yet; PARTIAL/UNKNOWN are terminal for the life
+ * of this process and callers must not automatically retry them.
+ */
+bool roothide_hidden_tweak_envbuf_apply(char ***envc);
 bool roothide_hidden_tweak_env_is_configured(void);
-void roothide_hidden_tweak_prepare_for_loader(void);
-void roothide_hidden_tweak_prepare_minimal_runtime(void);
-void roothide_hidden_tweak_load_selected(void);
+bool roothide_hidden_tweak_prepare_for_loader(void);
+bool roothide_hidden_tweak_prepare_minimal_runtime(void);
+bool roothide_hidden_tweak_load_selected(void);
+HiddenTweakLoadState roothide_hidden_tweak_load_state(void);
+void roothide_hidden_tweak_note_loader_result(bool succeeded);
 
 int __sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);
 int __sysctl_hook(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);

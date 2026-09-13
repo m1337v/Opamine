@@ -1,0 +1,158 @@
+{
+  "schema": "rhinject.systemhook.ownership.v1",
+  "scope": "BaseBin/systemhook plus its launchd handoff",
+  "modes": [
+    {
+      "name": "stock",
+      "mode_source": "common.c:root_hide_injection_mode",
+      "spawn_behavior": "default RootHide spawn configuration unless legacy control files select another mode",
+      "hidden_hider": false,
+      "hidden_tweak_loading": false
+    },
+    {
+      "name": "blacklist",
+      "mode_source": "common.c:root_hide_injection_mode",
+      "spawn_behavior": "inject/trust by default, with explicit uninject and stability exceptions",
+      "hidden_hider": false,
+      "hidden_tweak_loading": false
+    },
+    {
+      "name": "whitelist",
+      "mode_source": "common.c:root_hide_injection_mode",
+      "spawn_behavior": "inject/trust only for executable or system allowlist matches",
+      "hidden_hider": false,
+      "hidden_tweak_loading": false
+    },
+    {
+      "name": "hiddenwhitelist",
+      "mode_source": "common.c:root_hide_injection_mode",
+      "spawn_behavior": "blacklist-equivalent baseline; launchd may add explicit hidden injection and selected tweaks",
+      "hidden_hider": "when ROOTHIDE_HIDDEN_INJECTION=1 reaches systemhook",
+      "hidden_tweak_loading": "when ROOTHIDE_ENABLE_HIDDEN_TWEAKS=1 reaches systemhook"
+    },
+    {
+      "name": "blacklistallowlist",
+      "mode_source": "common.c:root_hide_injection_mode",
+      "spawn_behavior": "blacklist-equivalent baseline with selected hidden allowlist path",
+      "hidden_hider": "when ROOTHIDE_HIDDEN_INJECTION=1 reaches systemhook",
+      "hidden_tweak_loading": "minimal selected-tweak path when ROOTHIDE_ENABLE_HIDDEN_TWEAKS=1"
+    }
+  ],
+  "owners": [
+    {
+      "id": "mode-resolution",
+      "owner": "BaseBin/systemhook/src/common.c",
+      "phase": "pre-spawn and runtime mode lookup",
+      "symbols": [
+        "root_hide_injection_mode",
+        "root_hide_injection_mode_is_hidden_whitelist",
+        "root_hide_injection_mode_is_blacklist_allowlist",
+        "root_hide_injection_mode_uses_whitelist_rules",
+        "spawn_config_for_executable"
+      ],
+      "surfaces": ["mode plist", "legacy marker fallback", "spawn inject/trust"]
+    },
+    {
+      "id": "launchd-mode-handoff",
+      "owner": "BaseBin/launchdhook/src/roothider.m",
+      "phase": "launchd spawn decision",
+      "symbols": [
+        "RootHideApplyHiddenWhitelistTweakEnvironment",
+        "RootHideShouldEnableHiddenWhitelistBootstrap",
+        "RootHideIsAppWhitelisted"
+      ],
+      "surfaces": ["per-app mode", "selected tweak list", "hider profile", "disabled hider hooks"]
+    },
+    {
+      "id": "systemhook-entry-and-child-bridge",
+      "owner": "BaseBin/systemhook/src/main.c",
+      "phase": "constructor and process handoff",
+      "symbols": [
+        "consume_hidden_injection_env",
+        "consume_hidden_tweak_loading_env",
+        "should_enable_tweaks",
+        "__posix_spawn_hook",
+        "__execve_hook",
+        "csops_hook",
+        "csops_audittoken_hook"
+      ],
+      "surfaces": ["hidden env consumption", "runtime patch gate", "csops normalization", "spawn/exec"]
+    },
+    {
+      "id": "dyld-and-detector-hider",
+      "owner": "BaseBin/systemhook/src/hidden_dylib_hider.c",
+      "phase": "core then strict systemhook phases",
+      "symbols": [
+        "hidden_dylib_hider_init",
+        "hidden_dylib_hider_enable_strict_hooks",
+        "hidden_dylib_hider_dlsym_remap",
+        "h_image_count",
+        "h_get_image_name",
+        "h_get_image_header",
+        "h_dladdr",
+        "h_dlsym",
+        "h_task_info",
+        "h_sysctl",
+        "h_sysctlbyname",
+        "h_opendir",
+        "h_readdir",
+        "h_closedir"
+      ],
+      "surfaces": ["dyld", "dlsym/dladdr", "task_info", "filesystem", "directory", "environment", "sysctl"]
+    },
+    {
+      "id": "hider-process-identity",
+      "owner": "BaseBin/systemhook/src/hider_identity.c",
+      "phase": "core systemhook initialization",
+      "symbols": [
+        "rhi_hider_identity_init",
+        "rhi_hider_identity_executable_path",
+        "rhi_hider_identity_executable_header",
+        "rhi_hider_identity_image_text_range",
+        "rhi_hider_identity_executable_ranges"
+      ],
+      "surfaces": ["MH_EXECUTE identity", "validated Mach-O load commands", "all executable segments"]
+    },
+    {
+      "id": "hider-caller-capability",
+      "owner": "BaseBin/systemhook/src/hider_caller_policy.c",
+      "phase": "core systemhook initialization and selected-tweak load completion",
+      "symbols": [
+        "rhi_hider_caller_can_read_hidden",
+        "rhi_hider_caller_register_own_function",
+        "rhi_hider_caller_authorize_loaded_image_path",
+        "rhi_hider_caller_image_removed",
+        "rhi_hider_caller_internal_read_enter"
+      ],
+      "surfaces": ["exact trusted ranges", "return-address cache generation", "selected tweak authorization", "internal forwarding scope"]
+    },
+    {
+      "id": "syscall-shim",
+      "owner": "BaseBin/systemhook/src/roothider_common.c",
+      "phase": "low-level RootHide compatibility",
+      "symbols": [
+        "__sysctl_hook",
+        "__sysctlbyname_hook"
+      ],
+      "surfaces": ["direct syscall-backed sysctl", "AMFI query compatibility"]
+    },
+    {
+      "id": "selected-tweak-loader",
+      "owner": "BaseBin/systemhook/src/roothider_main.c",
+      "phase": "late runtime after RootHide check-in",
+      "symbols": [
+        "roothide_hidden_tweak_prepare_for_loader",
+        "roothide_hidden_tweak_prepare_minimal_runtime",
+        "roothide_hidden_tweak_load_selected"
+      ],
+      "surfaces": ["dependency ordering", "trust", "dlopen", "selected tweak handles"]
+    }
+  ],
+  "invariants": [
+    "Only a verified active hook may be advertised by dlsym remapping.",
+    "A true MH_EXECUTE image must be selected even when dyld image zero is a dylib.",
+    "A hidden DIR close must unregister state before the DIR pointer can be reused.",
+    "A sysctlbyname size query must preserve the platform two-pass contract.",
+    "All five injection modes must remain distinct at the launchd/systemhook boundary."
+  ]
+}

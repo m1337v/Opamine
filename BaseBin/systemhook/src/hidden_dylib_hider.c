@@ -4,12 +4,9 @@
  * Strategy:
  *   - Hook dyld enumeration functions via litehook (in-place DSC replacement)
  *   - Maintain two image arrays: g_all (complete) and g_visible (filtered)
- *   - Caller detection via __builtin_return_address + dyld_image_path_containing_address:
- *     tweak callers → g_all, app callers → g_visible
+ *   - Caller capability via exact validated image ranges:
+ *     systemhook/authorized selected tweaks → g_all, everyone else → g_visible
  *   - Also hooks task_info(TASK_DYLD_INFO) to present filtered dyld_all_image_infos
- *
- * The caller check uses dyld_image_path_containing_address() which queries dyld's
- * internal image list (NOT affected by our hooks) — safe and accurate.
  *
  * Advantage over Shadow/Choicy: we're in systemhook, hooking at the DSC level
  * before any app code runs. No extra dylib to hide, no GOT modifications,
@@ -26,6 +23,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <libgen.h>
 #include <os/lock.h>
 #include <limits.h>
@@ -42,6 +40,10 @@
 #include <strings.h>
 
 #include "common.h"
+#include "envbuf.h"
+#include "hider_internal.h"
+#include "hider_identity.h"
+#include "hider_caller_policy.h"
 
 // From roothider_main.c — non-static after our edit
 extern bool hidden_tweak_filter_should_block_path(const char *path);
@@ -152,21 +154,65 @@ typedef struct {
 	uint32_t       cap;
 } image_array_t;
 
-static void arr_ensure(image_array_t *a, uint32_t need) {
-	if (need <= a->cap) return;
-	uint32_t nc = a->cap ? a->cap * 2 : 64;
-	if (nc < need) nc = need;
-	a->items = realloc(a->items, nc * sizeof(image_entry_t));
+/*
+ * All arrays in this file are append-only or protected by g_lock.  Never
+ * assign realloc() directly to a live array: a failed growth must preserve
+ * the old, still-valid view for callers already inside a dyld callback.
+ */
+static bool arr_ensure(image_array_t *a, uint32_t need) {
+	if (need <= a->cap) return true;
+	if ((size_t)need > SIZE_MAX / sizeof(image_entry_t)) return false;
+
+	uint32_t nc = a->cap ? a->cap : 64;
+	while (nc < need) {
+		if (nc > UINT32_MAX / 2) {
+			nc = need;
+			break;
+		}
+		nc *= 2;
+	}
+	if ((size_t)nc > SIZE_MAX / sizeof(image_entry_t)) return false;
+
+	image_entry_t *items = realloc(a->items, (size_t)nc * sizeof(*items));
+	if (!items) return false;
+
+	a->items = items;
 	a->cap = nc;
+	return true;
 }
 
-static void arr_add(image_array_t *a, const char *name,
+static bool arr_add(image_array_t *a, const char *name,
                     const struct mach_header *mh, intptr_t slide) {
-	arr_ensure(a, a->count + 1);
+	if (a->count == UINT32_MAX || !arr_ensure(a, a->count + 1)) {
+		return false;
+	}
 	a->items[a->count].name   = name;  // store dyld's canonical pointer directly
 	a->items[a->count].header = mh;
 	a->items[a->count].slide  = slide;
 	a->count++;
+	return true;
+}
+
+static bool reserve_entries(void **items, uint32_t *cap, uint32_t need, size_t item_size) {
+	if (need <= *cap) return true;
+	if (!item_size || (size_t)need > SIZE_MAX / item_size) return false;
+
+	uint32_t next_cap = *cap ? *cap : 8;
+	while (next_cap < need) {
+		if (next_cap > UINT32_MAX / 2) {
+			next_cap = need;
+			break;
+		}
+		next_cap *= 2;
+	}
+	if ((size_t)next_cap > SIZE_MAX / item_size) return false;
+
+	void *resized = realloc(*items, (size_t)next_cap * item_size);
+	if (!resized) return false;
+
+	*items = resized;
+	*cap = next_cap;
+	return true;
 }
 
 static void arr_remove_by_header(image_array_t *a, const struct mach_header *mh) {
@@ -342,16 +388,46 @@ static objc_load_cb_entry_t *g_objc_addload_cbs = NULL;
 static uint32_t              g_objc_addload_cb_n = 0;
 static uint32_t              g_objc_addload_cb_cap = 0;
 
-// task_info(TASK_DYLD_INFO) snapshot
-static struct dyld_all_image_infos  g_ti_snap     = {0};
-static struct dyld_image_info      *g_ti_images   = NULL;
-static uint32_t                     g_ti_cap      = 0;
-static struct dyld_uuid_info       *g_ti_uuids    = NULL;
-static uint32_t                     g_ti_uuid_cap = 0;
-static struct dyld_all_image_infos *g_real_aii    = NULL;  // cached from first task_info call
+/*
+ * task_info callers retain the returned dyld_all_image_infos pointer after
+ * h_task_info returns.  A single mutable snapshot (and reallocating its
+ * backing arrays) therefore creates use-after-realloc races.  Publish only
+ * complete, process-lifetime generations.  If a new generation cannot be
+ * copied coherently, every linked view degrades to dyld's original APIs.
+ */
+typedef struct task_snapshot_generation {
+	struct dyld_all_image_infos snapshot;
+	struct dyld_image_info *images;
+	char **image_paths;
+	uint32_t image_path_capacity;
+	struct dyld_uuid_info *uuids;
+	uint64_t image_generation;
+	struct task_snapshot_generation *previous;
+} task_snapshot_generation_t;
 
-static bool g_inited = false;
-static bool g_strict_hooks_enabled = false;
+#define RHI_TASK_SNAPSHOT_COPY_ATTEMPTS 3U
+
+static task_snapshot_generation_t *g_ti_current = NULL;
+static uint64_t                     g_image_generation = 0;
+static struct dyld_all_image_infos *g_real_aii = NULL;  // cached from first task_info call
+static bool                         g_image_tracking_degraded = false;
+
+typedef enum {
+	HIDER_STATE_UNINITIALIZED = 0,
+	HIDER_STATE_INITIALIZING,
+	HIDER_STATE_READY,
+} hider_state_t;
+
+static atomic_uint g_init_state;
+static atomic_uint g_strict_state;
+
+static bool hider_is_ready(void) {
+	return atomic_load_explicit(&g_init_state, memory_order_acquire) == HIDER_STATE_READY;
+}
+
+static bool hider_strict_hooks_ready(void) {
+	return atomic_load_explicit(&g_strict_state, memory_order_acquire) == HIDER_STATE_READY;
+}
 static bool g_hook_objc_runtime_enabled = true;
 static bool g_hook_objc_copy_class_list_enabled = true;
 static bool g_hook_url_schemes_enabled = true;
@@ -359,8 +435,17 @@ static bool g_hook_environment_enabled = true;
 static bool g_hook_filesystem_enabled = true;
 static bool g_hook_directory_enabled = true;
 
+/*
+ * xpcproxy consumes the launchd policy before it bridges the real app. Keep a
+ * canonical, allocation-free representation so the child inherits the same
+ * effective hook profile.
+ */
+static char g_hider_bridge_profile[8] = "full";
+static char g_hider_bridge_disabled[96] = {0};
+
 // Cache the executable path for dladdr / class_getImageName substitution
 static const char *g_executable_path = NULL;
+static const struct mach_header *g_executable_header = NULL;
 
 static bool hider_component_list_contains(const char *list, const char *needle) {
 	if (!list || !needle || !needle[0]) return false;
@@ -391,6 +476,36 @@ static void disable_all_strict_profile_hooks(void) {
 	g_hook_environment_enabled = false;
 	g_hook_filesystem_enabled = false;
 	g_hook_directory_enabled = false;
+}
+
+static void hider_bridge_append_disabled(const char *token) {
+	if (!token || !token[0]) return;
+	if (g_hider_bridge_disabled[0]) {
+		strlcat(g_hider_bridge_disabled, ":", sizeof(g_hider_bridge_disabled));
+	}
+	strlcat(g_hider_bridge_disabled, token, sizeof(g_hider_bridge_disabled));
+}
+
+static void retain_effective_hider_profile_for_child(void) {
+	g_hider_bridge_disabled[0] = '\0';
+	strlcpy(g_hider_bridge_profile, "full", sizeof(g_hider_bridge_profile));
+
+	if (!g_hook_objc_runtime_enabled && !g_hook_objc_copy_class_list_enabled &&
+	    !g_hook_url_schemes_enabled && !g_hook_environment_enabled &&
+	    !g_hook_filesystem_enabled && !g_hook_directory_enabled) {
+		strlcpy(g_hider_bridge_profile, "core", sizeof(g_hider_bridge_profile));
+		return;
+	}
+	if (!g_hook_objc_runtime_enabled) {
+		hider_bridge_append_disabled("objc-runtime");
+	}
+	else if (!g_hook_objc_copy_class_list_enabled) {
+		hider_bridge_append_disabled("objc-copy-class-list");
+	}
+	if (!g_hook_url_schemes_enabled) hider_bridge_append_disabled("url-schemes");
+	if (!g_hook_environment_enabled) hider_bridge_append_disabled("environment");
+	if (!g_hook_filesystem_enabled) hider_bridge_append_disabled("filesystem");
+	else if (!g_hook_directory_enabled) hider_bridge_append_disabled("directory");
 }
 
 static void load_hider_profile_from_environment(void) {
@@ -434,8 +549,18 @@ static void load_hider_profile_from_environment(void) {
 		g_hook_directory_enabled = false;
 	}
 
+	retain_effective_hider_profile_for_child();
+
 	unsetenv("ROOTHIDE_HIDER_PROFILE");
 	unsetenv("ROOTHIDE_HIDER_DISABLED_HOOKS");
+}
+
+bool hidden_dylib_hider_envbuf_apply(char ***envc) {
+	if (!envc || !*envc) return false;
+	return envbuf_setenv(envc, "ROOTHIDE_HIDER_PROFILE", g_hider_bridge_profile)
+		&& (g_hider_bridge_disabled[0]
+			? envbuf_setenv(envc, "ROOTHIDE_HIDER_DISABLED_HOOKS", g_hider_bridge_disabled)
+			: envbuf_unsetenv(envc, "ROOTHIDE_HIDER_DISABLED_HOOKS"));
 }
 
 //------------------------------------------------------------------------------
@@ -484,49 +609,21 @@ static bool image_path_should_hide(const char *path) {
 //------------------------------------------------------------------------------
 #pragma mark - Caller Check
 
-// Bypass cache: 64-slot ring buffer mapping return addresses → hidden decision.
-// Avoids calling dyld_image_path_containing_address + string matching on every
-// hooked function invocation. Same design as Choicy's stealth caller cache.
-typedef struct {
-	const void *ra;
-	bool        hidden;
-} caller_cache_entry_t;
-
-static caller_cache_entry_t g_caller_cache[64] = {0};
-static uint32_t             g_caller_cache_next = 0;
-static os_unfair_lock        g_caller_cache_lock = OS_UNFAIR_LOCK_INIT;
-
+/*
+ * Image concealment intentionally remains path based, but hidden-view access
+ * is capability based.  Only systemhook itself, explicitly authorized selected
+ * tweaks, and a narrowly scoped internal RootHide operation receive truth.
+ * Unknown callers are external by default.
+ */
 static bool caller_is_hidden(const void *ra) {
-	if (!ra) return false;
-
-	// Check cache first
-	os_unfair_lock_lock(&g_caller_cache_lock);
-	for (uint32_t i = 0; i < 64; i++) {
-		if (g_caller_cache[i].ra == ra) {
-			bool h = g_caller_cache[i].hidden;
-			os_unfair_lock_unlock(&g_caller_cache_lock);
-			return h;
-		}
-	}
-	os_unfair_lock_unlock(&g_caller_cache_lock);
-
-	// Cache miss — resolve via dyld private API (unaffected by our hooks)
-	const char *p = dyld_image_path_containing_address(ra);
-	bool hidden = p ? image_path_should_hide(p) : false;
-
-	// Store in cache
-	os_unfair_lock_lock(&g_caller_cache_lock);
-	uint32_t slot = g_caller_cache_next++ % 64;
-	g_caller_cache[slot] = (caller_cache_entry_t){ .ra = ra, .hidden = hidden };
-	os_unfair_lock_unlock(&g_caller_cache_lock);
-
-	return hidden;
+	return rhi_hider_caller_can_read_hidden(ra);
 }
 
 //------------------------------------------------------------------------------
 #pragma mark - dyld Notification Callbacks (registered before hooking)
 
 static void on_image_added(const struct mach_header *mh, intptr_t slide) {
+	rhi_hider_caller_image_added(mh, slide);
 	const char *path = dyld_image_path_containing_address(mh);
 	if (!path) return;
 
@@ -534,25 +631,49 @@ static void on_image_added(const struct mach_header *mh, intptr_t slide) {
 
 	os_unfair_lock_lock(&g_lock);
 
-	arr_add(&g_all, path, mh, slide);
-	if (!hide)
-		arr_add(&g_visible, path, mh, slide);
+	if (!g_image_tracking_degraded) {
+		bool recorded = arr_add(&g_all, path, mh, slide);
+		if (recorded && !hide) {
+			recorded = arr_add(&g_visible, path, mh, slide);
+		}
+		if (!recorded) {
+			/*
+			 * We cannot maintain a coherent filtered view after an allocation
+			 * failure.  Subsequent public dyld/task_info calls fall through to
+			 * their original APIs instead of manufacturing a partial view.
+			 */
+			g_image_tracking_degraded = true;
+		} else {
+			g_image_generation++;
+		}
+	}
 
 	// Copy callbacks that need notification (under lock)
 	uint32_t n = g_add_cb_n;
 	cb_entry_t *snapshot = n ? malloc(n * sizeof(cb_entry_t)) : NULL;
-	if (snapshot) memcpy(snapshot, g_add_cbs, n * sizeof(cb_entry_t));
+	uint32_t snapshot_n = 0;
+	if (snapshot) {
+		memcpy(snapshot, g_add_cbs, n * sizeof(cb_entry_t));
+		snapshot_n = n;
+	}
 	uint32_t objc_n = g_objc_addload_cb_n;
 	objc_load_cb_entry_t *objc_snapshot = objc_n ? malloc(objc_n * sizeof(objc_load_cb_entry_t)) : NULL;
-	if (objc_snapshot) memcpy(objc_snapshot, g_objc_addload_cbs, objc_n * sizeof(objc_load_cb_entry_t));
+	uint32_t objc_snapshot_n = 0;
+	if (objc_snapshot) {
+		memcpy(objc_snapshot, g_objc_addload_cbs, objc_n * sizeof(objc_load_cb_entry_t));
+		objc_snapshot_n = objc_n;
+	}
+	bool tracking_degraded = g_image_tracking_degraded;
 
 	os_unfair_lock_unlock(&g_lock);
 
-	// Deliver outside lock to avoid deadlock if callback does dyld calls
-	for (uint32_t i = 0; i < n; i++) {
+	// Deliver outside lock to avoid deadlock if callback does dyld calls.  A
+	// failed callback snapshot intentionally drops this synthetic notification
+	// rather than indexing NULL or claiming a registration we cannot service.
+	for (uint32_t i = 0; i < snapshot_n; i++) {
 		// Tweak callback → always gets notified
 		// App callback → only for visible images
-		if (snapshot[i].from_hidden || !hide)
+		if (tracking_degraded || snapshot[i].from_hidden || !hide)
 			snapshot[i].func(mh, slide);
 	}
 	free(snapshot);
@@ -560,14 +681,15 @@ static void on_image_added(const struct mach_header *mh, intptr_t slide) {
 	// ObjC load-image callbacks use the objc_addLoadImageFunc signature
 	// (header only, no slide). Keep the same visibility policy as the dyld
 	// add-image callbacks without returning NULL from dlsym for a real API.
-	for (uint32_t i = 0; i < objc_n; i++) {
-		if (objc_snapshot[i].from_hidden || !hide)
+	for (uint32_t i = 0; i < objc_snapshot_n; i++) {
+		if (tracking_degraded || objc_snapshot[i].from_hidden || !hide)
 			objc_snapshot[i].func(mh);
 	}
 	free(objc_snapshot);
 }
 
 static void on_image_removed(const struct mach_header *mh, intptr_t slide) {
+	rhi_hider_caller_image_removed(mh, slide);
 	os_unfair_lock_lock(&g_lock);
 
 	bool was_in_all = arr_contains_header(&g_all, mh);
@@ -575,16 +697,23 @@ static void on_image_removed(const struct mach_header *mh, intptr_t slide) {
 	arr_remove_by_header(&g_all, mh);
 	if (was_visible)
 		arr_remove_by_header(&g_visible, mh);
+	if (was_in_all || was_visible)
+		g_image_generation++;
 
 	uint32_t n = g_rem_cb_n;
 	cb_entry_t *snapshot = n ? malloc(n * sizeof(cb_entry_t)) : NULL;
-	if (snapshot) memcpy(snapshot, g_rem_cbs, n * sizeof(cb_entry_t));
+	uint32_t snapshot_n = 0;
+	if (snapshot) {
+		memcpy(snapshot, g_rem_cbs, n * sizeof(cb_entry_t));
+		snapshot_n = n;
+	}
+	bool tracking_degraded = g_image_tracking_degraded;
 
 	os_unfair_lock_unlock(&g_lock);
 
-	if (was_in_all) {
-		for (uint32_t i = 0; i < n; i++) {
-			if (snapshot[i].from_hidden || was_visible)
+	if (was_in_all || tracking_degraded) {
+		for (uint32_t i = 0; i < snapshot_n; i++) {
+			if (tracking_degraded || snapshot[i].from_hidden || was_visible)
 				snapshot[i].func(mh, slide);
 		}
 	}
@@ -599,8 +728,11 @@ static uint32_t h_image_count(void) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
+	bool tracking_degraded = g_image_tracking_degraded;
 	uint32_t c = hidden ? g_all.count : g_visible.count;
 	os_unfair_lock_unlock(&g_lock);
+	if (tracking_degraded && orig_dyld_image_count)
+		return orig_dyld_image_count();
 	return c;
 }
 
@@ -609,9 +741,12 @@ static const char *h_get_image_name(uint32_t idx) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
+	bool tracking_degraded = g_image_tracking_degraded;
 	const image_array_t *a = hidden ? &g_all : &g_visible;
 	const char *n = (idx < a->count) ? a->items[idx].name : NULL;
 	os_unfair_lock_unlock(&g_lock);
+	if (tracking_degraded && orig_dyld_get_image_name)
+		return orig_dyld_get_image_name(idx);
 	return n;
 }
 
@@ -620,9 +755,12 @@ static const struct mach_header *h_get_image_header(uint32_t idx) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
+	bool tracking_degraded = g_image_tracking_degraded;
 	const image_array_t *a = hidden ? &g_all : &g_visible;
 	const struct mach_header *h = (idx < a->count) ? a->items[idx].header : NULL;
 	os_unfair_lock_unlock(&g_lock);
+	if (tracking_degraded && orig_dyld_get_image_header)
+		return orig_dyld_get_image_header(idx);
 	return h;
 }
 
@@ -631,9 +769,12 @@ static intptr_t h_get_image_vmaddr_slide(uint32_t idx) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
+	bool tracking_degraded = g_image_tracking_degraded;
 	const image_array_t *a = hidden ? &g_all : &g_visible;
 	intptr_t s = (idx < a->count) ? a->items[idx].slide : 0;
 	os_unfair_lock_unlock(&g_lock);
+	if (tracking_degraded && orig_dyld_get_image_vmaddr_slide)
+		return orig_dyld_get_image_vmaddr_slide(idx);
 	return s;
 }
 
@@ -645,35 +786,45 @@ static void h_register_func_for_add_image(void (*func)(const struct mach_header 
 	bool hidden = caller_is_hidden(ra);
 
 	os_unfair_lock_lock(&g_lock);
-
-	// Store callback with origin flag
-	if (g_add_cb_n >= g_add_cb_cap) {
-		g_add_cb_cap = g_add_cb_cap ? g_add_cb_cap * 2 : 8;
-		g_add_cbs = realloc(g_add_cbs, g_add_cb_cap * sizeof(cb_entry_t));
+	if (g_image_tracking_degraded) {
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_dyld_register_func_for_add_image)
+			orig_dyld_register_func_for_add_image(func);
+		return;
 	}
-	g_add_cbs[g_add_cb_n++] = (cb_entry_t){.func = func, .from_hidden = hidden};
 
-	// Replay: tweak gets all, app gets visible only
+	// Capture the replay before committing the registration.  If we cannot
+	// allocate a complete replay snapshot, use dyld's original registration so
+	// the callback still receives the real image set exactly once.
 	const image_array_t *a = hidden ? &g_all : &g_visible;
 	uint32_t n = a->count;
-	const struct mach_header **hdrs = NULL;
-	intptr_t *slides = NULL;
-	if (n) {
-		hdrs = malloc(n * sizeof(void *));
-		slides = malloc(n * sizeof(intptr_t));
-		for (uint32_t i = 0; i < n; i++) {
-			hdrs[i]   = a->items[i].header;
-			slides[i] = a->items[i].slide;
-		}
+	image_entry_t *image_snapshot = n ? malloc((size_t)n * sizeof(*image_snapshot)) : NULL;
+	if (n && !image_snapshot) {
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_dyld_register_func_for_add_image)
+			orig_dyld_register_func_for_add_image(func);
+		return;
 	}
+	if (image_snapshot)
+		memcpy(image_snapshot, a->items, (size_t)n * sizeof(*image_snapshot));
+
+	// Store callback with origin flag
+	if (g_add_cb_n == UINT32_MAX ||
+	    !reserve_entries((void **)&g_add_cbs, &g_add_cb_cap, g_add_cb_n + 1, sizeof(*g_add_cbs))) {
+		free(image_snapshot);
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_dyld_register_func_for_add_image)
+			orig_dyld_register_func_for_add_image(func);
+		return;
+	}
+	g_add_cbs[g_add_cb_n++] = (cb_entry_t){.func = func, .from_hidden = hidden};
 
 	os_unfair_lock_unlock(&g_lock);
 
 	// Call outside lock
 	for (uint32_t i = 0; i < n; i++)
-		func(hdrs[i], slides[i]);
-	free(hdrs);
-	free(slides);
+		func(image_snapshot[i].header, image_snapshot[i].slide);
+	free(image_snapshot);
 }
 
 __attribute__((noinline))
@@ -684,9 +835,12 @@ static void h_register_func_for_remove_image(void (*func)(const struct mach_head
 	bool hidden = caller_is_hidden(ra);
 
 	os_unfair_lock_lock(&g_lock);
-	if (g_rem_cb_n >= g_rem_cb_cap) {
-		g_rem_cb_cap = g_rem_cb_cap ? g_rem_cb_cap * 2 : 8;
-		g_rem_cbs = realloc(g_rem_cbs, g_rem_cb_cap * sizeof(cb_entry_t));
+	if (g_image_tracking_degraded || g_rem_cb_n == UINT32_MAX ||
+	    !reserve_entries((void **)&g_rem_cbs, &g_rem_cb_cap, g_rem_cb_n + 1, sizeof(*g_rem_cbs))) {
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_dyld_register_func_for_remove_image)
+			orig_dyld_register_func_for_remove_image(func);
+		return;
 	}
 	g_rem_cbs[g_rem_cb_n++] = (cb_entry_t){.func = func, .from_hidden = hidden};
 	os_unfair_lock_unlock(&g_lock);
@@ -717,6 +871,14 @@ typedef struct {
 // via mach_msg.  Detection-proof since it's just a Mach IPC message.
 static kern_return_t raw_task_info(task_name_t target, task_flavor_t flavor,
                                    task_info_t info_out, mach_msg_type_number_t *cnt) {
+	if (!info_out || !cnt) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	const mach_msg_type_number_t requested_count = *cnt;
+	if (requested_count > (mach_msg_type_number_t)(sizeof(((_ti_reply_t *)0)->task_info_out) / sizeof(integer_t))) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
 	union {
 		_ti_request_t req;
 		_ti_reply_t   rep;
@@ -732,7 +894,7 @@ static kern_return_t raw_task_info(task_name_t target, task_flavor_t flavor,
 	req->Head.msgh_id = 3418;
 	req->NDR = NDR_record;
 	req->flavor = flavor;
-	req->task_info_outCnt = *cnt;
+	req->task_info_outCnt = requested_count;
 
 	kern_return_t kr = mach_msg(
 		&req->Head,
@@ -755,78 +917,276 @@ static kern_return_t raw_task_info(task_name_t target, task_flavor_t flavor,
 		return rep->RetCode;
 
 	mach_msg_type_number_t out_n = rep->task_info_outCnt;
-	if (out_n > *cnt) out_n = *cnt;
+	if (out_n > requested_count) out_n = requested_count;
+	if (out_n > (mach_msg_type_number_t)(sizeof(rep->task_info_out) / sizeof(integer_t)))
+		out_n = (mach_msg_type_number_t)(sizeof(rep->task_info_out) / sizeof(integer_t));
 	memcpy(info_out, rep->task_info_out, out_n * sizeof(integer_t));
 	*cnt = out_n;
 
 	return KERN_SUCCESS;
 }
 
-static bool header_is_visible(const struct mach_header *mh) {
-	for (uint32_t i = 0; i < g_visible.count; i++) {
-		if (g_visible.items[i].header == mh)
+typedef enum {
+	TASK_SNAPSHOT_READY = 0,
+	TASK_SNAPSHOT_TRANSIENT_UNAVAILABLE,
+	TASK_SNAPSHOT_FATAL,
+} task_snapshot_result_t;
+
+typedef struct {
+	struct dyld_all_image_infos snapshot;
+	const struct dyld_image_info *images;
+	uint32_t image_count;
+	const struct dyld_uuid_info *uuids;
+	uintptr_t uuid_count;
+	uint64_t timestamp;
+} task_snapshot_source_t;
+
+static void discard_task_snapshot_generation(task_snapshot_generation_t *generation) {
+	if (!generation) {
+		return;
+	}
+	if (generation->image_paths) {
+		for (uint32_t i = 0; i < generation->image_path_capacity; i++) {
+			free(generation->image_paths[i]);
+		}
+	}
+	free(generation->image_paths);
+	free(generation->images);
+	free(generation->uuids);
+	free(generation);
+}
+
+static bool capture_task_snapshot_source(task_snapshot_source_t *source) {
+	if (!source || !g_real_aii || !g_real_aii->infoArray) {
+		return false;
+	}
+
+	memset(source, 0, sizeof(*source));
+	source->snapshot = *g_real_aii;
+	source->images = source->snapshot.infoArray;
+	source->image_count = source->snapshot.infoArrayCount;
+	if (source->snapshot.version >= 8) {
+		source->uuids = source->snapshot.uuidArray;
+		source->uuid_count = source->snapshot.uuidArrayCount;
+	}
+	if (source->snapshot.version >= 15) {
+		source->timestamp = source->snapshot.infoArrayChangeTimestamp;
+	}
+	return source->images != NULL;
+}
+
+static bool task_snapshot_source_is_current(const task_snapshot_source_t *source) {
+	if (!source || !g_real_aii || !g_real_aii->infoArray ||
+	    g_real_aii->infoArray != source->images ||
+	    g_real_aii->infoArrayCount != source->image_count) {
+		return false;
+	}
+	if (source->snapshot.version >= 8 &&
+	    (g_real_aii->uuidArray != source->uuids ||
+	     g_real_aii->uuidArrayCount != source->uuid_count)) {
+		return false;
+	}
+	if (source->snapshot.version >= 15 &&
+	    g_real_aii->infoArrayChangeTimestamp != source->timestamp) {
+		return false;
+	}
+	return true;
+}
+
+static char *copy_dyld_image_path(const char *path) {
+	if (!path) {
+		return NULL;
+	}
+	size_t length = strnlen(path, PATH_MAX);
+	if (length == PATH_MAX || length == SIZE_MAX) {
+		return NULL;
+	}
+	char *copy = malloc(length + 1);
+	if (!copy) {
+		return NULL;
+	}
+	memcpy(copy, path, length);
+	copy[length] = '\0';
+	return copy;
+}
+
+static bool snapshot_contains_header(const task_snapshot_generation_t *generation,
+	                                  const struct mach_header *header) {
+	if (!generation || !header) {
+		return false;
+	}
+	for (uint32_t i = 0; i < generation->snapshot.infoArrayCount; i++) {
+		if (generation->images[i].imageLoadAddress == header) {
 			return true;
+		}
 	}
 	return false;
 }
 
-static void build_task_snapshot(void) {
+static task_snapshot_generation_t *build_task_snapshot(task_snapshot_result_t *result_out) {
 	// Must be called with g_lock held.
-	// Filter g_real_aii->infoArray directly: copy visible entries verbatim.
-	// This preserves every field (imageFilePath pointer, imageFileModDate,
-	// imageLoadAddress) exactly as dyld reported — no reconstruction needed.
-	// Pointer identity between task_info, _dyld_get_image_name, and dladdr
-	// is maintained because all use dyld's canonical pointers.
-	if (!g_real_aii || !g_real_aii->infoArray) {
-		// Shouldn't happen, but handle gracefully
-		memset(&g_ti_snap, 0, sizeof(g_ti_snap));
-		return;
+	if (result_out) {
+		*result_out = TASK_SNAPSHOT_TRANSIENT_UNAVAILABLE;
 	}
-
-	uint32_t src_n = g_real_aii->infoArrayCount;
-	if (src_n > g_ti_cap) {
-		g_ti_images = realloc(g_ti_images, src_n * sizeof(struct dyld_image_info));
-		g_ti_cap = src_n;
+	if (g_image_tracking_degraded || !g_real_aii || !g_real_aii->infoArray) {
+		return NULL;
 	}
-
-	uint32_t vis_n = 0;
-	for (uint32_t i = 0; i < src_n; i++) {
-		const struct dyld_image_info *entry = &g_real_aii->infoArray[i];
-		if (!image_path_should_hide(entry->imageFilePath))
-			g_ti_images[vis_n++] = *entry;  // verbatim copy
-	}
-
-	g_ti_snap = *g_real_aii;
-	g_ti_snap.infoArray      = g_ti_images;
-	g_ti_snap.infoArrayCount = vis_n;
-
-	// Filter UUID array — must match visible images only
-	if (g_real_aii && g_real_aii->version >= 8 &&
-	    g_real_aii->uuidArray && g_real_aii->uuidArrayCount > 0) {
-		uint32_t src_n = (uint32_t)g_real_aii->uuidArrayCount;
-		if (src_n > g_ti_uuid_cap) {
-			g_ti_uuids = realloc(g_ti_uuids, src_n * sizeof(struct dyld_uuid_info));
-			g_ti_uuid_cap = src_n;
+	if (g_ti_current && g_ti_current->image_generation == g_image_generation) {
+		if (result_out) {
+			*result_out = TASK_SNAPSHOT_READY;
 		}
-		uint32_t vis_uuid_n = 0;
-		for (uint32_t i = 0; i < src_n; i++) {
-			if (header_is_visible(g_real_aii->uuidArray[i].imageLoadAddress))
-				g_ti_uuids[vis_uuid_n++] = g_real_aii->uuidArray[i];
+		return g_ti_current;
+	}
+
+	for (uint32_t attempt = 0; attempt < RHI_TASK_SNAPSHOT_COPY_ATTEMPTS; attempt++) {
+		task_snapshot_source_t source = {0};
+		if (!capture_task_snapshot_source(&source)) {
+			return NULL;
 		}
-		g_ti_snap.uuidArray      = vis_uuid_n ? g_ti_uuids : NULL;
-		g_ti_snap.uuidArrayCount = vis_uuid_n;
-	} else if (g_ti_snap.version >= 8) {
-		g_ti_snap.uuidArray      = NULL;
-		g_ti_snap.uuidArrayCount = 0;
+		if ((size_t)source.image_count > SIZE_MAX / sizeof(struct dyld_image_info) ||
+		    source.uuid_count > UINT32_MAX ||
+		    source.uuid_count > SIZE_MAX / sizeof(struct dyld_uuid_info)) {
+			break;
+		}
+
+		struct dyld_image_info *source_images = NULL;
+		struct dyld_uuid_info *source_uuids = NULL;
+		if (source.image_count) {
+			source_images = malloc((size_t)source.image_count * sizeof(*source_images));
+			if (!source_images) {
+				break;
+			}
+			memcpy(source_images, source.images, (size_t)source.image_count * sizeof(*source_images));
+		}
+		if (source.uuid_count) {
+			if (!source.uuids) {
+				free(source_images);
+				break;
+			}
+			source_uuids = malloc((size_t)source.uuid_count * sizeof(*source_uuids));
+			if (!source_uuids) {
+				free(source_images);
+				break;
+			}
+			memcpy(source_uuids, source.uuids, (size_t)source.uuid_count * sizeof(*source_uuids));
+		}
+		if (!task_snapshot_source_is_current(&source)) {
+			free(source_uuids);
+			free(source_images);
+			continue;
+		}
+
+		task_snapshot_generation_t *generation = calloc(1, sizeof(*generation));
+		if (!generation) {
+			free(source_uuids);
+			free(source_images);
+			break;
+		}
+		if (source.image_count) {
+			generation->images = calloc(source.image_count, sizeof(*generation->images));
+			generation->image_paths = calloc(source.image_count, sizeof(*generation->image_paths));
+			generation->image_path_capacity = source.image_count;
+			if (!generation->images || !generation->image_paths) {
+				discard_task_snapshot_generation(generation);
+				free(source_uuids);
+				free(source_images);
+				break;
+			}
+		}
+
+		uint32_t visible_image_count = 0;
+		bool path_copy_failed = false;
+		for (uint32_t i = 0; i < source.image_count; i++) {
+			const struct dyld_image_info *entry = &source_images[i];
+			if (image_path_should_hide(entry->imageFilePath)) {
+				continue;
+			}
+			generation->images[visible_image_count] = *entry;
+			if (entry->imageFilePath) {
+				generation->image_paths[visible_image_count] = copy_dyld_image_path(entry->imageFilePath);
+				if (!generation->image_paths[visible_image_count]) {
+					path_copy_failed = true;
+					break;
+				}
+				generation->images[visible_image_count].imageFilePath =
+					generation->image_paths[visible_image_count];
+			}
+			visible_image_count++;
+		}
+		if (path_copy_failed || !task_snapshot_source_is_current(&source)) {
+			discard_task_snapshot_generation(generation);
+			free(source_uuids);
+			free(source_images);
+			if (path_copy_failed) {
+				break;
+			}
+			continue;
+		}
+
+		generation->snapshot = source.snapshot;
+		generation->snapshot.infoArray = generation->images;
+		generation->snapshot.infoArrayCount = visible_image_count;
+		if (generation->snapshot.version >= 8) {
+			if (source.uuid_count) {
+				generation->uuids = calloc((size_t)source.uuid_count, sizeof(*generation->uuids));
+				if (!generation->uuids) {
+					discard_task_snapshot_generation(generation);
+					free(source_uuids);
+					free(source_images);
+					break;
+				}
+				uint32_t visible_uuid_count = 0;
+				for (uintptr_t i = 0; i < source.uuid_count; i++) {
+					if (snapshot_contains_header(generation, source_uuids[i].imageLoadAddress)) {
+						generation->uuids[visible_uuid_count++] = source_uuids[i];
+					}
+				}
+				generation->snapshot.uuidArray = visible_uuid_count ? generation->uuids : NULL;
+				generation->snapshot.uuidArrayCount = visible_uuid_count;
+			} else {
+				generation->snapshot.uuidArray = NULL;
+				generation->snapshot.uuidArrayCount = 0;
+			}
+		}
+		if (generation->snapshot.version >= 9) {
+			generation->snapshot.dyldAllImageInfosAddress = &generation->snapshot;
+		}
+		if (!task_snapshot_source_is_current(&source)) {
+			discard_task_snapshot_generation(generation);
+			free(source_uuids);
+			free(source_images);
+			continue;
+		}
+
+		free(source_uuids);
+		free(source_images);
+		generation->image_generation = g_image_generation;
+		generation->previous = g_ti_current;
+		g_ti_current = generation;
+		if (result_out) {
+			*result_out = TASK_SNAPSHOT_READY;
+		}
+		return generation;
 	}
-	if (g_ti_snap.version >= 9) {
-		g_ti_snap.dyldAllImageInfosAddress = &g_ti_snap;
+
+	/*
+	 * A stable but unpublishable dyld generation (OOM, overflow, malformed
+	 * count, or a load storm that never stabilizes) cannot coexist with filtered
+	 * enumeration.  Degrade every linked view to dyld's originals atomically.
+	 */
+	g_image_tracking_degraded = true;
+	if (result_out) {
+		*result_out = TASK_SNAPSHOT_FATAL;
 	}
+	return NULL;
 }
 
 __attribute__((noinline))
 static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
                                  task_info_t info_out, mach_msg_type_number_t *cnt) {
+	if (!orig_task_info) {
+		return KERN_FAILURE;
+	}
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_task_info(target, flavor, info_out, cnt);
@@ -839,19 +1199,25 @@ static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
 	// Only filter TASK_DYLD_INFO on mach_task_self()
 	if (flavor != TASK_DYLD_INFO || target != mach_task_self())
 		return kr;
+	// The original call owns validation of the request.  Only reinterpret the
+	// returned buffer when it contains a complete task_dyld_info structure.
+	if (!info_out || !cnt || *cnt < TASK_DYLD_INFO_COUNT)
+		return kr;
 
 	struct task_dyld_info *tdi = (struct task_dyld_info *)info_out;
 
-	// Cache the real dyld_all_image_infos pointer on first encounter
+	os_unfair_lock_lock(&g_lock);
+	// Cache the real dyld_all_image_infos pointer on first encounter.
 	if (!g_real_aii && tdi->all_image_info_addr)
 		g_real_aii = (struct dyld_all_image_infos *)(uintptr_t)tdi->all_image_info_addr;
-
-	os_unfair_lock_lock(&g_lock);
-	build_task_snapshot();
+	task_snapshot_result_t snapshot_result = TASK_SNAPSHOT_TRANSIENT_UNAVAILABLE;
+	task_snapshot_generation_t *generation = build_task_snapshot(&snapshot_result);
 	os_unfair_lock_unlock(&g_lock);
+	if (!generation)
+		return kr;
 
-	tdi->all_image_info_addr = (mach_vm_address_t)(uintptr_t)&g_ti_snap;
-	tdi->all_image_info_size = sizeof(g_ti_snap);
+	tdi->all_image_info_addr = (mach_vm_address_t)(uintptr_t)&generation->snapshot;
+	tdi->all_image_info_size = sizeof(generation->snapshot);
 
 	return KERN_SUCCESS;
 }
@@ -934,13 +1300,14 @@ static int h_dladdr(const void *addr, Dl_info *info) {
 	// detection SDKs (ICGN, SF) to flag the IMP as anomalous
 	// because dladdr never fails for valid addresses on stock iOS.
 	// This matches h_class_getImageName's strategy of returning g_executable_path.
-	if (info && info->dli_fname && image_path_should_hide(info->dli_fname)) {
+	if (info && info->dli_fname && g_executable_path && g_executable_header &&
+	    image_path_should_hide(info->dli_fname)) {
 		// Rewrite the owning image to match the app executable. Preserve the
 		// symbol name so callers that stringify dli_sname don't crash on NULL.
 		// dli_saddr stays cleared because it would otherwise still point into the
 		// hidden image even after we swap dli_fbase to the app binary.
 		info->dli_fname = g_executable_path;
-		info->dli_fbase = (void *)orig_dyld_get_image_header(0);
+		info->dli_fbase = (void *)g_executable_header;
 		info->dli_saddr = NULL;
 		return 1;
 	}
@@ -1132,28 +1499,41 @@ static void h_objc_addLoadImageFunc(objc_func_loadImage func) {
 	bool hidden = caller_is_hidden(ra);
 
 	os_unfair_lock_lock(&g_lock);
-
-	if (g_objc_addload_cb_n >= g_objc_addload_cb_cap) {
-		g_objc_addload_cb_cap = g_objc_addload_cb_cap ? g_objc_addload_cb_cap * 2 : 8;
-		g_objc_addload_cbs = realloc(g_objc_addload_cbs, g_objc_addload_cb_cap * sizeof(objc_load_cb_entry_t));
+	if (g_image_tracking_degraded) {
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_objc_addLoadImageFunc)
+			orig_objc_addLoadImageFunc(func);
+		return;
 	}
-	g_objc_addload_cbs[g_objc_addload_cb_n++] = (objc_load_cb_entry_t){ .func = func, .from_hidden = hidden };
 
 	const image_array_t *a = hidden ? &g_all : &g_visible;
 	uint32_t n = a->count;
-	const struct mach_header **hdrs = NULL;
-	if (n) {
-		hdrs = malloc(n * sizeof(void *));
-		for (uint32_t i = 0; i < n; i++) {
-			hdrs[i] = a->items[i].header;
-		}
+	const struct mach_header **headers = n ? malloc((size_t)n * sizeof(*headers)) : NULL;
+	if (n && !headers) {
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_objc_addLoadImageFunc)
+			orig_objc_addLoadImageFunc(func);
+		return;
 	}
+	for (uint32_t i = 0; i < n; i++)
+		headers[i] = a->items[i].header;
+
+	if (g_objc_addload_cb_n == UINT32_MAX ||
+	    !reserve_entries((void **)&g_objc_addload_cbs, &g_objc_addload_cb_cap,
+	                     g_objc_addload_cb_n + 1, sizeof(*g_objc_addload_cbs))) {
+		free(headers);
+		os_unfair_lock_unlock(&g_lock);
+		if (orig_objc_addLoadImageFunc)
+			orig_objc_addLoadImageFunc(func);
+		return;
+	}
+	g_objc_addload_cbs[g_objc_addload_cb_n++] = (objc_load_cb_entry_t){ .func = func, .from_hidden = hidden };
 
 	os_unfair_lock_unlock(&g_lock);
 
 	for (uint32_t i = 0; i < n; i++)
-		func(hdrs[i]);
-	free(hdrs);
+		func(headers[i]);
+	free(headers);
 }
 
 //------------------------------------------------------------------------------
@@ -1691,11 +2071,9 @@ static struct dirent *h_readdir(DIR *dirp) {
 
 __attribute__((noinline))
 static int h_closedir(DIR *dirp) {
-	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
-	if (caller_is_hidden(ra)) {
-		return orig_closedir(dirp);
-	}
-
+	/* DIR * addresses can be reused by libc.  Cleanup is ownership-neutral:
+	 * remove any app-side filter before every close, including a close issued
+	 * from hidden code, so a later directory cannot inherit stale filtering. */
 	unregister_dir_filter(dirp);
 	return orig_closedir(dirp);
 }
@@ -1713,17 +2091,25 @@ static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 	if (caller_is_hidden(ra))
 		return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 
-	int result = orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
-	if (result != 0 || !oldp || !oldlenp || !name)
-		return result;
-
-	// kern.bootargs can leak jailbreak boot arguments
-	if (strcmp(name, "kern.bootargs") == 0 && oldp && oldlenp && *oldlenp > 0) {
+	/* Preserve the normal two-pass contract without first exposing the real
+	 * boot-argument length. Writes and malformed calls still go to the kernel. */
+	if (name && oldlenp && !newp && strcmp(name, "kern.bootargs") == 0) {
+		const size_t required = 1;
+		if (!oldp) {
+			*oldlenp = required;
+			return 0;
+		}
+		if (*oldlenp < required) {
+			*oldlenp = required;
+			errno = ENOMEM;
+			return -1;
+		}
 		((char *)oldp)[0] = '\0';
-		*oldlenp = 1;
+		*oldlenp = required;
+		return 0;
 	}
 
-	return result;
+	return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
 //------------------------------------------------------------------------------
@@ -1761,8 +2147,22 @@ extern void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 
 // consumed and before roothide_init_with_executable / TweakLoader.
 void hidden_dylib_hider_init(void)
 {
-	if (g_inited) return;
-	g_inited = true;
+	unsigned expected = HIDER_STATE_UNINITIALIZED;
+	if (!atomic_compare_exchange_strong_explicit(&g_init_state, &expected,
+	                                             HIDER_STATE_INITIALIZING,
+	                                             memory_order_acq_rel,
+	                                             memory_order_acquire)) {
+		// Another call is either completing initialization or has already made
+		// the core hooks visible.  Do not recurse through dyld registration.
+		return;
+	}
+
+	rhi_hider_identity_init();
+	rhi_hider_caller_policy_init();
+	if (!rhi_hider_caller_register_own_function(hidden_dylib_hider_init)) {
+		/* Fail closed: systemhook retains no implicit privileged caller fallback. */
+		rhi_diag_log("HIDER caller capability unavailable; unclassified callers remain filtered");
+	}
 
 	rhi_diag_log("HIDER init start, _dyld_image_count=%u", _dyld_image_count());
 
@@ -1818,8 +2218,12 @@ void hidden_dylib_hider_init(void)
 	orig_closedir = closedir;
 	orig_mach_port_get_refs = mach_port_get_refs;
 
-	// Cache executable path for class_getImageName / dladdr substitution
-	g_executable_path = _dyld_get_image_name(0);
+	// Cache the true main executable for class_getImageName / dladdr
+	// substitution.  Injection can place systemhook before the MH_EXECUTE image.
+	// If dyld exposes no valid MH_EXECUTE image, these stay NULL rather than
+	// borrowing identity from an arbitrary injected dylib.
+	g_executable_path = rhi_hider_identity_executable_path();
+	g_executable_header = rhi_hider_identity_executable_header();
 	load_hider_profile_from_environment();
 
 	// 4. GOT rebinding for all hooks.
@@ -1858,16 +2262,22 @@ void hidden_dylib_hider_init(void)
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctlbyname, h_sysctlbyname, NULL);
 	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, mach_port_get_refs, h_mach_port_get_refs, NULL);
 
+	atomic_store_explicit(&g_init_state, HIDER_STATE_READY, memory_order_release);
 	rhi_diag_log("HIDER init complete — core hooks enabled");
 }
 
 void hidden_dylib_hider_enable_strict_hooks(void)
 {
-	if (!g_inited || g_strict_hooks_enabled) {
+	if (!hider_is_ready()) {
 		return;
 	}
-
-	g_strict_hooks_enabled = true;
+	unsigned expected = HIDER_STATE_UNINITIALIZED;
+	if (!atomic_compare_exchange_strong_explicit(&g_strict_state, &expected,
+	                                             HIDER_STATE_INITIALIZING,
+	                                             memory_order_acq_rel,
+	                                             memory_order_acquire)) {
+		return;
+	}
 
 	// ObjC runtime — hide injected images from class/image enumeration
 	if (g_hook_objc_runtime_enabled) {
@@ -1901,6 +2311,10 @@ void hidden_dylib_hider_enable_strict_hooks(void)
 		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, closedir, h_closedir, NULL);
 	}
 
+	// Do not expose strict-hook pointers through dlsym until every requested
+	// strict installation has run.  A concurrent/reentrant caller observes the
+	// original APIs during this short window instead of a half-installed set.
+	atomic_store_explicit(&g_strict_state, HIDER_STATE_READY, memory_order_release);
 	rhi_diag_log("HIDER strict hooks enabled");
 }
 
@@ -1914,7 +2328,7 @@ void hidden_dylib_hider_enable_strict_hooks(void)
 // with the original dlsym).
 void *hidden_dylib_hider_dlsym_remap(const char *name)
 {
-	if (!g_inited || !name)
+	if (!hider_is_ready() || !name)
 		return NULL;
 
 	// Only remap dlopen when the actual GOT-level fallback hook was installed.
@@ -1967,7 +2381,7 @@ void *hidden_dylib_hider_dlsym_remap(const char *name)
 
 	for (unsigned i = 0; i < sizeof(remap) / sizeof(*remap); i++) {
 		if (strcmp(name, remap[i].sym) == 0) {
-			if (remap[i].requiresStrictHooks && !g_strict_hooks_enabled)
+				if (remap[i].requiresStrictHooks && !hider_strict_hooks_ready())
 				return NULL;
 			if (remap[i].enabled && !*remap[i].enabled)
 				return NULL;
