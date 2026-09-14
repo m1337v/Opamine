@@ -565,11 +565,18 @@ __attribute__((constructor)) static void initializer(void)
 		gLibSandboxHandle = dlopen("/usr/lib/libsandbox.1.dylib", RTLD_FIRST | RTLD_LOCAL | RTLD_LAZY);
 		sandbox_apply_orig = dlsym(gLibSandboxHandle, "sandbox_apply");
 
-		// Apply dyld hooks
-		void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
-		if (gDyldPtr) {
-			// TODO: Maybe we can just rebind sandbox_apply instead?
-			dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+		/* gDyld is a private, PAC-diversified vtable.  Keep the established
+		 * non-hidden legacy behavior, but hidden injection must not perform an
+		 * unverified raw table write. Its selected-tweak path is gated on the
+		 * result-aware dlopen transaction in roothider_main.c instead. */
+		if (!gHiddenInjection) {
+			void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
+			if (gDyldPtr) {
+				// TODO: Maybe we can just rebind sandbox_apply instead?
+				dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+			}
+		} else {
+			rhi_diag_log("hidden injection: refusing unverified gDyld vtable mutation");
 		}
 	}
 
@@ -661,19 +668,21 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 			if (tweaksEnabled) {
 				if (hiddenTweakMinimalRuntime) {
 					root_hide_hidden_whitelist_log("attempt minimal hidden tweak runtime executable=%s", gExecutablePath);
-					if (roothide_hidden_tweak_prepare_minimal_runtime()) {
+					if (roothide_hidden_tweak_prepare_minimal_runtime() &&
+					    roothide_hidden_tweak_hooks_ready()) {
 						bool selectedTweaksLoaded = roothide_hidden_tweak_load_selected();
 						rhi_diag_log("POST-MINIMAL-LOAD-SELECTED loaded=%d state=%d", selectedTweaksLoaded, roothide_hidden_tweak_load_state());
 					}
 					else {
-						root_hide_hidden_whitelist_log("skip minimal selected tweaks after failed prepare executable=%s state=%d", gExecutablePath, roothide_hidden_tweak_load_state());
+						root_hide_hidden_whitelist_log("skip minimal selected tweaks after failed prepare or unverified dyld hook executable=%s state=%d", gExecutablePath, roothide_hidden_tweak_load_state());
 					}
 				}
 				else {
 					const char *tweakLoaderPath = JBROOT_PATH("/usr/lib/TweakLoader.dylib");
 					root_hide_hidden_whitelist_log("attempt TweakLoader executable=%s path=%s", gExecutablePath, tweakLoaderPath);
 					if (access(tweakLoaderPath, F_OK) == 0) {
-						bool loaderPrepareSucceeded = !gHiddenInjection || !gHiddenTweakLoading || roothide_hidden_tweak_prepare_for_loader();
+						bool loaderPrepareSucceeded = !gHiddenInjection || !gHiddenTweakLoading ||
+							(roothide_hidden_tweak_hooks_ready() && roothide_hidden_tweak_prepare_for_loader());
 						if (!loaderPrepareSucceeded) {
 							root_hide_hidden_whitelist_log("skip TweakLoader after failed selected-tweak prepare executable=%s state=%d", gExecutablePath, roothide_hidden_tweak_load_state());
 						}

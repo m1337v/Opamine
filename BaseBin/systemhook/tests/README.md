@@ -5,13 +5,16 @@ current rhinject systemhook contract.  They are intentionally separate from
 the iOS build: the production sources include Darwin, Mach-O, Objective-C and
 RootHide-only APIs which cannot be compiled faithfully by the host compiler.
 
-The checks therefore have two parts:
+The checks therefore have three parts:
 
 * pure host doubles for deterministic contracts (token parsing, executable
   selection, hook/remap state, `dlsym` error semantics, sysctl two-pass
   behavior and directory state lifetime); and
 * static assertions against the current production sources plus a JSON
-  ownership matrix.
+  ownership matrix; and
+* a macOS-host executable fixture that includes the production `rhi_rebind.c`
+  decoder and validates chained import metadata, addends, weak imports, PAC
+  schema decoding, original-file chain words and malformed-precommit refusal.
 
 Passing this lane does **not** prove that an iOS hook is installed, that PAC or
 dyld-private ABI behavior is correct, or that a detector is bypassed.  The

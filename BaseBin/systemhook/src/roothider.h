@@ -56,6 +56,7 @@ bool roothide_hidden_tweak_env_is_configured(void);
 bool roothide_hidden_tweak_prepare_for_loader(void);
 bool roothide_hidden_tweak_prepare_minimal_runtime(void);
 bool roothide_hidden_tweak_load_selected(void);
+bool roothide_hidden_tweak_hooks_ready(void);
 HiddenTweakLoadState roothide_hidden_tweak_load_state(void);
 void roothide_hidden_tweak_note_loader_result(bool succeeded);
 

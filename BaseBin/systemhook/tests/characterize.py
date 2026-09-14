@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -36,6 +37,9 @@ ROOTHIDER_COMMON = ROOT / "BaseBin/systemhook/src/roothider_common.c"
 ROOTHIDER_MAIN = ROOT / "BaseBin/systemhook/src/roothider_main.c"
 LAUNCHD = ROOT / "BaseBin/launchdhook/src/roothider.m"
 LITEHOOK = ROOT / "BaseBin/_external/modules/litehook/src/litehook.c"
+RHI_REBIND = ROOT / "BaseBin/systemhook/src/rhi_rebind.c"
+RHI_REBIND_HEADER = ROOT / "BaseBin/systemhook/src/rhi_rebind.h"
+HIDER_HOOK_SESSION = ROOT / "BaseBin/systemhook/src/hider_hook_session.c"
 OWNERSHIP = TESTS / "ownership.json"
 
 
@@ -151,6 +155,28 @@ class HookFixture:
     replacement: str = ""
 
 
+@dataclass
+class SelectedReadinessModel:
+    """Small publication model for the selected-tweak dlopen gate."""
+
+    transaction_published: bool = False
+    installed: bool = False
+    state: HookState = HookState.NOT_ATTEMPTED
+    live_state: HookState = HookState.NOT_ATTEMPTED
+    dlopen_active: bool = False
+
+    def ready(self) -> bool:
+        if not (self.transaction_published and self.installed and self.state is HookState.ACTIVE):
+            return False
+        if self.live_state is not HookState.ACTIVE or not self.dlopen_active:
+            # Readiness invalidation is one-way: a stale physical replacement
+            # must never become advertised again in this process.
+            self.state = HookState.FAILED
+            self.installed = False
+            return False
+        return True
+
+
 def remap_result(hook: HookFixture, strict_enabled: bool = True) -> str | None:
     """Model truthful remapping: only a verified ACTIVE hook is advertised."""
 
@@ -159,27 +185,67 @@ def remap_result(hook: HookFixture, strict_enabled: bool = True) -> str | None:
     return hook.replacement
 
 
+def session_ready(required: bool, hooks: Iterable[HookFixture]) -> bool:
+    """Model required all-or-nothing core versus independent strict sessions."""
+
+    hook_list = list(hooks)
+    if not hook_list:
+        return False
+    return all(hook.state is HookState.ACTIVE for hook in hook_list) if required else \
+        hook_list[0].state is HookState.ACTIVE
+
+
 class DlsymDouble:
-    """Small dlsym/RTLD_NEXT/dlerror behavioral double."""
+    """Model external dlsym remaps, denied results, and one-shot TLS errors."""
 
     def __init__(self) -> None:
-        self.default = {"known": "default-known", "shared": "default-shared"}
+        self.default = {
+            "known": "default-known",
+            "shared": "default-shared",
+            "hidden": "hidden-private",
+        }
         self.next = {"shared": "next-shared"}
         self.handles = {"handle-a": {"known": "handle-a-known"}}
-        self._error: str | None = None
+        self._state = threading.local()
 
-    def lookup(self, handle: str, name: str) -> str | None:
+    def _set_error(self, message: str | None) -> None:
+        self._state.error = message
+
+    def _get_error(self) -> str | None:
+        return getattr(self._state, "error", None)
+
+    def lookup(
+        self,
+        handle: str,
+        name: str | None,
+        remaps: dict[str, str] | None = None,
+    ) -> str | None:
+        # h_dlsym drops only its own pending denial before delegating. The
+        # original lookup establishes stock success/failure state first.
+        self._set_error(None)
+        if name is None:
+            self._set_error("stock invalid symbol")
+            return None
         if handle == "RTLD_DEFAULT":
             result = self.default.get(name)
         elif handle == "RTLD_NEXT":
             result = self.next.get(name)
         else:
             result = self.handles.get(handle, {}).get(name)
-        self._error = None if result is not None else f"symbol not found: {name}"
+        if result is None:
+            self._set_error(f"symbol not found: {name}")
+        if remaps and name in remaps:
+            # A policy-remapped success must consume an original lookup error.
+            self._set_error(None)
+            return remaps[name]
+        if result == "hidden-private":
+            self._set_error(f"symbol not found: {name}")
+            return None
         return result
 
     def dlerror(self) -> str | None:
-        result, self._error = self._error, None
+        result = self._get_error()
+        self._set_error(None)
         return result
 
 
@@ -205,7 +271,7 @@ class SysctlDouble:
 
 
 class DirectoryDouble:
-    """Model fresh path resolution and unconditional directory cleanup."""
+    """Model fresh fd-path classification with no retained DIR ownership."""
 
     def __init__(self) -> None:
         self.paths: dict[str, str] = {}
@@ -217,8 +283,13 @@ class DirectoryDouble:
         require(token in self.paths, "directory token must be open")
         self.paths[token] = path
 
-    def classify(self, token: str) -> str | None:
-        return self.paths.get(token)
+    def classify(self, token: str, errno: int, available: bool = True) -> tuple[str | None, int]:
+        """Return the current resolved path without letting resolution alter errno."""
+
+        saved_errno = errno
+        if not available or token not in self.paths:
+            return None, saved_errno
+        return self.paths[token], saved_errno
 
     def close(self, token: str) -> None:
         self.paths.pop(token, None)
@@ -376,6 +447,9 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     roothider_main = production_text(ROOTHIDER_MAIN)
     launchd = production_text(LAUNCHD)
     litehook = production_text(LITEHOOK)
+    rhi_rebind = production_text(RHI_REBIND)
+    rhi_rebind_header = production_text(RHI_REBIND_HEADER)
+    hider_hook_session = production_text(HIDER_HOOK_SESSION)
 
     def check_launchd_identity_fixture() -> None:
         require(bundle_candidate_from_spawn_value("UIKitApplication:com.example.App[0x123]") == "com.example.App", "UIKitApplication label must preserve its app identifier")
@@ -562,6 +636,8 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
                 "rhi_hider_caller_register_own_function",
                 "rhi_hider_identity_executable_path",
                 "hidden_dylib_hider_init",
+                "rhi_rebind_transaction_prepare_global",
+                "rhi_hider_hook_session_start",
             ):
                 require(symbol not in completed.stdout, f"private hider symbol exported: {symbol}")
 
@@ -576,6 +652,72 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
 
     check("hook_state_and_remap_truth_fixture", check_hook_state_fixture)
 
+    def check_selected_readiness_contract() -> None:
+        model = SelectedReadinessModel(
+            transaction_published=False,
+            installed=True,
+            state=HookState.ACTIVE,
+            live_state=HookState.ACTIVE,
+            dlopen_active=True,
+        )
+        require(not model.ready(), "selected readiness must fail closed before transaction publication")
+
+        model.transaction_published = True
+        require(model.ready(), "published active selected transaction must be ready")
+
+        model.live_state = HookState.PARTIAL
+        require(not model.ready(), "late transaction degradation must invalidate selected readiness")
+        require(model.state is HookState.FAILED and not model.installed,
+                "selected readiness invalidation must be one-way")
+        model.live_state = HookState.ACTIVE
+        model.dlopen_active = True
+        require(not model.ready(), "invalidated selected readiness must not reactivate")
+
+    check("selected_tweak_readiness_publication_fixture", check_selected_readiness_contract)
+
+    def check_selected_readiness_source_contract() -> None:
+        require("#include <stdatomic.h>" in roothider_main,
+                "selected readiness owner must use C11 atomics")
+        for token in (
+            "atomic_bool dlopen_fallback_hook_installed",
+            "static atomic_bool gHiddenTweakHooksInstalled",
+            "static atomic_int gHiddenTweakHookState",
+            "_Atomic(rhi_rebind_transaction_t *) gHiddenTweakFallbackTransaction",
+            "atomic_compare_exchange_strong_explicit(&gHiddenTweakHookState",
+            "atomic_store_explicit(&gHiddenTweakFallbackTransaction, transaction, memory_order_release)",
+            "atomic_store_explicit(&gHiddenTweakHooksInstalled, true, memory_order_release)",
+            "atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_ACTIVE, memory_order_release)",
+        ):
+            require(token in roothider_main, f"selected readiness atomic contract missing: {token}")
+        require("extern atomic_bool dlopen_fallback_hook_installed" in hider,
+                "hider advertisement must declare the fallback flag atomically")
+        require("atomic_load_explicit(&dlopen_fallback_hook_installed, memory_order_acquire)" in hider,
+                "hider advertisement must acquire the fallback publication")
+        require(
+            re.search(
+                r"atomic_load_explicit\(\s*&gHiddenTweakFallbackTransaction\s*,\s*memory_order_acquire\s*\)",
+                roothider_main,
+            ),
+            "selected readiness must acquire its published transaction pointer",
+        )
+        require(
+            re.search(
+                r"atomic_load_explicit\(\s*&dlopen_fallback_hook_installed\s*,\s*memory_order_acquire\s*\)",
+                roothider_main,
+            ),
+            "selected readiness must acquire its fallback advertisement flag",
+        )
+        pointer_publish = roothider_main.find(
+            "atomic_store_explicit(&gHiddenTweakFallbackTransaction, transaction, memory_order_release)")
+        installed_publish = roothider_main.find(
+            "atomic_store_explicit(&dlopen_fallback_hook_installed, true, memory_order_release)")
+        require(pointer_publish >= 0 and installed_publish > pointer_publish,
+                "selected fallback flag must publish only after its transaction pointer")
+        require("rhi_rebind_transaction_hook_is_active(transaction, \"dlopen\")" in roothider_main,
+                "selected readiness must query the live transaction hook state")
+
+    check("selected_tweak_readiness_atomic_source_contract", check_selected_readiness_source_contract)
+
     def check_remap_source_contract() -> None:
         require("hidden_dylib_hider_dlsym_remap" in hider, "remap entry point missing")
         for symbol in ("_dyld_image_count", "dlsym", "dladdr", "getenv", "opendir", "sysctlbyname"):
@@ -589,13 +731,49 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
 
     check("hook_remap_production_static_contract", check_remap_source_contract)
 
-    if re.search(r"\bvoid\s+litehook_rebind_symbol\s*\(", litehook):
-        known_gaps.append({
-            "id": "no-per-hook-installation-result",
-            "severity": "high",
-            "source": "BaseBin/systemhook/src/hidden_dylib_hider.c and BaseBin/systemhook/src/litehook.c",
-            "detail": "strict state is global and litehook rebind calls are not represented by a per-hook ACTIVE/FAILED/PARTIAL result.",
-        })
+    def check_result_aware_rebind_contract() -> None:
+        require("RHI_REBIND_NONE" in rhi_rebind_header and "RHI_REBIND_COMPLETE" in rhi_rebind_header, "transaction must distinguish no mutation from complete mutation")
+        require("RHI_REBIND_PARTIAL" in rhi_rebind_header and "RHI_REBIND_UNKNOWN" in rhi_rebind_header, "post-write failure states missing")
+        for state in ("RHI_HOOK_NOT_ATTEMPTED", "RHI_HOOK_PREPARED", "RHI_HOOK_ACTIVE", "RHI_HOOK_FAILED", "RHI_HOOK_PARTIAL", "RHI_HOOK_UNKNOWN"):
+            require(state in rhi_rebind_header, f"per-hook state missing {state}")
+        require("rhi_transaction_image_snapshot_stable" in rhi_rebind and "rhi_commit_slots" in rhi_rebind, "all current slots must be prepared and revalidated before commit")
+        require("__atomic_store_n" in rhi_rebind and "__ATOMIC_RELEASE" in rhi_rebind, "slot writes must use release atomics")
+        require("rhi_pac_sign_key" in rhi_rebind and "rhi_slot_schema_matches" in rhi_rebind and "__auth_got" in rhi_rebind, "authenticated GOT slots need exact file-schema signing and raw PAC validation")
+        require("mach_vm_region_recurse" in rhi_rebind and "original_protection" in rhi_rebind and "mach_vm_protect" in rhi_rebind, "writer must record and restore actual page protections")
+        require("LC_DYLD_CHAINED_FIXUPS" in rhi_rebind and "rhi_scan_chained_image" in rhi_rebind and "rhi_walk_chained_image" in rhi_rebind and "rhi_open_file_view" in rhi_rebind, "chained imports must use validated original-file words rather than live resolved slots")
+        require("rhi_chained_imports_validate" in rhi_rebind and "rhi_decode_chain_pointer" in rhi_rebind and "rhi_select_file_slice" in rhi_rebind, "chained imports must validate names, fat-slice CPU identity, addends and PAC schema before planning")
+        require("rhi_legacy_import_metadata_init" in rhi_rebind and "rhi_legacy_slot_hook_index" in rhi_rebind, "legacy candidate discovery must use indirect-symbol metadata, not pointer aliases")
+        require("RHI_IMPORT_MALFORMED" in rhi_rebind and "rhi_import_name_matches_spec" in rhi_rebind and "predecessor != rhi_strip_function" in rhi_rebind, "metadata-selected slots must reject malformed indirect tables and prove canonical predecessors")
+        require("rhi_rebind_transaction_activate_global" in rhi_rebind, "new image handling must stay on the same result-aware transaction")
+        require("g_native_register_add_image" in rhi_rebind and "g_native_register_remove_image" in rhi_rebind, "dyld lifecycle registration must use captured native entry points")
+        require("rhi_global_image_removed" in rhi_rebind and "image.header = NULL" in rhi_rebind and "g_lifecycle_generation" in rhi_rebind, "dlclose must invalidate stale identity and generation before address reuse")
+        require("g_writer_lock" in rhi_rebind and "info.is_submap" in rhi_rebind and "_Alignof(uintptr_t)" in rhi_rebind and "rhi_transaction_image_snapshot_stable(transaction)" in rhi_rebind, "writer must serialize, identity-revalidate and validate whole leaf pages before atomic writes")
+        require("if (start == end) return RHI_REBIND_COMPLETE" in rhi_rebind and "slot_count == 0" not in rhi_rebind[rhi_rebind.find("rhi_rebind_transaction_all_hooks_prepared"):], "zero current sites must be a valid monitored session, not a fabricated failed hook")
+        require("litehook_rebind_symbol(" not in hider, "hider must not call LiteHook's result-less rebind API")
+        require("litehook_rebind_symbol(" not in roothider_main, "selected loader fallback must not call LiteHook's result-less rebind API")
+        require("rhi_hider_hook_session_hook_is_active" in hider and "rhi_hider_hook_session_start" in hider_hook_session, "dlsym advertisement must consult verified per-hook session state")
+        require("roothide_hidden_tweak_hooks_ready" in roothider_main and "roothide_hidden_tweak_hooks_ready" in main, "selected tweak progress must be gated on a verified dyld hook transaction")
+        require(
+            "rhi_rebind_transaction_hook_is_active(gHiddenTweakFallbackTransaction, \"dlopen\")" in roothider_main
+            or "rhi_rebind_transaction_hook_is_active(transaction, \"dlopen\")" in roothider_main,
+            "selected readiness must query the live fallback transaction rather than a cached ACTIVE bit",
+        )
+        require("hider_strict_hook_is_ready" in hider and "hider_strict_hooks_ready" in hider, "strict replacements must forward once their own session or core view loses verification")
+        require("unverified; refusing transaction before mutation" in roothider_main, "private dyld vtable must refuse absent ABI proof")
+
+        raw_vtable_call = main.find("dyld_hook_routine(*gDyldPtr")
+        hidden_guard = main.rfind("if (!gHiddenInjection)", 0, raw_vtable_call)
+        require(raw_vtable_call >= 0 and hidden_guard >= 0, "raw gDyld mutation must remain guarded to non-hidden legacy mode")
+
+        active = HookFixture("one", HookState.ACTIVE, "h_one")
+        missing = HookFixture("two", HookState.NOT_ATTEMPTED, "h_two")
+        require(session_ready(True, [active]), "required session with all verified hooks must be ready")
+        require(not session_ready(True, [active, missing]), "required multi-hook session must reject missing hook slots before READY")
+        require(not session_ready(True, [HookFixture("one", HookState.PARTIAL, "h_one")]), "required partial transaction must never become ready")
+        require(session_ready(False, [active]), "one-hook optional strict session may be ready independently")
+        require("rhi_rebind_transaction_all_hooks_prepared" in hider_hook_session and "rhi_rebind_transaction_all_hooks_active" in hider_hook_session, "required session must demand every hook at prepare and ready time")
+
+    check("result_aware_rebind_production_contract", check_result_aware_rebind_contract)
 
     def check_dlsym_fixture() -> None:
         dlsym = DlsymDouble()
@@ -605,22 +783,51 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         require(dlsym.lookup("RTLD_DEFAULT", "missing") is None, "missing symbol must return NULL")
         require(dlsym.dlerror() == "symbol not found: missing", "missing symbol must set dlerror")
         require(dlsym.dlerror() is None, "dlerror must consume the pending error")
+        require(
+            dlsym.lookup("handle-a", "remapped", {"remapped": "h_remapped"}) == "h_remapped",
+            "active policy remap must succeed independent of the original handle lookup",
+        )
+        require(dlsym.dlerror() is None, "remapped success must clear the failed original lookup error")
+        require(dlsym.lookup("RTLD_DEFAULT", "hidden") is None, "hidden resolved result must be denied")
+        require(dlsym.dlerror() == "symbol not found: hidden", "denied result must use dlsym-shaped error")
+        require(dlsym.dlerror() is None, "denied result error must be one-shot")
+        require(dlsym.lookup("RTLD_DEFAULT", None) is None, "NULL symbol must delegate safely")
+        require(dlsym.dlerror() == "stock invalid symbol", "NULL symbol must not manufacture a hidden-result error")
+
+        worker_result: list[str | None] = []
+
+        def denied_in_worker() -> None:
+            require(dlsym.lookup("RTLD_DEFAULT", "hidden") is None, "worker hidden result must be denied")
+            worker_result.append(dlsym.dlerror())
+            worker_result.append(dlsym.dlerror())
+
+        worker = threading.Thread(target=denied_in_worker)
+        worker.start()
+        worker.join()
+        require(worker_result == ["symbol not found: hidden", None], "denied error must stay thread-local and one-shot")
+        require(dlsym.dlerror() is None, "worker denial must not poison caller thread")
 
     check("dlsym_handle_next_dlerror_fixture", check_dlsym_fixture)
 
     def check_dlsym_source_contract() -> None:
         require("orig_dlsym(handle, symbol)" in hider, "h_dlsym must preserve the original lookup path")
         require("hidden_dylib_hider_dlsym_remap" in main or "hidden_dylib_hider_dlsym_remap" in hider, "remap must have a caller")
+        require("static char *h_dlerror(void)" in hider and "orig_dlerror" in hider, "synthetic dlsym denials require a hooked dlerror")
+        require("_Thread_local" in hider and "g_dlsym_error_pending" in hider, "dlsym denial state must be thread-local")
+        require('"symbol not found: %s"' in hider, "denied result must use dlsym-shaped error text")
+        require("if (!symbol)" in hider, "NULL symbols must remain on the original dlsym path")
+        require("(void)orig_dlerror()" in hider, "remapped success must consume stale original error state")
+        require('{ "dlerror", (void *)dlerror, (void *)h_dlerror }' in hider, "dlerror must be part of the core transaction")
+        require('{ "dlerror",                               (void *)h_dlerror' in hider, "dlsym(dlerror) must agree with the GOT hook")
 
     check("dlsym_production_static_contract", check_dlsym_source_contract)
 
-    if "dlerror" not in hider[hider.index("static void *h_dlsym"):hider.index("static void *h_dlsym") + 1200]:
-        known_gaps.append({
-            "id": "dlsym-error-shape",
-            "severity": "medium",
-            "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
-            "detail": "the h_dlsym path has no explicit aligned dlerror handling for remap refusal or NULL results.",
-        })
+    known_gaps.append({
+        "id": "dlsym-caller-relative-handle-semantics",
+        "severity": "medium",
+        "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
+        "detail": "RTLD_NEXT/RTLD_SELF are delegated through the h_dlsym frame; caller-relative lookup has not been implemented or device-validated.",
+    })
 
     def check_sysctl_fixture() -> None:
         sysctl = SysctlDouble()
@@ -659,19 +866,29 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     def check_directory_fixture() -> None:
         directory = DirectoryDouble()
         directory.open("dir-1", "/allowed/dir")
-        require(directory.classify("dir-1") == "/allowed/dir", "open must register directory state")
+        path, errno_after = directory.classify("dir-1", errno=11)
+        require(path == "/allowed/dir" and errno_after == 11, "fresh path resolution must preserve errno")
         directory.rename_or_rebind("dir-1", "/restricted/dir")
-        require(directory.classify("dir-1") == "/restricted/dir", "classification must resolve fresh path state")
+        path, errno_after = directory.classify("dir-1", errno=35)
+        require(path == "/restricted/dir" and errno_after == 35, "classification must resolve current descriptor path")
+        path, errno_after = directory.classify("dir-1", errno=6, available=False)
+        require(path is None and errno_after == 6, "unavailable path resolution must fail open without changing errno")
         directory.close("dir-1")
-        require(directory.classify("dir-1") is None, "close must unregister before token reuse")
+        path, errno_after = directory.classify("dir-1", errno=22)
+        require(path is None and errno_after == 22, "close must not leave retained directory classification")
         directory.open("dir-1", "/new/allowed")
-        require(directory.classify("dir-1") == "/new/allowed", "reused directory token must not inherit stale state")
+        path, _ = directory.classify("dir-1", errno=0)
+        require(path == "/new/allowed", "reused directory token must resolve only its current path")
 
     check("directory_pointer_reuse_fresh_path_fixture", check_directory_fixture)
 
     def check_directory_source_contract() -> None:
-        for symbol in ("h_opendir", "h_readdir", "h_closedir", "register_dir_filter", "lookup_dir_filter", "unregister_dir_filter"):
+        for symbol in ("h_opendir", "h_readdir", "h_closedir", "dir_filter_kind_for_dir"):
             require(symbol in hider, f"directory symbol missing: {symbol}")
+        require("dirfd(dirp)" in hider and "fcntl(fd, F_GETPATH, path)" in hider, "readdir must classify each live DIR descriptor via F_GETPATH")
+        require("const int saved_errno = errno" in hider and "errno = saved_errno" in hider, "directory path resolution must preserve errno")
+        for obsolete in ("register_dir_filter", "lookup_dir_filter", "unregister_dir_filter", "g_dir_filters", "g_dir_filter_lock"):
+            require(obsolete not in hider, f"obsolete DIR state must be removed: {obsolete}")
 
     check("directory_production_static_contract", check_directory_source_contract)
 
@@ -682,20 +899,8 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     opendir_body = hider[opendir_start:hider.index("static struct dirent *h_readdir", opendir_start)]
     closedir_start = closedir_match.start()
     closedir_body = hider[closedir_start:hider.index("static int h_sysctlbyname", closedir_start)]
-    if "register_dir_filter(dirp" in opendir_body and "dir_filter_kind_for_path(path)" in opendir_body:
-        known_gaps.append({
-            "id": "directory-open-time-classification",
-            "severity": "medium",
-            "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
-            "detail": "directory filtering captures a category at opendir time instead of resolving the current fd/DIR path for each decision.",
-        })
-    if "caller_is_hidden(ra)" in closedir_body and closedir_body.index("caller_is_hidden(ra)") < closedir_body.index("unregister_dir_filter"):
-        known_gaps.append({
-            "id": "hidden-closedir-state-leak",
-            "severity": "medium",
-            "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
-            "detail": "the hidden-caller early return bypasses unregister_dir_filter, allowing stale DIR pointer state.",
-        })
+    require("dir_filter_kind_for_dir" not in opendir_body, "opendir must not capture a directory category")
+    require("g_dir_filter" not in closedir_body and "unregister_dir_filter" not in closedir_body, "closedir must remain ownership-neutral")
 
     def check_task_snapshot_coherence_contract() -> None:
         require("RHI_TASK_SNAPSHOT_GENERATION_LIMIT" not in hider, "snapshot generations must not have a detector-controlled fixed cap")

@@ -13,8 +13,11 @@
 #include <mach-o/fat.h>
 #include <mach/machine.h>
 #include <libkern/OSByteOrder.h>
+#include <stdatomic.h>
 
 #include <litehook.h>
+
+#include "rhi_rebind.h"
 
 #include "common.h"
 #include "envbuf.h"
@@ -26,11 +29,19 @@
 const char* HOOK_DYLIB_PATH = NULL;
 
 bool dyld_patch_fallback_enabled = false;
-bool dlopen_fallback_hook_installed = false;
+/*
+ * This flag is read by hidden_dylib_hider.c from dlsym paths that may run
+ * concurrently with selected-tweak initialization or a late-image failure.
+ * Keep the advertisement publication atomic and release it only after the
+ * transaction pointer and predecessor have been published.
+ */
+atomic_bool dlopen_fallback_hook_installed = false;
 static bool gHiddenTweakAllowMode = true;
 static size_t gHiddenTweakNameCount = 0;
 static char **gHiddenTweakNames = NULL;
-static bool gHiddenTweakHooksInstalled = false;
+static atomic_bool gHiddenTweakHooksInstalled = false;
+static atomic_int gHiddenTweakHookState = RHI_HOOK_NOT_ATTEMPTED;
+static _Atomic(rhi_rebind_transaction_t *) gHiddenTweakFallbackTransaction = NULL;
 static char *gHiddenTweakModeString = NULL;
 static char *gHiddenTweakListString = NULL;
 
@@ -1092,6 +1103,10 @@ fail:
 
 static bool hidden_tweak_prepare_runtime(bool minimalRuntime)
 {
+	if (!roothide_hidden_tweak_hooks_ready()) {
+		root_hide_hidden_whitelist_log("selected tweak prepare blocked: dyld transaction is no longer verified");
+		return false;
+	}
 	if (!hidden_tweak_preflight_selected_binaries()) {
 		root_hide_hidden_whitelist_log("selected tweak prepare blocked state=%s", hidden_tweak_load_state_name(gHiddenTweakLoadState));
 		return false;
@@ -1157,6 +1172,13 @@ static bool hidden_tweak_verified_loaded_image_seam(const char *path)
 
 bool roothide_hidden_tweak_load_selected(void)
 {
+	if (!roothide_hidden_tweak_hooks_ready()) {
+		gHiddenTweakLoadState = gHiddenTweakAnyDlopenSucceeded ?
+			HIDDEN_TWEAK_LOAD_PARTIAL : HIDDEN_TWEAK_LOAD_FAILED;
+		root_hide_hidden_whitelist_log("selected tweak load blocked: dyld transaction is no longer verified state=%s",
+			hidden_tweak_load_state_name(gHiddenTweakLoadState));
+		return false;
+	}
 	if (gHiddenTweakLoadState == HIDDEN_TWEAK_LOAD_NOT_ATTEMPTED) {
 		// Keep this public entry point safe for future callers: it may not load
 		// selected tweaks until both the binaries and runtime support set passed
@@ -1177,6 +1199,13 @@ bool roothide_hidden_tweak_load_selected(void)
 		gHiddenTweakListString ?: "(null)");
 
 	for (size_t i = 0; i < gHiddenTweakLoadPlanCount; i++) {
+		if (!roothide_hidden_tweak_hooks_ready()) {
+			gHiddenTweakLoadState = gHiddenTweakAnyDlopenSucceeded ?
+				HIDDEN_TWEAK_LOAD_PARTIAL : HIDDEN_TWEAK_LOAD_FAILED;
+			root_hide_hidden_whitelist_log("selected tweak load stopped: dyld transaction invalidated state=%s",
+				hidden_tweak_load_state_name(gHiddenTweakLoadState));
+			return false;
+		}
 		HiddenTweakBinary *binary = &gHiddenTweakBinaries[gHiddenTweakLoadPlan[i]];
 		if (binary->state != HIDDEN_TWEAK_LOAD_PREPARED) {
 			gHiddenTweakLoadState = gHiddenTweakAnyDlopenSucceeded ? HIDDEN_TWEAK_LOAD_PARTIAL : HIDDEN_TWEAK_LOAD_UNKNOWN;
@@ -1212,6 +1241,13 @@ bool roothide_hidden_tweak_load_selected(void)
 		}
 
 		gHiddenTweakAnyDlopenSucceeded = true;
+		if (!roothide_hidden_tweak_hooks_ready()) {
+			binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
+			gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
+			root_hide_hidden_whitelist_log("selected tweak dlopen invalidated dyld transaction binary=%s",
+				binary->name);
+			return false;
+		}
 		if (!hidden_tweak_store_loaded_library(binary->path, handle)) {
 			binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
 			gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
@@ -1721,33 +1757,38 @@ bool dyld_dlopen_preflight_hook(void *dyld, const char* path)
 	__attribute__((musttail)) return dyld_dlopen_preflight_orig(dyld, path);
 }
 
-int hook_dyld_routine(void **dyld, int idx, void *hook, void **orig, uint16_t pacSalt)
+/*
+ * The dyld4 gDyld vtable is private ABI.  The historical code blindly wrote
+ * four hard-coded indexes and then called that success.  We have no supported
+ * way to prove the table span and PAC discriminator layout for every dyld
+ * revision from this process, so it is deliberately treated as an
+ * unsupported transaction rather than risking a partially-written vtable.
+ * The result-aware import-slot fallback below remains available when it can
+ * prepare and verify every target slot.
+ */
+static rhi_rebind_result_t prepare_dyld_vtable_transaction(void ***gDyldPtr)
 {
-	if (!dyld) return -1;
-
-	uint64_t dyldPacDiversifier = ((uint64_t)dyld & ~(0xFFFFull << 48)) | (0x63FAull << 48);
-	void **dyldFuncPtrs = ptrauth_auth_data(*dyld, ptrauth_key_process_independent_data, dyldPacDiversifier);
-	if (!dyldFuncPtrs) return -1;
-
-	if (vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ | VM_PROT_WRITE) == 0) {
-		uint64_t location = (uint64_t)&dyldFuncPtrs[idx];
-		uint64_t pacDiversifier = (location & ~(0xFFFFull << 48)) | ((uint64_t)pacSalt << 48);
-
-		*orig = ptrauth_auth_and_resign(dyldFuncPtrs[idx], ptrauth_key_process_independent_code, pacDiversifier, ptrauth_key_function_pointer, 0);
-		dyldFuncPtrs[idx] = ptrauth_auth_and_resign(hook, ptrauth_key_function_pointer, 0, ptrauth_key_process_independent_code, pacDiversifier);
-		vm_protect(mach_task_self_, (mach_vm_address_t)&dyldFuncPtrs[idx], sizeof(void *), false, VM_PROT_READ);
-		return 0;
+	if (gDyldPtr) {
+		root_hide_hidden_whitelist_log("dyld4 vtable layout unverified; refusing transaction before mutation");
 	}
-
-	return -1;
+	return RHI_REBIND_NONE;
 }
 
 // iOS 15 / dyld3 fallback: GOT-rebound dlopen hook with standard C signature.
 // litehook_rebind_symbol replaces the GOT entry for dlopen in all loaded images,
 // so the original dlopen address stays valid through the DSC.
-void *(*dlopen_fallback_orig)(const char *, int) = NULL;
+/* Captured before the first replacement write; atomic so a replacement that
+ * becomes reachable during commit cannot race this publication. */
+static _Atomic(void *(*)(const char *, int)) dlopen_fallback_orig = NULL;
 void *dlopen_fallback_hook(const char *path, int mode)
 {
+	/* A late image can invalidate this physical GOT replacement. Forward via
+	 * the published predecessor instead of retaining a stale success bit. */
+	if (!roothide_hidden_tweak_hooks_ready()) {
+		void *(*predecessor)(const char *, int) =
+			atomic_load_explicit(&dlopen_fallback_orig, memory_order_acquire);
+		return predecessor ? predecessor(path, mode) : NULL;
+	}
 	bool shouldBlock = path && hidden_tweak_filter_should_block_path(path);
 	if (path && (shouldBlock || hidden_tweak_filter_applies_to_path(path) || strstr(path, "/usr/lib/TweakLoader.dylib"))) {
 		root_hide_hidden_whitelist_log("dlopen mode=%d %s path=%s", mode, shouldBlock ? "block" : "allow", path);
@@ -1758,33 +1799,141 @@ void *dlopen_fallback_hook(const char *path, int mode)
 	if (path && !(mode & RTLD_NOLOAD)) {
 		jbclient_trust_library_recurse(path, __builtin_return_address(0));
 	}
-	return dlopen_fallback_orig(path, mode);
+	void *(*predecessor)(const char *, int) =
+		atomic_load_explicit(&dlopen_fallback_orig, memory_order_acquire);
+	return predecessor ? predecessor(path, mode) : NULL;
 }
 
 void init_dyldhooks()
 {
-	if (gHiddenTweakHooksInstalled) {
+	if (atomic_load_explicit(&gHiddenTweakHooksInstalled, memory_order_acquire) &&
+	    roothide_hidden_tweak_hooks_ready()) {
+		return;
+	}
+	rhi_hook_state_t current_state = (rhi_hook_state_t)
+		atomic_load_explicit(&gHiddenTweakHookState, memory_order_acquire);
+	if (current_state != RHI_HOOK_NOT_ATTEMPTED) {
+		return;
+	}
+	/* Claim initialization exactly once.  This is intentionally lock-free:
+	 * init can be reached through a dyld/dlopen path where a mutex would
+	 * recurse.  PREPARED is the in-progress and no-retry publication state. */
+	int expected_state = RHI_HOOK_NOT_ATTEMPTED;
+	if (!atomic_compare_exchange_strong_explicit(&gHiddenTweakHookState,
+	                                             &expected_state,
+	                                             RHI_HOOK_PREPARED,
+	                                             memory_order_acq_rel,
+	                                             memory_order_acquire)) {
 		return;
 	}
 
-	// Apply dyld hooks — try dyld4 vtable first (iOS 16+), fall back to GOT rebinding (iOS 15)
+	// First attempt the private dyld4 route only if it can be transactionally proven.
 	void ***gDyldPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gDyldE");
-	if (gDyldPtr) {
-		hook_dyld_routine(*gDyldPtr, 14, (void *)&dyld_dlopen_hook, (void **)&dyld_dlopen_orig, 0xBF31);
-		hook_dyld_routine(*gDyldPtr, 18, (void *)&dyld_dlopen_preflight_hook, (void **)&dyld_dlopen_preflight_orig, 0xB1B6);
-		hook_dyld_routine(*gDyldPtr, 97, (void *)&dyld_dlopen_from_hook, (void **)&dyld_dlopen_from_orig, 0xD48C);
-		hook_dyld_routine(*gDyldPtr, 98, (void *)&dyld_dlopen_audited_hook, (void **)&dyld_dlopen_audited_orig, 0xD2A5);
-		dlopen_fallback_hook_installed = false;
-		gHiddenTweakHooksInstalled = true;
-	} else {
-		// iOS 15 / dyld3 fallback: rebind dlopen in GOT of all loaded images.
-		// Save the real dlopen pointer before rebinding.
-		dlopen_fallback_orig = dlopen;
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlopen, dlopen_fallback_hook,
-		                       NULL);
-		dlopen_fallback_hook_installed = true;
-		gHiddenTweakHooksInstalled = true;
+	rhi_rebind_result_t vtable_result = prepare_dyld_vtable_transaction(gDyldPtr);
+	if (vtable_result == RHI_REBIND_COMPLETE) {
+		/* No current implementation reaches this branch without ABI proof.  A
+		 * vtable result has no published transaction/session for the readiness
+		 * API, so never advertise it as a successful selected hook. */
+		atomic_store_explicit(&dlopen_fallback_hook_installed, false, memory_order_release);
+		atomic_store_explicit(&gHiddenTweakHooksInstalled, false, memory_order_release);
+		atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_FAILED, memory_order_release);
+		return;
 	}
+	if (vtable_result == RHI_REBIND_PARTIAL || vtable_result == RHI_REBIND_UNKNOWN) {
+		rhi_hook_state_t state = vtable_result == RHI_REBIND_PARTIAL ?
+			RHI_HOOK_PARTIAL : RHI_HOOK_UNKNOWN;
+		atomic_store_explicit(&gHiddenTweakHookState, state, memory_order_release);
+		root_hide_hidden_whitelist_log("dyld vtable transaction %s; no fallback after mutation",
+			vtable_result == RHI_REBIND_PARTIAL ? "partial" : "unknown");
+		return;
+	}
+
+	/* iOS 15/dyld3 compatible path: verified global GOT transaction for dlopen. */
+	rhi_rebind_transaction_t *transaction = rhi_rebind_transaction_create();
+	if (!transaction) {
+		atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_FAILED, memory_order_release);
+		return;
+	}
+	const rhi_rebind_spec_t fallback_spec = {
+		"dlopen", (void *)dlopen, (void *)dlopen_fallback_hook,
+	};
+	if (!rhi_rebind_transaction_prepare_global(transaction,
+	                                           &fallback_spec, 1)) {
+		rhi_hook_state_t state = rhi_rebind_transaction_state(transaction);
+		atomic_store_explicit(&gHiddenTweakHookState, state, memory_order_release);
+		root_hide_hidden_whitelist_log("dyld dlopen fallback prepare %s",
+			rhi_hook_state_name(state));
+		return;
+	}
+	/* Publish the captured predecessor before a replacement becomes reachable. */
+	void *(*predecessor)(const char *, int) = (void *(*)(const char *, int))
+		rhi_rebind_transaction_original(transaction, 0);
+	if (!predecessor) {
+		atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_FAILED, memory_order_release);
+		return;
+	}
+	atomic_store_explicit(&dlopen_fallback_orig, predecessor, memory_order_release);
+	rhi_rebind_result_t fallback_result =
+		rhi_rebind_transaction_commit(transaction);
+	if (fallback_result != RHI_REBIND_COMPLETE ||
+	    !rhi_rebind_transaction_activate_global(transaction)) {
+		rhi_hook_state_t state = rhi_rebind_transaction_state(transaction);
+		atomic_store_explicit(&gHiddenTweakHookState, state, memory_order_release);
+		root_hide_hidden_whitelist_log("dyld dlopen fallback %s",
+			rhi_hook_state_name(state));
+		return;
+	}
+	/* The transaction is process-lifetime after activation. Publish it before
+	 * the readiness and dlsym advertisement flags, so no reader can observe a
+	 * true flag with a missing/partially initialized transaction. */
+	atomic_store_explicit(&gHiddenTweakFallbackTransaction, transaction, memory_order_release);
+	atomic_store_explicit(&dlopen_fallback_hook_installed, true, memory_order_release);
+	atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_ACTIVE, memory_order_release);
+	/* This is the single publication point. Its release pairs with the first
+	 * acquire in readiness, making the pointer, predecessor, state and dlsym
+	 * advertisement visible as one completed installation. */
+	atomic_store_explicit(&gHiddenTweakHooksInstalled, true, memory_order_release);
+}
+
+bool roothide_hidden_tweak_hooks_ready(void)
+{
+	const bool installed = atomic_load_explicit(&gHiddenTweakHooksInstalled, memory_order_acquire);
+	/* False includes both the ordinary pre-publication window and a terminal
+	 * invalidation. Do not mutate other fields merely because a reader raced the
+	 * initializer before its final release store. */
+	if (!installed) return false;
+	const bool fallback_advertised = atomic_load_explicit(
+		&dlopen_fallback_hook_installed, memory_order_acquire);
+	const rhi_hook_state_t published_state = (rhi_hook_state_t)
+		atomic_load_explicit(&gHiddenTweakHookState, memory_order_acquire);
+	/* Load the pointer only after the release-published state/flag.  A missing
+	 * pointer is always a fail-closed result; the pointer is never destroyed
+	 * after publication, so this acquire also keeps the transaction readable. */
+	rhi_rebind_transaction_t *transaction = atomic_load_explicit(
+		&gHiddenTweakFallbackTransaction, memory_order_acquire);
+	if (!fallback_advertised || published_state != RHI_HOOK_ACTIVE || !transaction) {
+		/* Once the final installed flag was acquired, an incomplete tuple is a
+		 * real one-way invalidation rather than an initialization race. */
+		atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_FAILED, memory_order_release);
+		atomic_store_explicit(&gHiddenTweakHooksInstalled, false, memory_order_release);
+		atomic_store_explicit(&dlopen_fallback_hook_installed, false, memory_order_release);
+		return false;
+	}
+	const rhi_hook_state_t live_state =
+		rhi_rebind_transaction_state(transaction);
+	if (live_state != RHI_HOOK_ACTIVE ||
+	    !rhi_rebind_transaction_hook_is_active(transaction, "dlopen")) {
+		/* A physical GOT replacement may remain after a failed late-image
+		 * transaction.  This one-way gate is used by both the wrapper and the
+		 * selected-loader progress path, so stale state is never advertised. */
+		rhi_hook_state_t invalidated_state = live_state == RHI_HOOK_ACTIVE ?
+			RHI_HOOK_FAILED : live_state;
+		atomic_store_explicit(&gHiddenTweakHookState, invalidated_state, memory_order_release);
+		atomic_store_explicit(&gHiddenTweakHooksInstalled, false, memory_order_release);
+		atomic_store_explicit(&dlopen_fallback_hook_installed, false, memory_order_release);
+		return false;
+	}
+	return true;
 }
 
 extern struct mach_header __dso_handle;

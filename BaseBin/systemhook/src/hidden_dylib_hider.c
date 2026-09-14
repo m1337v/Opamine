@@ -35,8 +35,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <dirent.h>
+#include <stdio.h>
 #include <strings.h>
 
 #include "common.h"
@@ -44,21 +46,17 @@
 #include "hider_internal.h"
 #include "hider_identity.h"
 #include "hider_caller_policy.h"
+#include "hider_hook_session.h"
 
 // From roothider_main.c — non-static after our edit
 extern bool hidden_tweak_filter_should_block_path(const char *path);
 extern bool dyld_patch_fallback_enabled;
-extern bool dlopen_fallback_hook_installed;
+extern atomic_bool dlopen_fallback_hook_installed;
 extern void *dlopen_fallback_hook(const char *path, int mode);
+extern bool roothide_hidden_tweak_hooks_ready(void);
 
 // dyld private — always available, NOT hooked by us
 extern const char *dyld_image_path_containing_address(const void *addr);
-
-// From litehook
-extern kern_return_t litehook_hook_function(void *source, void *target);
-typedef struct mach_header mach_header_u;
-#define LITEHOOK_REBIND_GLOBAL NULL
-extern void litehook_rebind_symbol(const mach_header_u *targetHeader, void *replacee, void *replacement, bool (*exceptionFilter)(const mach_header_u *header));
 
 // ObjC runtime functions we hook via GOT rebinding
 extern const char *class_getImageName(Class cls);
@@ -66,10 +64,11 @@ extern Class *objc_copyClassList(unsigned int *outCount);
 extern const char * _Nonnull * objc_copyImageNames(unsigned int *outCount);
 extern const char * _Nonnull * objc_copyClassNamesForImage(const char *image, unsigned int *outCount);
 
-// Saved original function pointers — set before rebinding, stay valid because
-// litehook_rebind_symbol only patches GOT entries, the DSC functions are intact.
+// Saved original function pointers — published before any import-slot write.
+// The new backend changes callers' slots, not the DSC function bodies.
 static int (*orig_dladdr)(const void *, Dl_info *) = NULL;
 static void *(*orig_dlsym)(void *, const char *) = NULL;
+static char *(*orig_dlerror)(void) = NULL;
 static uint32_t (*orig_dyld_image_count)(void) = NULL;
 static const char *(*orig_dyld_get_image_name)(uint32_t) = NULL;
 static const struct mach_header *(*orig_dyld_get_image_header)(uint32_t) = NULL;
@@ -113,6 +112,7 @@ static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
                                   task_info_t info_out, mach_msg_type_number_t *cnt);
 static int h_dladdr(const void *addr, Dl_info *info);
 static void *h_dlsym(void *handle, const char *symbol);
+static char *h_dlerror(void);
 static const char *h_class_getImageName(Class cls);
 static Class *h_objc_copyClassList(unsigned int *outCount);
 static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount);
@@ -248,15 +248,6 @@ typedef enum {
 	DIR_FILTER_PREBOOT_HASH_ROOT,
 } dir_filter_kind_t;
 
-typedef struct dir_filter_entry {
-	DIR *dirp;
-	dir_filter_kind_t kind;
-	struct dir_filter_entry *next;
-} dir_filter_entry_t;
-
-static dir_filter_entry_t *g_dir_filters = NULL;
-static os_unfair_lock g_dir_filter_lock = OS_UNFAIR_LOCK_INIT;
-
 static bool path_is_preboot_root(const char *path) {
 	return path && (!strcmp(path, "/private/preboot") || !strcmp(path, "/private/preboot/"));
 }
@@ -289,53 +280,27 @@ static dir_filter_kind_t dir_filter_kind_for_path(const char *path) {
 	return DIR_FILTER_NONE;
 }
 
-static void register_dir_filter(DIR *dirp, dir_filter_kind_t kind) {
-	if (!dirp || kind == DIR_FILTER_NONE) {
-		return;
+/* A DIR* is not a stable path identity: libc may recycle the pointer and a
+ * directory may be renamed after opendir.  Resolve the descriptor on every
+ * external readdir decision instead of retaining process-global DIR state.
+ * F_GETPATH is intentionally best-effort; sandboxed or unusual descriptors
+ * simply keep stock readdir behavior. */
+static bool dir_filter_kind_for_dir(DIR *dirp, dir_filter_kind_t *kind_out) {
+	if (!dirp || !kind_out) {
+		return false;
 	}
 
-	dir_filter_entry_t *entry = calloc(1, sizeof(*entry));
-	if (!entry) {
-		return;
+	const int saved_errno = errno;
+	const int fd = dirfd(dirp);
+	char path[PATH_MAX];
+	if (fd < 0 || fcntl(fd, F_GETPATH, path) != 0) {
+		errno = saved_errno;
+		return false;
 	}
 
-	entry->dirp = dirp;
-	entry->kind = kind;
-
-	os_unfair_lock_lock(&g_dir_filter_lock);
-	entry->next = g_dir_filters;
-	g_dir_filters = entry;
-	os_unfair_lock_unlock(&g_dir_filter_lock);
-}
-
-static dir_filter_kind_t lookup_dir_filter(DIR *dirp) {
-	dir_filter_kind_t kind = DIR_FILTER_NONE;
-
-	os_unfair_lock_lock(&g_dir_filter_lock);
-	for (dir_filter_entry_t *entry = g_dir_filters; entry; entry = entry->next) {
-		if (entry->dirp == dirp) {
-			kind = entry->kind;
-			break;
-		}
-	}
-	os_unfair_lock_unlock(&g_dir_filter_lock);
-
-	return kind;
-}
-
-static void unregister_dir_filter(DIR *dirp) {
-	os_unfair_lock_lock(&g_dir_filter_lock);
-	dir_filter_entry_t **cursor = &g_dir_filters;
-	while (*cursor) {
-		if ((*cursor)->dirp == dirp) {
-			dir_filter_entry_t *entry = *cursor;
-			*cursor = entry->next;
-			free(entry);
-			break;
-		}
-		cursor = &(*cursor)->next;
-	}
-	os_unfair_lock_unlock(&g_dir_filter_lock);
+	*kind_out = dir_filter_kind_for_path(path);
+	errno = saved_errno;
+	return true;
 }
 
 static bool preboot_root_entry_should_hide(const char *name) {
@@ -416,24 +381,57 @@ typedef enum {
 	HIDER_STATE_UNINITIALIZED = 0,
 	HIDER_STATE_INITIALIZING,
 	HIDER_STATE_READY,
+	HIDER_STATE_FAILED,
 } hider_state_t;
 
 static atomic_uint g_init_state;
 static atomic_uint g_strict_state;
 
-static bool hider_is_ready(void) {
-	return atomic_load_explicit(&g_init_state, memory_order_acquire) == HIDER_STATE_READY;
-}
-
-static bool hider_strict_hooks_ready(void) {
-	return atomic_load_explicit(&g_strict_state, memory_order_acquire) == HIDER_STATE_READY;
-}
 static bool g_hook_objc_runtime_enabled = true;
 static bool g_hook_objc_copy_class_list_enabled = true;
 static bool g_hook_url_schemes_enabled = true;
 static bool g_hook_environment_enabled = true;
 static bool g_hook_filesystem_enabled = true;
 static bool g_hook_directory_enabled = true;
+static bool g_url_scheme_hooks_active = false;
+
+/* Core is one all-or-nothing concealment view; strict hooks stay independent. */
+static rhi_hider_hook_session_t g_core_hook_session = { .name = "hider-core", .required = true };
+static rhi_hider_hook_session_t g_strict_class_image_session = { .name = "strict-class-image" };
+static rhi_hider_hook_session_t g_strict_copy_images_session = { .name = "strict-copy-images" };
+static rhi_hider_hook_session_t g_strict_copy_names_session = { .name = "strict-copy-names" };
+static rhi_hider_hook_session_t g_strict_copy_class_list_session = { .name = "strict-copy-class-list" };
+static rhi_hider_hook_session_t g_strict_add_load_session = { .name = "strict-add-load" };
+static rhi_hider_hook_session_t g_strict_getenv_session = { .name = "strict-getenv" };
+static rhi_hider_hook_session_t g_strict_access_session = { .name = "strict-access" };
+static rhi_hider_hook_session_t g_strict_stat_session = { .name = "strict-stat" };
+static rhi_hider_hook_session_t g_strict_lstat_session = { .name = "strict-lstat" };
+static rhi_hider_hook_session_t g_strict_fopen_session = { .name = "strict-fopen" };
+static rhi_hider_hook_session_t g_strict_opendir_session = { .name = "strict-opendir" };
+static rhi_hider_hook_session_t g_strict_readdir_session = { .name = "strict-readdir" };
+static rhi_hider_hook_session_t g_strict_closedir_session = { .name = "strict-closedir" };
+
+static bool hider_is_ready(void) {
+	return atomic_load_explicit(&g_init_state, memory_order_acquire) == HIDER_STATE_READY &&
+	       rhi_hider_hook_session_is_ready(&g_core_hook_session);
+}
+
+static bool hider_strict_hooks_ready(void) {
+	return hider_is_ready() &&
+	       atomic_load_explicit(&g_strict_state, memory_order_acquire) == HIDER_STATE_READY;
+}
+
+/* Optional hooks are physically left in place after a late-image failure: a
+ * guessed rollback is unsafe once arbitrary constructors can execute.  Each
+ * replacement therefore consults its own live transaction state and forwards
+ * stock behavior as soon as that component (or the linked core view) is no
+ * longer verified. */
+static bool hider_strict_hook_is_ready(const rhi_hider_hook_session_t *session,
+	                                  const char *symbol)
+{
+	return hider_strict_hooks_ready() &&
+	       rhi_hider_hook_session_hook_is_active(session, symbol);
+}
 
 /*
  * xpcproxy consumes the launchd policy before it bridges the real app. Keep a
@@ -725,6 +723,8 @@ static void on_image_removed(const struct mach_header *mh, intptr_t slide) {
 
 __attribute__((noinline))
 static uint32_t h_image_count(void) {
+	if (!hider_is_ready() && orig_dyld_image_count)
+		return orig_dyld_image_count();
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
@@ -738,6 +738,8 @@ static uint32_t h_image_count(void) {
 
 __attribute__((noinline))
 static const char *h_get_image_name(uint32_t idx) {
+	if (!hider_is_ready() && orig_dyld_get_image_name)
+		return orig_dyld_get_image_name(idx);
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
@@ -752,6 +754,8 @@ static const char *h_get_image_name(uint32_t idx) {
 
 __attribute__((noinline))
 static const struct mach_header *h_get_image_header(uint32_t idx) {
+	if (!hider_is_ready() && orig_dyld_get_image_header)
+		return orig_dyld_get_image_header(idx);
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
@@ -766,6 +770,8 @@ static const struct mach_header *h_get_image_header(uint32_t idx) {
 
 __attribute__((noinline))
 static intptr_t h_get_image_vmaddr_slide(uint32_t idx) {
+	if (!hider_is_ready() && orig_dyld_get_image_vmaddr_slide)
+		return orig_dyld_get_image_vmaddr_slide(idx);
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
@@ -781,6 +787,10 @@ static intptr_t h_get_image_vmaddr_slide(uint32_t idx) {
 __attribute__((noinline))
 static void h_register_func_for_add_image(void (*func)(const struct mach_header *, intptr_t)) {
 	if (!func) return;
+	if (!hider_is_ready() && orig_dyld_register_func_for_add_image) {
+		orig_dyld_register_func_for_add_image(func);
+		return;
+	}
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
@@ -830,6 +840,10 @@ static void h_register_func_for_add_image(void (*func)(const struct mach_header 
 __attribute__((noinline))
 static void h_register_func_for_remove_image(void (*func)(const struct mach_header *, intptr_t)) {
 	if (!func) return;
+	if (!hider_is_ready() && orig_dyld_register_func_for_remove_image) {
+		orig_dyld_register_func_for_remove_image(func);
+		return;
+	}
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
@@ -1183,10 +1197,12 @@ static task_snapshot_generation_t *build_task_snapshot(task_snapshot_result_t *r
 
 __attribute__((noinline))
 static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
-                                 task_info_t info_out, mach_msg_type_number_t *cnt) {
+                                  task_info_t info_out, mach_msg_type_number_t *cnt) {
 	if (!orig_task_info) {
 		return KERN_FAILURE;
 	}
+	if (!hider_is_ready())
+		return orig_task_info(target, flavor, info_out, cnt);
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_task_info(target, flavor, info_out, cnt);
@@ -1237,6 +1253,7 @@ static const void *translate_hook_to_orig(const void *addr) {
 	static const struct { const void *hook; void *const *orig; } map[] = {
 		{ (const void *)h_dladdr,                        (void *const *)&orig_dladdr },
 		{ (const void *)h_dlsym,                         (void *const *)&orig_dlsym },
+		{ (const void *)h_dlerror,                       (void *const *)&orig_dlerror },
 		{ (const void *)h_image_count,                   (void *const *)&orig_dyld_image_count },
 		{ (const void *)h_get_image_name,                (void *const *)&orig_dyld_get_image_name },
 		{ (const void *)h_get_image_header,              (void *const *)&orig_dyld_get_image_header },
@@ -1283,6 +1300,8 @@ static const void *translate_hook_to_orig(const void *addr) {
 
 __attribute__((noinline))
 static int h_dladdr(const void *addr, Dl_info *info) {
+	if (!hider_is_ready())
+		return orig_dladdr ? orig_dladdr(addr, info) : 0;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_dladdr(addr, info);  // tweak caller → full unfiltered result
@@ -1320,25 +1339,63 @@ static int h_dladdr(const void *addr, Dl_info *info) {
 
 void *hidden_dylib_hider_dlsym_remap(const char *name);  // forward decl
 
+/* h_dlsym can manufacture a failure after libdyld successfully resolved an
+ * address in a hidden image. Keep that error local to the probing thread and
+ * consume it exactly once from h_dlerror, matching dlerror's ownership model.
+ * A fixed TLS buffer avoids allocation/re-entry on the loader/error path. */
+#define RHI_DLSYM_ERROR_CAPACITY 512U
+static _Thread_local char g_dlsym_error_message[RHI_DLSYM_ERROR_CAPACITY];
+static _Thread_local bool g_dlsym_error_pending = false;
+
+static void hider_dlsym_clear_pending_error(void) {
+	g_dlsym_error_pending = false;
+}
+
+static void hider_dlsym_set_hidden_result_error(const char *symbol) {
+	if (!symbol) {
+		return;
+	}
+	snprintf(g_dlsym_error_message, sizeof(g_dlsym_error_message),
+	         "symbol not found: %s", symbol);
+	g_dlsym_error_pending = true;
+}
+
 __attribute__((noinline))
 static void *h_dlsym(void *handle, const char *symbol) {
-	void *result = orig_dlsym(handle, symbol);
+	if (!hider_is_ready())
+		return orig_dlsym ? orig_dlsym(handle, symbol) : NULL;
+	if (!orig_dlsym) {
+		return NULL;
+	}
+
+	/* A later loader operation supersedes an unconsumed synthetic denial on
+	 * this same thread. This mirrors the TLS lane used by current Shadow. */
+	hider_dlsym_clear_pending_error();
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
-		return result;  // tweak caller → full access
+		return orig_dlsym(handle, symbol);  // tweak caller → full access
+
+	/* Do not manufacture an error or dereference a NULL symbol. libdyld owns
+	 * the exact invalid-input semantics for this uncommon caller misuse. */
+	if (!symbol) {
+		return orig_dlsym(handle, symbol);
+	}
+
+	void *result = orig_dlsym(handle, symbol);
 
 	// App caller: remap our GOT-hooked functions so dlsym returns
 	// our hook pointer, not the raw DSC address (which would bypass
 	// our GOT hooks if the app caches the pointer).
-	if (symbol) {
-		void *remapped = hidden_dylib_hider_dlsym_remap(symbol);
-		if (remapped) return remapped;
-
-		// Filtered wrapper for ObjC image-load callbacks. Returning NULL here is
-		// risky for Swift callers because objc_addLoadImageFunc is a real API.
-		if (strcmp(symbol, "objc_addLoadImageFunc") == 0)
-			return (void *)h_objc_addLoadImageFunc;
+	void *remapped = hidden_dylib_hider_dlsym_remap(symbol);
+	if (remapped) {
+		/* The original lookup may have failed for a particular handle even
+		 * though the active policy remap succeeds. A successful dlsym must not
+		 * leave that stale libdyld error visible through dlerror. */
+		if (orig_dlerror) {
+			(void)orig_dlerror();
+		}
+		return remapped;
 	}
 
 	// App caller: if the resolved address lives in a hidden image,
@@ -1346,11 +1403,38 @@ static void *h_dlsym(void *handle, const char *symbol) {
 	// without needing a symbol-name blocklist.
 	if (result) {
 		const char *path = dyld_image_path_containing_address(result);
-		if (path && image_path_should_hide(path))
+		if (path && image_path_should_hide(path)) {
+			/* Replace, rather than stack on, libdyld's prior per-thread error.
+			 * After our one-shot denial is consumed, a second dlerror must be NULL. */
+			if (orig_dlerror) (void)orig_dlerror();
+			hider_dlsym_set_hidden_result_error(symbol);
 			return NULL;
+		}
 	}
 
+	/* RTLD_NEXT/RTLD_SELF are delegated to libdyld from this wrapper frame.
+	 * That preserves the platform's normal lookup/error handling as far as
+	 * possible, but is not a caller-relative emulation; do not advertise a
+	 * stronger guarantee until a safe per-image resolver is implemented. */
 	return result;
+}
+
+__attribute__((noinline))
+static char *h_dlerror(void) {
+	if (!hider_is_ready()) {
+		return orig_dlerror ? orig_dlerror() : NULL;
+	}
+
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra)) {
+		return orig_dlerror ? orig_dlerror() : NULL;
+	}
+
+	if (g_dlsym_error_pending) {
+		g_dlsym_error_pending = false;
+		return g_dlsym_error_message;
+	}
+	return orig_dlerror ? orig_dlerror() : NULL;
 }
 
 //------------------------------------------------------------------------------
@@ -1359,6 +1443,8 @@ static void *h_dlsym(void *handle, const char *symbol) {
 __attribute__((noinline))
 static const char *h_class_getImageName(Class cls) {
 	const char *result = orig_class_getImageName(cls);
+	if (!hider_strict_hook_is_ready(&g_strict_class_image_session, "class_getImageName"))
+		return result;
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
@@ -1418,6 +1504,8 @@ static bool class_should_hide_from_app(Class cls) {
 __attribute__((noinline))
 static Class *h_objc_copyClassList(unsigned int *outCount) {
 	Class *result = orig_objc_copyClassList(outCount);
+	if (!hider_strict_hook_is_ready(&g_strict_copy_class_list_session, "objc_copyClassList"))
+		return result;
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra) || !result || !outCount)
@@ -1443,6 +1531,8 @@ static Class *h_objc_copyClassList(unsigned int *outCount) {
 __attribute__((noinline))
 static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount) {
 	const char * _Nonnull *result = orig_objc_copyImageNames(outCount);
+	if (!hider_strict_hook_is_ready(&g_strict_copy_images_session, "objc_copyImageNames"))
+		return result;
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra) || !result || !outCount)
@@ -1478,6 +1568,8 @@ static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount) {
 
 __attribute__((noinline))
 static const char * _Nonnull *h_objc_copyClassNamesForImage(const char *image, unsigned int *outCount) {
+	if (!hider_strict_hook_is_ready(&g_strict_copy_names_session, "objc_copyClassNamesForImage"))
+		return orig_objc_copyClassNamesForImage(image, outCount);
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_objc_copyClassNamesForImage(image, outCount);
@@ -1493,6 +1585,10 @@ static const char * _Nonnull *h_objc_copyClassNamesForImage(const char *image, u
 
 __attribute__((noinline))
 static void h_objc_addLoadImageFunc(objc_func_loadImage func) {
+	if (!hider_strict_hook_is_ready(&g_strict_add_load_session, "objc_addLoadImageFunc")) {
+		if (orig_objc_addLoadImageFunc) orig_objc_addLoadImageFunc(func);
+		return;
+	}
 	if (!func) return;
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
@@ -1595,6 +1691,10 @@ static const char *url_scheme_utf8(id url) {
 
 __attribute__((noinline))
 static BOOL h_UIApplication_canOpenURL(id self, SEL _cmd, id url) {
+	if (!hider_strict_hooks_ready()) {
+		return orig_UIApplication_canOpenURL ?
+			((BOOL (*)(id, SEL, id))orig_UIApplication_canOpenURL)(self, _cmd, url) : NO;
+	}
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra)) {
 		return ((BOOL (*)(id, SEL, id))orig_UIApplication_canOpenURL)(self, _cmd, url);
@@ -1608,6 +1708,10 @@ static BOOL h_UIApplication_canOpenURL(id self, SEL _cmd, id url) {
 
 __attribute__((noinline))
 static BOOL h_UIApplication_openURL(id self, SEL _cmd, id url) {
+	if (!hider_strict_hooks_ready()) {
+		return orig_UIApplication_openURL ?
+			((BOOL (*)(id, SEL, id))orig_UIApplication_openURL)(self, _cmd, url) : NO;
+	}
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra)) {
 		return ((BOOL (*)(id, SEL, id))orig_UIApplication_openURL)(self, _cmd, url);
@@ -1640,6 +1744,11 @@ static void invoke_bool_completion(void *completion, BOOL success) {
 
 __attribute__((noinline))
 static void h_UIApplication_openURL_options_completion(id self, SEL _cmd, id url, id options, void *completion) {
+	if (!hider_strict_hooks_ready()) {
+		if (orig_UIApplication_openURL_options_completion)
+			((void (*)(id, SEL, id, id, void *))orig_UIApplication_openURL_options_completion)(self, _cmd, url, options, completion);
+		return;
+	}
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra)) {
 		((void (*)(id, SEL, id, id, void *))orig_UIApplication_openURL_options_completion)(self, _cmd, url, options, completion);
@@ -1665,6 +1774,7 @@ static void install_url_scheme_hooks(void) {
 		return;
 
 	orig_UIApplication_canOpenURL = method_setImplementation(canOpenURLMethod, (IMP)h_UIApplication_canOpenURL);
+	g_url_scheme_hooks_active = orig_UIApplication_canOpenURL != NULL;
 
 	SEL openURLSel = sel_registerName("openURL:");
 	Method openURLMethod = class_getInstanceMethod(applicationClass, openURLSel);
@@ -1689,6 +1799,8 @@ static void install_url_scheme_hooks(void) {
 
 __attribute__((noinline))
 static pid_t h_fork(void) {
+	if (!hider_is_ready())
+		return orig_fork ? orig_fork() : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_fork();
@@ -1726,6 +1838,8 @@ static void sanitize_mount_entry(struct statfs *fs) {
 
 __attribute__((noinline))
 static int h_getfsstat(struct statfs *buf, int bufsize, int mode) {
+	if (!hider_is_ready())
+		return orig_getfsstat ? orig_getfsstat(buf, bufsize, mode) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_getfsstat(buf, bufsize, mode);
@@ -1767,6 +1881,8 @@ static int h_getfsstat(struct statfs *buf, int bufsize, int mode) {
 
 __attribute__((noinline))
 static int h_statfs(const char *path, struct statfs *buf) {
+	if (!hider_is_ready())
+		return orig_statfs ? orig_statfs(path, buf) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_statfs(path, buf);
@@ -1788,6 +1904,8 @@ static int h_statfs(const char *path, struct statfs *buf) {
 
 __attribute__((noinline))
 static int h_statvfs(const char *path, struct statvfs *buf) {
+	if (!hider_is_ready())
+		return orig_statvfs ? orig_statvfs(path, buf) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_statvfs(path, buf);
@@ -1816,6 +1934,8 @@ static int h_statvfs(const char *path, struct statvfs *buf) {
 __attribute__((noinline))
 static int h_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
                     void *newp, size_t newlen) {
+	if (!hider_is_ready())
+		return orig_sysctl ? orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
@@ -1856,6 +1976,8 @@ static bool env_name_should_hide(const char *name) {
 
 __attribute__((noinline))
 static char *h_getenv(const char *name) {
+	if (!hider_strict_hook_is_ready(&g_strict_getenv_session, "getenv"))
+		return orig_getenv ? orig_getenv(name) : NULL;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_getenv(name);
@@ -1986,6 +2108,8 @@ static bool fs_path_should_hide(const char *path) {
 
 __attribute__((noinline))
 static int h_access(const char *path, int amode) {
+	if (!hider_strict_hook_is_ready(&g_strict_access_session, "access"))
+		return orig_access ? orig_access(path, amode) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_access(path, amode);
@@ -1999,6 +2123,8 @@ static int h_access(const char *path, int amode) {
 
 __attribute__((noinline))
 static int h_stat(const char *path, struct stat *buf) {
+	if (!hider_strict_hook_is_ready(&g_strict_stat_session, "stat"))
+		return orig_stat ? orig_stat(path, buf) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_stat(path, buf);
@@ -2012,6 +2138,8 @@ static int h_stat(const char *path, struct stat *buf) {
 
 __attribute__((noinline))
 static int h_lstat(const char *path, struct stat *buf) {
+	if (!hider_strict_hook_is_ready(&g_strict_lstat_session, "lstat"))
+		return orig_lstat ? orig_lstat(path, buf) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_lstat(path, buf);
@@ -2025,6 +2153,8 @@ static int h_lstat(const char *path, struct stat *buf) {
 
 __attribute__((noinline))
 static FILE *h_fopen(const char *path, const char *mode) {
+	if (!hider_strict_hook_is_ready(&g_strict_fopen_session, "fopen"))
+		return orig_fopen ? orig_fopen(path, mode) : NULL;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_fopen(path, mode);
@@ -2038,25 +2168,26 @@ static FILE *h_fopen(const char *path, const char *mode) {
 
 __attribute__((noinline))
 static DIR *h_opendir(const char *path) {
-	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
-	if (caller_is_hidden(ra)) {
-		return orig_opendir(path);
-	}
-
-	DIR *dirp = orig_opendir(path);
-	register_dir_filter(dirp, dir_filter_kind_for_path(path));
-	return dirp;
+	if (!hider_strict_hook_is_ready(&g_strict_opendir_session, "opendir"))
+		return orig_opendir ? orig_opendir(path) : NULL;
+	/* h_readdir resolves the live directory descriptor for every filtered
+	 * entry. opendir intentionally remains ownership-neutral. */
+	return orig_opendir ? orig_opendir(path) : NULL;
 }
 
 __attribute__((noinline))
 static struct dirent *h_readdir(DIR *dirp) {
+	if (!hider_strict_hook_is_ready(&g_strict_readdir_session, "readdir"))
+		return orig_readdir ? orig_readdir(dirp) : NULL;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra)) {
 		return orig_readdir(dirp);
 	}
 
-	dir_filter_kind_t kind = lookup_dir_filter(dirp);
-	if (kind == DIR_FILTER_NONE) {
+	dir_filter_kind_t kind = DIR_FILTER_NONE;
+	if (!dir_filter_kind_for_dir(dirp, &kind) || kind == DIR_FILTER_NONE) {
+		/* F_GETPATH is unavailable for some descriptor types/sandboxes. Do not
+		 * turn that inability to classify into a detector-visible failure. */
 		return orig_readdir(dirp);
 	}
 
@@ -2071,11 +2202,11 @@ static struct dirent *h_readdir(DIR *dirp) {
 
 __attribute__((noinline))
 static int h_closedir(DIR *dirp) {
-	/* DIR * addresses can be reused by libc.  Cleanup is ownership-neutral:
-	 * remove any app-side filter before every close, including a close issued
-	 * from hidden code, so a later directory cannot inherit stale filtering. */
-	unregister_dir_filter(dirp);
-	return orig_closedir(dirp);
+	if (!hider_strict_hook_is_ready(&g_strict_closedir_session, "closedir"))
+		return orig_closedir ? orig_closedir(dirp) : -1;
+	/* No DIR allocation or global state is retained; simply preserve stock
+	 * close ownership and errno behavior for every caller class. */
+	return orig_closedir ? orig_closedir(dirp) : -1;
 }
 
 //------------------------------------------------------------------------------
@@ -2087,6 +2218,8 @@ static int h_closedir(DIR *dirp) {
 __attribute__((noinline))
 static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
                           void *newp, size_t newlen) {
+	if (!hider_is_ready())
+		return orig_sysctlbyname ? orig_sysctlbyname(name, oldp, oldlenp, newp, newlen) : -1;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
@@ -2122,6 +2255,8 @@ static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 __attribute__((noinline))
 static kern_return_t h_mach_port_get_refs(ipc_space_t task, mach_port_name_t name,
                                           mach_port_right_t right, mach_port_urefs_t *refs) {
+	if (!hider_is_ready())
+		return orig_mach_port_get_refs ? orig_mach_port_get_refs(task, name, right, refs) : KERN_FAILURE;
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_mach_port_get_refs(task, name, right, refs);
@@ -2189,6 +2324,7 @@ void hidden_dylib_hider_init(void)
 	//    These point directly into the DSC code which remains intact.
 	orig_dladdr = dladdr;
 	orig_dlsym = dlsym;
+	orig_dlerror = dlerror;
 	orig_dyld_image_count = _dyld_image_count;
 	orig_dyld_get_image_name = _dyld_get_image_name;
 	orig_dyld_get_image_header = _dyld_get_image_header;
@@ -2226,44 +2362,42 @@ void hidden_dylib_hider_init(void)
 	g_executable_header = rhi_hider_identity_executable_header();
 	load_hider_profile_from_environment();
 
-	// 4. GOT rebinding for all hooks.
-	//    Uses GOT rebinding (not in-place DSC patching) so the DSC functions
-	//    remain intact — MSHookFunction/ellekit can still create trampolines.
-
-	// dyld image enumeration — filtered view for app callers
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_image_count, h_image_count, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, (void *)_dyld_get_image_name, h_get_image_name, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_get_image_header, h_get_image_header, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_get_image_vmaddr_slide, h_get_image_vmaddr_slide, NULL);
-
-	// dyld callback registration — filter hidden images from app callbacks
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_register_func_for_add_image, h_register_func_for_add_image, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, _dyld_register_func_for_remove_image, h_register_func_for_remove_image, NULL);
-
-	// dlopen / dlsym / dladdr — block probing, remap hooked symbols, rewrite hidden paths
-	// NOTE: dlopen hook commented out — conflicts with init_dyldhooks iOS 15 GOT fallback.
-	// The dlopen GOT rebind here replaces the replacee that init_dyldhooks needs to find,
-	// preventing its trust/filter hook from ever being installed on iOS 15.
-	// litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlopen, h_dlopen, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlsym, h_dlsym, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dladdr, h_dladdr, NULL);
-
-	// task_info(TASK_DYLD_INFO) — present filtered dyld_all_image_infos
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, task_info, h_task_info, NULL);
-
-	// Early strict-app probes that matter during startup and are safe enough
-	// to bring up before the hidden loader chain. Keep the more invasive ObjC,
-	// environment, and filesystem hooks for the later strict phase.
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fork, h_fork, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctl, h_sysctl, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getfsstat, h_getfsstat, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, statfs, h_statfs, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, statvfs, h_statvfs, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sysctlbyname, h_sysctlbyname, NULL);
-	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, mach_port_get_refs, h_mach_port_get_refs, NULL);
+	/*
+	 * 4. Prepare every required core import mutation before the first write.
+	 * The originals above were published before this call. A transaction that
+	 * is incomplete, partial, or uncertain is never presented as a hider: all
+	 * linked views keep forwarding through the untouched real API instead.
+	 */
+	const rhi_rebind_spec_t core_specs[] = {
+		{ "_dyld_image_count", (void *)_dyld_image_count, (void *)h_image_count },
+		{ "_dyld_get_image_name", (void *)_dyld_get_image_name, (void *)h_get_image_name },
+		{ "_dyld_get_image_header", (void *)_dyld_get_image_header, (void *)h_get_image_header },
+		{ "_dyld_get_image_vmaddr_slide", (void *)_dyld_get_image_vmaddr_slide, (void *)h_get_image_vmaddr_slide },
+		{ "_dyld_register_func_for_add_image", (void *)_dyld_register_func_for_add_image, (void *)h_register_func_for_add_image },
+		{ "_dyld_register_func_for_remove_image", (void *)_dyld_register_func_for_remove_image, (void *)h_register_func_for_remove_image },
+		{ "dlsym", (void *)dlsym, (void *)h_dlsym },
+		{ "dlerror", (void *)dlerror, (void *)h_dlerror },
+		{ "dladdr", (void *)dladdr, (void *)h_dladdr },
+		{ "task_info", (void *)task_info, (void *)h_task_info },
+		{ "fork", (void *)fork, (void *)h_fork },
+		{ "sysctl", (void *)sysctl, (void *)h_sysctl },
+		{ "getfsstat", (void *)getfsstat, (void *)h_getfsstat },
+		{ "statfs", (void *)statfs, (void *)h_statfs },
+		{ "statvfs", (void *)statvfs, (void *)h_statvfs },
+		{ "sysctlbyname", (void *)sysctlbyname, (void *)h_sysctlbyname },
+		{ "mach_port_get_refs", (void *)mach_port_get_refs, (void *)h_mach_port_get_refs },
+	};
+	rhi_hider_hook_session_reset(&g_core_hook_session, "hider-core", true);
+	if (!rhi_hider_hook_session_start(&g_core_hook_session, core_specs,
+	                                  sizeof(core_specs) / sizeof(*core_specs))) {
+		rhi_diag_log("HIDER core transaction %s; concealment disabled",
+		             rhi_hook_state_name(rhi_hider_hook_session_state(&g_core_hook_session)));
+		atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+		return;
+	}
 
 	atomic_store_explicit(&g_init_state, HIDER_STATE_READY, memory_order_release);
-	rhi_diag_log("HIDER init complete — core hooks enabled");
+	rhi_diag_log("HIDER init complete — verified core hooks enabled");
 }
 
 void hidden_dylib_hider_enable_strict_hooks(void)
@@ -2279,37 +2413,57 @@ void hidden_dylib_hider_enable_strict_hooks(void)
 		return;
 	}
 
-	// ObjC runtime — hide injected images from class/image enumeration
+	/*
+	 * Strict components are independent optional transactions. A failed
+	 * component stays unavailable, but cannot make us advertise its hook via
+	 * dlsym. The helper's one-slot session gives each mutation its own
+	 * prepare/commit/readback result rather than collapsing failures into a
+	 * global success bit.
+	 */
+#define START_STRICT_SESSION(SESSION, SYMBOL, ORIGINAL, REPLACEMENT) do { \
+	const rhi_rebind_spec_t strict_spec = { (SYMBOL), (void *)(ORIGINAL), (void *)(REPLACEMENT) }; \
+	rhi_hider_hook_session_reset(&(SESSION), (SYMBOL), false); \
+	if (!rhi_hider_hook_session_start(&(SESSION), &strict_spec, 1)) \
+		rhi_diag_log("HIDER strict %s unavailable: %s", (SYMBOL), \
+		             rhi_hook_state_name(rhi_hider_hook_session_state(&(SESSION)))); \
+} while (0)
+
+	// ObjC runtime — hide injected images from class/image enumeration.
 	if (g_hook_objc_runtime_enabled) {
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, class_getImageName, h_class_getImageName, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyImageNames, h_objc_copyImageNames, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassNamesForImage, h_objc_copyClassNamesForImage, NULL);
+		START_STRICT_SESSION(g_strict_class_image_session, "class_getImageName", class_getImageName, h_class_getImageName);
+		START_STRICT_SESSION(g_strict_copy_images_session, "objc_copyImageNames", objc_copyImageNames, h_objc_copyImageNames);
+		START_STRICT_SESSION(g_strict_copy_names_session, "objc_copyClassNamesForImage", objc_copyClassNamesForImage, h_objc_copyClassNamesForImage);
+		START_STRICT_SESSION(g_strict_add_load_session, "objc_addLoadImageFunc", objc_addLoadImageFunc, h_objc_addLoadImageFunc);
 	}
 	if (g_hook_objc_copy_class_list_enabled) {
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, objc_copyClassList, h_objc_copyClassList, NULL);
+		START_STRICT_SESSION(g_strict_copy_class_list_session, "objc_copyClassList", objc_copyClassList, h_objc_copyClassList);
 	}
 	if (g_hook_url_schemes_enabled) {
 		install_url_scheme_hooks();
+		if (!g_url_scheme_hooks_active)
+			rhi_diag_log("HIDER strict URL-scheme hook unavailable");
 	}
 
 	// Environment — hide DYLD_INSERT_LIBRARIES and JB markers
 	if (g_hook_environment_enabled) {
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, getenv, h_getenv, NULL);
+		START_STRICT_SESSION(g_strict_getenv_session, "getenv", getenv, h_getenv);
 	}
 
 	// Filesystem probes — hide jailbreak artifacts from stat/access/fopen and
 	// filter preboot descendant enumeration without lying about the preboot root.
 	if (g_hook_filesystem_enabled) {
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, access, h_access, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, stat, h_stat, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, lstat, h_lstat, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, fopen, h_fopen, NULL);
+		START_STRICT_SESSION(g_strict_access_session, "access", access, h_access);
+		START_STRICT_SESSION(g_strict_stat_session, "stat", stat, h_stat);
+		START_STRICT_SESSION(g_strict_lstat_session, "lstat", lstat, h_lstat);
+		START_STRICT_SESSION(g_strict_fopen_session, "fopen", fopen, h_fopen);
 	}
 	if (g_hook_directory_enabled) {
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, opendir, h_opendir, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, readdir, h_readdir, NULL);
-		litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, closedir, h_closedir, NULL);
+		START_STRICT_SESSION(g_strict_opendir_session, "opendir", opendir, h_opendir);
+		START_STRICT_SESSION(g_strict_readdir_session, "readdir", readdir, h_readdir);
+		START_STRICT_SESSION(g_strict_closedir_session, "closedir", closedir, h_closedir);
 	}
+
+#undef START_STRICT_SESSION
 
 	// Do not expose strict-hook pointers through dlsym until every requested
 	// strict installation has run.  A concurrent/reentrant caller observes the
@@ -2334,7 +2488,9 @@ void *hidden_dylib_hider_dlsym_remap(const char *name)
 	// Only remap dlopen when the actual GOT-level fallback hook was installed.
 	// dyld_patch_fallback_enabled is broader than that: it only means we need
 	// the fallback-capable dyld patch path, not that dlopen itself was rebound.
-	if (!strcmp(name, "dlopen") && dlopen_fallback_hook_installed)
+	if (!strcmp(name, "dlopen") &&
+	    atomic_load_explicit(&dlopen_fallback_hook_installed, memory_order_acquire) &&
+	    roothide_hidden_tweak_hooks_ready())
 		return (void *)dlopen_fallback_hook;
 
 	// Table of symbol names → our hooked function pointers.
@@ -2342,46 +2498,47 @@ void *hidden_dylib_hider_dlsym_remap(const char *name)
 	static const struct {
 		const char *sym;
 		void *func;
-		bool requiresStrictHooks;
+		const rhi_hider_hook_session_t *session;
 		const bool *enabled;
 	} remap[] = {
-		{ "_dyld_image_count",                    (void *)h_image_count,                   false, NULL },
-		{ "_dyld_get_image_name",                  (void *)h_get_image_name,               false, NULL },
-		{ "_dyld_get_image_header",                (void *)h_get_image_header,             false, NULL },
-		{ "_dyld_get_image_vmaddr_slide",          (void *)h_get_image_vmaddr_slide,       false, NULL },
-		{ "_dyld_register_func_for_add_image",     (void *)h_register_func_for_add_image,  false, NULL },
-		{ "_dyld_register_func_for_remove_image",  (void *)h_register_func_for_remove_image,false, NULL },
-		{ "task_info",                             (void *)h_task_info,                    false, NULL },
-		{ "dladdr",                                (void *)h_dladdr,                       false, NULL },
-		{ "dlsym",                                 (void *)h_dlsym,                        false, NULL },
-		{ "class_getImageName",                    (void *)h_class_getImageName,           true,  &g_hook_objc_runtime_enabled },
-		{ "objc_copyClassList",                    (void *)h_objc_copyClassList,           true,  &g_hook_objc_copy_class_list_enabled },
-		{ "objc_copyImageNames",                   (void *)h_objc_copyImageNames,          true,  &g_hook_objc_runtime_enabled },
-		{ "objc_copyClassNamesForImage",           (void *)h_objc_copyClassNamesForImage,  true,  &g_hook_objc_runtime_enabled },
-		{ "objc_addLoadImageFunc",                 (void *)h_objc_addLoadImageFunc,        false, NULL },
+		{ "_dyld_image_count",                    (void *)h_image_count,                   &g_core_hook_session, NULL },
+		{ "_dyld_get_image_name",                  (void *)h_get_image_name,               &g_core_hook_session, NULL },
+		{ "_dyld_get_image_header",                (void *)h_get_image_header,             &g_core_hook_session, NULL },
+		{ "_dyld_get_image_vmaddr_slide",          (void *)h_get_image_vmaddr_slide,       &g_core_hook_session, NULL },
+		{ "_dyld_register_func_for_add_image",     (void *)h_register_func_for_add_image,  &g_core_hook_session, NULL },
+		{ "_dyld_register_func_for_remove_image",  (void *)h_register_func_for_remove_image,&g_core_hook_session, NULL },
+		{ "task_info",                             (void *)h_task_info,                    &g_core_hook_session, NULL },
+		{ "dladdr",                                (void *)h_dladdr,                       &g_core_hook_session, NULL },
+		{ "dlsym",                                 (void *)h_dlsym,                        &g_core_hook_session, NULL },
+		{ "dlerror",                               (void *)h_dlerror,                      &g_core_hook_session, NULL },
+		{ "class_getImageName",                    (void *)h_class_getImageName,           &g_strict_class_image_session, &g_hook_objc_runtime_enabled },
+		{ "objc_copyClassList",                    (void *)h_objc_copyClassList,           &g_strict_copy_class_list_session, &g_hook_objc_copy_class_list_enabled },
+		{ "objc_copyImageNames",                   (void *)h_objc_copyImageNames,          &g_strict_copy_images_session, &g_hook_objc_runtime_enabled },
+		{ "objc_copyClassNamesForImage",           (void *)h_objc_copyClassNamesForImage,  &g_strict_copy_names_session, &g_hook_objc_runtime_enabled },
+		{ "objc_addLoadImageFunc",                 (void *)h_objc_addLoadImageFunc,        &g_strict_add_load_session, &g_hook_objc_runtime_enabled },
 		// NOTE: keep dlopen off the remap table. The dlopen hook path remains
 		// disabled due to the iOS 15 init_dyldhooks fallback conflict.
 		// { "dlopen",                               (void *)h_dlopen,                       false, NULL },
-		{ "fork",                                  (void *)h_fork,                         false, NULL },
-		{ "getfsstat",                             (void *)h_getfsstat,                    false, NULL },
-		{ "statfs",                                (void *)h_statfs,                       false, NULL },
-		{ "statvfs",                               (void *)h_statvfs,                      false, NULL },
-		{ "sysctl",                                (void *)h_sysctl,                       false, NULL },
-		{ "getenv",                                (void *)h_getenv,                       true,  &g_hook_environment_enabled },
-		{ "access",                                (void *)h_access,                       true,  &g_hook_filesystem_enabled },
-		{ "stat",                                  (void *)h_stat,                         true,  &g_hook_filesystem_enabled },
-		{ "lstat",                                 (void *)h_lstat,                        true,  &g_hook_filesystem_enabled },
-		{ "fopen",                                 (void *)h_fopen,                        true,  &g_hook_filesystem_enabled },
-		{ "opendir",                               (void *)h_opendir,                      true,  &g_hook_directory_enabled },
-		{ "readdir",                               (void *)h_readdir,                      true,  &g_hook_directory_enabled },
-		{ "closedir",                              (void *)h_closedir,                     true,  &g_hook_directory_enabled },
-		{ "sysctlbyname",                          (void *)h_sysctlbyname,                 false, NULL },
-		{ "mach_port_get_refs",                    (void *)h_mach_port_get_refs,           false, NULL },
+		{ "fork",                                  (void *)h_fork,                         &g_core_hook_session, NULL },
+		{ "getfsstat",                             (void *)h_getfsstat,                    &g_core_hook_session, NULL },
+		{ "statfs",                                (void *)h_statfs,                       &g_core_hook_session, NULL },
+		{ "statvfs",                               (void *)h_statvfs,                      &g_core_hook_session, NULL },
+		{ "sysctl",                                (void *)h_sysctl,                       &g_core_hook_session, NULL },
+		{ "getenv",                                (void *)h_getenv,                       &g_strict_getenv_session, &g_hook_environment_enabled },
+		{ "access",                                (void *)h_access,                       &g_strict_access_session, &g_hook_filesystem_enabled },
+		{ "stat",                                  (void *)h_stat,                         &g_strict_stat_session, &g_hook_filesystem_enabled },
+		{ "lstat",                                 (void *)h_lstat,                        &g_strict_lstat_session, &g_hook_filesystem_enabled },
+		{ "fopen",                                 (void *)h_fopen,                        &g_strict_fopen_session, &g_hook_filesystem_enabled },
+		{ "opendir",                               (void *)h_opendir,                      &g_strict_opendir_session, &g_hook_directory_enabled },
+		{ "readdir",                               (void *)h_readdir,                      &g_strict_readdir_session, &g_hook_directory_enabled },
+		{ "closedir",                              (void *)h_closedir,                     &g_strict_closedir_session, &g_hook_directory_enabled },
+		{ "sysctlbyname",                          (void *)h_sysctlbyname,                 &g_core_hook_session, NULL },
+		{ "mach_port_get_refs",                    (void *)h_mach_port_get_refs,           &g_core_hook_session, NULL },
 	};
 
 	for (unsigned i = 0; i < sizeof(remap) / sizeof(*remap); i++) {
 		if (strcmp(name, remap[i].sym) == 0) {
-				if (remap[i].requiresStrictHooks && !hider_strict_hooks_ready())
+			if (!rhi_hider_hook_session_hook_is_active(remap[i].session, remap[i].sym))
 				return NULL;
 			if (remap[i].enabled && !*remap[i].enabled)
 				return NULL;
