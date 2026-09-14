@@ -64,6 +64,33 @@ parity. ObjC copy APIs compact their runtime-owned arrays in place even when
 nil terminator for `objc_copyClassList`), and never use class names alone to
 decide visibility.
 
+The attestation fixtures model bounded, read-only phase gates: core requires
+an `INTACT` observation plus a still-live session/callback route; strict READY
+checks only sessions that were published `ACTIVE`; and a failure after any
+successful support-library, TweakLoader, or selected-tweak `dlopen` is
+necessarily `PARTIAL`. Static contracts locate the checkpoints after
+`roothideinit`, after the executable patch phase, at fallback activation,
+prepare, every successful loader/binary load, and immediately before selected
+`ACTIVE` publication. They also assert that ordinary readiness, dlsym, and
+dyld/dlopen wrappers contain no attestation call. These are sequential,
+individually fenced checks—not an atomic multi-session lifecycle snapshot—and
+remain fail-closed if a later callback or live-state check degrades.
+
+An exact selected-image capability range granted before a later attestation
+failure persists until that image unloads; this phase does not revoke trusted
+image authorization. The `main.c` post-checkin and post-patch checkpoints
+attest core only. Hidden selected-tweak prepare re-attests the fallback in its
+combined phase gate, while generic/non-selected fallback use relies on the
+initial proof plus its O(1) live transaction-state gate.
+
+No host result validates iOS hook slots, PAC behavior, image-loader races, or
+concurrent callback/loader stress. Device release gates must exercise those
+transitions under supported and denied selected-tweak configurations and
+confirm native passthrough after forced phase degradation. The existing sole
+reported host gap remains the intentionally limited caller-relative
+`RTLD_SELF`/`RTLD_NEXT` fallback described below; this documentation does not
+claim device validation.
+
 These models do not establish the iOS private `KERN_PROCARGS2` layout, the
 target page geometry used by the current XNU short-buffer compatibility path,
 `sysctlnametomib("kern.bootargs")` availability, sandboxed `F_GETPATH`, or

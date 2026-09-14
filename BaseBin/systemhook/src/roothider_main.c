@@ -610,6 +610,105 @@ static bool hidden_tweak_preflight_support_library(const char *libraryPath)
 	return true;
 }
 
+/* Loader/tweak phases are the only places that attest this hook session.
+ * Ordinary readiness and the fallback wrapper deliberately remain O(1): they
+ * consume these release-published fail-closed words and never read/repair a
+ * GOT slot. */
+static void hidden_tweak_fail_attestation_phase(const char *phase,
+	                                             rhi_hook_state_t terminal_state)
+{
+	if (terminal_state == RHI_HOOK_NOT_ATTEMPTED ||
+	    terminal_state == RHI_HOOK_PREPARED ||
+	    terminal_state == RHI_HOOK_ACTIVE) {
+		terminal_state = RHI_HOOK_FAILED;
+	}
+	/* A successful dlopen has already run constructors. It is necessarily a
+	 * partial transaction even when a later attestation cannot prove its hooks;
+	 * never relabel that history as a clean FAILED attempt. */
+	gHiddenTweakLoadState = gHiddenTweakAnyDlopenSucceeded ?
+		HIDDEN_TWEAK_LOAD_PARTIAL :
+		(terminal_state == RHI_HOOK_UNKNOWN ? HIDDEN_TWEAK_LOAD_UNKNOWN : HIDDEN_TWEAK_LOAD_FAILED);
+	/* Publish the terminal hook/readiness state before withdrawing either
+	 * advertised installation flag. The activated transaction remains owned by
+	 * the process lifetime; rollback/destruction is unsafe after constructors. */
+	atomic_store_explicit(&gHiddenTweakHookState, terminal_state, memory_order_release);
+	atomic_store_explicit(&dlopen_fallback_hook_installed, false, memory_order_release);
+	atomic_store_explicit(&gHiddenTweakHooksInstalled, false, memory_order_release);
+	root_hide_hidden_whitelist_log("hidden tweak attestation failed phase=%s hook=%s load=%s",
+		phase ?: "(unknown)", rhi_hook_state_name(terminal_state),
+		hidden_tweak_load_state_name(gHiddenTweakLoadState));
+}
+
+/* The initial fallback is also used by normal injection, where no hider core
+ * session exists. Keep its activation proof fallback-only; the combined
+ * core+fallback helper below is reserved for hidden selected-tweak phases. */
+static void hidden_tweak_fail_fallback_activation(const char *phase,
+	                                               rhi_hook_state_t terminal_state)
+{
+	if (terminal_state == RHI_HOOK_NOT_ATTEMPTED ||
+	    terminal_state == RHI_HOOK_PREPARED ||
+	    terminal_state == RHI_HOOK_ACTIVE) {
+		terminal_state = RHI_HOOK_FAILED;
+	}
+	atomic_store_explicit(&gHiddenTweakHookState, terminal_state, memory_order_release);
+	atomic_store_explicit(&dlopen_fallback_hook_installed, false, memory_order_release);
+	atomic_store_explicit(&gHiddenTweakHooksInstalled, false, memory_order_release);
+	root_hide_hidden_whitelist_log("hidden tweak fallback activation failed phase=%s hook=%s",
+		phase ?: "(unknown)", rhi_hook_state_name(terminal_state));
+}
+
+static bool hidden_tweak_attest_active_fallback(
+	rhi_rebind_transaction_t *transaction, const char *phase,
+	rhi_hook_state_t *terminal_state_out)
+{
+	if (!transaction) {
+		if (terminal_state_out) *terminal_state_out = RHI_HOOK_FAILED;
+		return false;
+	}
+	const rhi_hook_state_t before = rhi_rebind_transaction_state(transaction);
+	if (before != RHI_HOOK_ACTIVE) {
+		if (terminal_state_out) *terminal_state_out = before;
+		root_hide_hidden_whitelist_log("hidden tweak fallback attestation phase=%s state=%s",
+			phase ?: "(unknown)", rhi_hook_state_name(before));
+		return false;
+	}
+	const rhi_rebind_attestation_t observation =
+		rhi_rebind_transaction_attest(transaction);
+	const rhi_hook_state_t after = rhi_rebind_transaction_state(transaction);
+	if (terminal_state_out) *terminal_state_out = after;
+	const bool intact = observation == RHI_ATTEST_INTACT &&
+		after == RHI_HOOK_ACTIVE &&
+		rhi_rebind_transaction_hook_is_active(transaction, "dlopen");
+	if (!intact) {
+		root_hide_hidden_whitelist_log("hidden tweak fallback attestation phase=%s result=%s state=%s",
+			phase ?: "(unknown)", rhi_rebind_attestation_name(observation),
+			rhi_hook_state_name(after));
+	}
+	return intact;
+}
+
+static bool hidden_tweak_attest_phase(const char *phase)
+{
+	const bool core_intact = hidden_dylib_hider_attest_core();
+	rhi_rebind_transaction_t *transaction = atomic_load_explicit(
+		&gHiddenTweakFallbackTransaction, memory_order_acquire);
+	rhi_hook_state_t terminal_state = RHI_HOOK_FAILED;
+	bool fallback_intact = false;
+	if (!transaction) {
+		root_hide_hidden_whitelist_log("hidden tweak fallback attestation phase=%s missing transaction",
+			phase ?: "(unknown)");
+	}
+	else {
+		fallback_intact = hidden_tweak_attest_active_fallback(
+			transaction, phase, &terminal_state);
+	}
+	if (core_intact && fallback_intact) {
+		return true;
+	}
+	hidden_tweak_fail_attestation_phase(phase, terminal_state);
+	return false;
+}
+
 static bool hidden_tweak_load_support_library(const char *libraryPath)
 {
 	if (!hidden_tweak_preflight_support_library(libraryPath)) {
@@ -634,6 +733,13 @@ static bool hidden_tweak_load_support_library(const char *libraryPath)
 		// and stop rather than retrying an untracked mutation.
 		gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
 		root_hide_hidden_whitelist_log("support library handle record failed path=%s", libraryPath);
+		return false;
+	}
+	/* The retained support handle may have run constructors and changed the
+	 * image set. Re-prove core/fallback before any later loader capability can
+	 * be authorized. */
+	if (!hidden_tweak_attest_phase("support-library dlopen")) {
+		root_hide_hidden_whitelist_log("support library attestation failed path=%s", libraryPath);
 		return false;
 	}
 
@@ -1108,7 +1214,15 @@ fail:
 
 static bool hidden_tweak_prepare_runtime(bool minimalRuntime)
 {
-	if (!roothide_hidden_tweak_hooks_ready()) {
+	/* Preflight itself is a bounded loader phase. Do not let a post-core image
+	 * change reach support/selected loading on a merely cached READY bit. */
+	if (!hidden_tweak_attest_phase("hidden-tweak prepare entry") ||
+	    !roothide_hidden_tweak_hooks_ready()) {
+		if (gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_PARTIAL &&
+		    gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_UNKNOWN &&
+		    gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_FAILED) {
+			hidden_tweak_fail_attestation_phase("hidden-tweak prepare readiness", RHI_HOOK_FAILED);
+		}
 		root_hide_hidden_whitelist_log("selected tweak prepare blocked: dyld transaction is no longer verified");
 		return false;
 	}
@@ -1144,10 +1258,19 @@ bool roothide_hidden_tweak_prepare_minimal_runtime(void)
 	return hidden_tweak_prepare_runtime(true);
 }
 
-void roothide_hidden_tweak_note_loader_result(bool succeeded)
+bool roothide_hidden_tweak_note_loader_result(bool succeeded)
 {
+	if (succeeded) {
+		/* main.c retained TweakLoader's handle before this call. Its successful
+		 * dlopen is now part of the one-way transaction history even if the
+		 * attestation below fails. */
+		gHiddenTweakAnyDlopenSucceeded = true;
+	}
 	if (gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_PREPARED) {
-		return;
+		if (succeeded) {
+			gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
+		}
+		return false;
 	}
 	if (!succeeded) {
 		// Runtime support has already been dlopen'ed before TweakLoader is
@@ -1155,7 +1278,12 @@ void roothide_hidden_tweak_note_loader_result(bool succeeded)
 		// cannot truthfully be reported as a clean preflight refusal.
 		gHiddenTweakLoadState = gHiddenTweakAnyDlopenSucceeded ? HIDDEN_TWEAK_LOAD_PARTIAL : HIDDEN_TWEAK_LOAD_FAILED;
 		root_hide_hidden_whitelist_log("TweakLoader transaction failed state=%s", hidden_tweak_load_state_name(gHiddenTweakLoadState));
+		/* A failed dlopen adds no loader image, but this remains the bounded
+		 * post-attempt checkpoint for the surrounding support/fallback phase. */
+		(void)hidden_tweak_attest_phase("TweakLoader dlopen");
+		return false;
 	}
+	return hidden_tweak_attest_phase("TweakLoader dlopen");
 }
 
 static bool hidden_tweak_verified_loaded_image_seam(const char *path)
@@ -1177,9 +1305,15 @@ static bool hidden_tweak_verified_loaded_image_seam(const char *path)
 
 bool roothide_hidden_tweak_load_selected(void)
 {
-	if (!roothide_hidden_tweak_hooks_ready()) {
-		gHiddenTweakLoadState = gHiddenTweakAnyDlopenSucceeded ?
-			HIDDEN_TWEAK_LOAD_PARTIAL : HIDDEN_TWEAK_LOAD_FAILED;
+	/* Selected load is a bounded transaction entry.  Attest before granting a
+	 * selected image the full hidden caller capability. */
+	if (!hidden_tweak_attest_phase("selected-load entry") ||
+	    !roothide_hidden_tweak_hooks_ready()) {
+		if (gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_PARTIAL &&
+		    gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_UNKNOWN &&
+		    gHiddenTweakLoadState != HIDDEN_TWEAK_LOAD_FAILED) {
+			hidden_tweak_fail_attestation_phase("selected-load readiness", RHI_HOOK_FAILED);
+		}
 		root_hide_hidden_whitelist_log("selected tweak load blocked: dyld transaction is no longer verified state=%s",
 			hidden_tweak_load_state_name(gHiddenTweakLoadState));
 		return false;
@@ -1219,6 +1353,12 @@ bool roothide_hidden_tweak_load_selected(void)
 		}
 
 		if (hidden_tweak_loaded_library_contains_path(binary->path)) {
+			if (!hidden_tweak_attest_phase("selected existing-image capability")) {
+				binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
+				root_hide_hidden_whitelist_log("selected tweak existing image attestation failed binary=%s path=%s",
+					binary->name, binary->path);
+				return false;
+			}
 			if (!hidden_tweak_verified_loaded_image_seam(binary->path)) {
 				binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
 				gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
@@ -1246,17 +1386,18 @@ bool roothide_hidden_tweak_load_selected(void)
 		}
 
 		gHiddenTweakAnyDlopenSucceeded = true;
-		if (!roothide_hidden_tweak_hooks_ready()) {
-			binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
-			gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
-			root_hide_hidden_whitelist_log("selected tweak dlopen invalidated dyld transaction binary=%s",
-				binary->name);
-			return false;
-		}
 		if (!hidden_tweak_store_loaded_library(binary->path, handle)) {
 			binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
 			gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_PARTIAL;
 			root_hide_hidden_whitelist_log("selected tweak handle record failed binary=%s path=%s", binary->name, binary->path);
+			return false;
+		}
+		/* Retention precedes the post-dlopen proof. Capability is intentionally
+		 * withheld until this read-only phase verifies core and fallback again. */
+		if (!hidden_tweak_attest_phase("selected tweak binary dlopen")) {
+			binary->state = HIDDEN_TWEAK_LOAD_UNKNOWN;
+			root_hide_hidden_whitelist_log("selected tweak dlopen attestation failed binary=%s path=%s",
+				binary->name, binary->path);
 			return false;
 		}
 		if (!hidden_tweak_verified_loaded_image_seam(binary->path)) {
@@ -1270,6 +1411,9 @@ bool roothide_hidden_tweak_load_selected(void)
 		root_hide_hidden_whitelist_log("selected tweak dlopen success binary=%s path=%s handle=%p", binary->name, binary->path, handle);
 	}
 
+	if (!hidden_tweak_attest_phase("selected ACTIVE publication")) {
+		return false;
+	}
 	gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_ACTIVE;
 	root_hide_hidden_whitelist_log("selected tweak load end loadedLibraries=%zu state=%s", gHiddenTweakLoadedLibraryCount, hidden_tweak_load_state_name(gHiddenTweakLoadState));
 	return true;
@@ -1889,9 +2033,18 @@ void init_dyldhooks()
 		return;
 	}
 	/* The transaction is process-lifetime after activation. Publish it before
-	 * the readiness and dlsym advertisement flags, so no reader can observe a
-	 * true flag with a missing/partially initialized transaction. */
+	 * its bounded attestation and the readiness/dlsym advertisement flags, so
+	 * no reader can observe a true flag with a missing/partially initialized
+	 * transaction. */
 	atomic_store_explicit(&gHiddenTweakFallbackTransaction, transaction, memory_order_release);
+	rhi_hook_state_t fallback_terminal_state = RHI_HOOK_FAILED;
+	if (!hidden_tweak_attest_active_fallback(transaction,
+	                                          "fallback transaction activation",
+	                                          &fallback_terminal_state)) {
+		hidden_tweak_fail_fallback_activation("fallback transaction activation",
+			fallback_terminal_state);
+		return;
+	}
 	atomic_store_explicit(&dlopen_fallback_hook_installed, true, memory_order_release);
 	atomic_store_explicit(&gHiddenTweakHookState, RHI_HOOK_ACTIVE, memory_order_release);
 	/* This is the single publication point. Its release pairs with the first

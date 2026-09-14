@@ -148,6 +148,13 @@ class HookState(str, Enum):
     UNKNOWN = "unknown"
 
 
+class AttestationState(str, Enum):
+    INTACT = "intact"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    NOT_ATTEMPTED = "not_attempted"
+
+
 @dataclass
 class HookFixture:
     name: str
@@ -193,6 +200,44 @@ def session_ready(required: bool, hooks: Iterable[HookFixture]) -> bool:
         return False
     return all(hook.state is HookState.ACTIVE for hook in hook_list) if required else \
         hook_list[0].state is HookState.ACTIVE
+
+
+def core_attestation_ready(
+    observation: AttestationState,
+    session_ready_now: bool,
+    publication_state: HookState,
+    callback_delivery_clean: bool,
+) -> bool:
+    """Model the core's bounded read-only phase gate, not a hot-path check."""
+
+    return (
+        observation is AttestationState.INTACT
+        and session_ready_now
+        and publication_state in (HookState.PREPARED, HookState.ACTIVE)
+        and callback_delivery_clean
+    )
+
+
+def strict_attestation_ready(
+    core_ok: bool,
+    sessions: Iterable[tuple[HookState, AttestationState, bool]],
+) -> bool:
+    """Only published ACTIVE strict sessions are attested for strict READY."""
+
+    return core_ok and all(
+        state is not HookState.ACTIVE
+        or (observation is AttestationState.INTACT and ready_now)
+        for state, observation, ready_now in sessions
+    )
+
+
+def post_dlopen_failure_state(any_successful_dlopen: bool,
+                              terminal_state: HookState) -> str:
+    """A constructor-reaching dlopen makes every later failure PARTIAL."""
+
+    if any_successful_dlopen:
+        return "partial"
+    return "unknown" if terminal_state is HookState.UNKNOWN else "failed"
 
 
 class DlsymDouble:
@@ -1340,6 +1385,226 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
                 "selected readiness must query the live transaction hook state")
 
     check("selected_tweak_readiness_atomic_source_contract", check_selected_readiness_source_contract)
+
+    def check_phase_attestation_fixture() -> None:
+        require(
+            core_attestation_ready(
+                AttestationState.INTACT, True, HookState.ACTIVE, True
+            ),
+            "an intact, live core session must pass a bounded phase gate",
+        )
+        for observation in (
+            AttestationState.FAILED,
+            AttestationState.UNKNOWN,
+            AttestationState.NOT_ATTEMPTED,
+        ):
+            require(
+                not core_attestation_ready(observation, True, HookState.ACTIVE, True),
+                f"{observation.value} core attestation must fail closed",
+            )
+        require(
+            not core_attestation_ready(AttestationState.INTACT, False, HookState.ACTIVE, True),
+            "an intact historic observation cannot revive a non-live core session",
+        )
+        require(
+            not core_attestation_ready(AttestationState.INTACT, True, HookState.FAILED, True),
+            "callback fail-stop outer state must remain one-way",
+        )
+        require(
+            not core_attestation_ready(AttestationState.INTACT, True, HookState.ACTIVE, False),
+            "failed callback delivery must override an otherwise intact slot observation",
+        )
+        require(
+            strict_attestation_ready(
+                True,
+                [
+                    (HookState.NOT_ATTEMPTED, AttestationState.UNKNOWN, False),
+                    (HookState.ACTIVE, AttestationState.INTACT, True),
+                ],
+            ),
+            "unpublished optional strict sessions must not be attested",
+        )
+        for observation in (AttestationState.FAILED, AttestationState.UNKNOWN):
+            require(
+                not strict_attestation_ready(
+                    True, [(HookState.ACTIVE, observation, False)]
+                ),
+                f"published ACTIVE strict session with {observation.value} observation must block READY",
+            )
+        require(
+            post_dlopen_failure_state(False, HookState.FAILED) == "failed"
+            and post_dlopen_failure_state(False, HookState.UNKNOWN) == "unknown",
+            "pre-load attestation failures may retain FAILED/UNKNOWN",
+        )
+        require(
+            post_dlopen_failure_state(True, HookState.FAILED) == "partial"
+            and post_dlopen_failure_state(True, HookState.UNKNOWN) == "partial",
+            "a successful support/loader/tweak dlopen must make later failure PARTIAL",
+        )
+
+    check("phase_attestation_success_failure_unknown_and_partial_fixture", check_phase_attestation_fixture)
+
+    def check_phase_attestation_source_contract() -> None:
+        def c_function_body(source: str, signature: str) -> str:
+            start = source.index(signature)
+            brace = source.index("{", start)
+            depth = 0
+            for index in range(brace, len(source)):
+                if source[index] == "{":
+                    depth += 1
+                elif source[index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return source[start:index + 1]
+            raise AssertionError(f"unterminated C function: {signature}")
+
+        require(
+            "RHI_HIDER_INTERNAL bool hidden_dylib_hider_attest_core(void);" in hider_internal,
+            "core phase-attestation API must stay internal",
+        )
+        core_body = c_function_body(hider, "bool hidden_dylib_hider_attest_core(void)")
+        for token in (
+            "rhi_hider_hook_session_attest(&g_core_hook_session)",
+            "observation == RHI_ATTEST_INTACT",
+            "rhi_hider_hook_session_is_ready(&g_core_hook_session)",
+            "HIDER_STATE_INITIALIZING",
+            "HIDER_STATE_READY",
+            "g_callback_delivery_failed",
+            "hider_degrade_to_native();",
+            "atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release)",
+            "atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release)",
+        ):
+            require(token in core_body, f"core phase attestation missing {token}")
+        require(
+            core_body.index("hider_degrade_to_native();") <
+            core_body.index("atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED"),
+            "core must route permanent relays to native before fail-closing readiness",
+        )
+        init_body = c_function_body(hider, "void hidden_dylib_hider_init(void)")
+        require(
+            "atomic_compare_exchange_strong_explicit(&g_init_state, &expected_ready" in init_body,
+            "core READY must not overwrite a racing callback fail-stop",
+        )
+        callback_failstop_body = c_function_body(hider, "static void hider_callback_fail_stop(void)")
+        require(
+            "atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release)" in callback_failstop_body,
+            "callback fail-stop must invalidate strict readiness before a racing strict READY publication",
+        )
+
+        strict_body = c_function_body(hider, "void hidden_dylib_hider_enable_strict_hooks(void)")
+        strict_attest_body = c_function_body(hider, "static bool hider_attest_active_strict_sessions(void)")
+        for token in (
+            "session->state != RHI_HOOK_ACTIVE",
+            "rhi_hider_hook_session_attest(session)",
+            "rhi_hider_hook_session_is_ready(session)",
+            "atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release)",
+        ):
+            require(token in strict_attest_body, f"strict active-session attestation missing {token}")
+        require(
+            strict_body.index("hidden_dylib_hider_attest_core()") <
+            strict_body.index("START_STRICT_SESSION"),
+            "strict installation must attest core before the first strict session",
+        )
+        strict_phase = strict_body.index("hider_attest_active_strict_sessions()")
+        strict_core = strict_body.index("const bool core_intact", strict_phase)
+        strict_ready = strict_body.index("atomic_compare_exchange_strong_explicit(&g_strict_state", strict_core)
+        require(strict_phase < strict_core < strict_ready,
+                "strict READY requires all published ACTIVE sessions then core attestation")
+
+        checkin = main.index("roothide_init_with_checkin(JB_RootPath)")
+        checkin_checkpoint = main.index("hidden_dylib_hider_attest_core()", checkin)
+        checkin_done = main.index('rhi_diag_log("POST-ROOTHIDE-CHECKIN done")', checkin)
+        require(checkin < checkin_checkpoint < checkin_done,
+                "main must attest core immediately after roothideinit/checkin load phase")
+        executable_phase = main.index("roothide_init_with_executable(gExecutablePath)")
+        executable_checkpoint = main.index("hidden_dylib_hider_attest_core()", executable_phase)
+        selected_load_comment = main.index("// Load tweaks if desired", executable_phase)
+        require(executable_phase < executable_checkpoint < selected_load_comment,
+                "main must attest core immediately after roothidehooks/patch phase")
+
+        phase_body = c_function_body(roothider_main, "static bool hidden_tweak_attest_phase(const char *phase)")
+        for token in (
+            "hidden_dylib_hider_attest_core()",
+            "gHiddenTweakFallbackTransaction",
+            "bool fallback_intact = false",
+            "if (!transaction)",
+            "hidden_tweak_attest_active_fallback",
+            "hidden_tweak_fail_attestation_phase",
+        ):
+            require(token in phase_body, f"combined hidden-tweak phase gate missing {token}")
+        fallback_body = c_function_body(
+            roothider_main,
+            "static bool hidden_tweak_attest_active_fallback(",
+        )
+        for token in (
+            "before != RHI_HOOK_ACTIVE",
+            "rhi_rebind_transaction_attest(transaction)",
+            "observation == RHI_ATTEST_INTACT",
+            "after == RHI_HOOK_ACTIVE",
+            'rhi_rebind_transaction_hook_is_active(transaction, "dlopen")',
+        ):
+            require(token in fallback_body, f"fallback phase gate missing {token}")
+
+        fallback_pointer = roothider_main.index(
+            "atomic_store_explicit(&gHiddenTweakFallbackTransaction, transaction, memory_order_release)"
+        )
+        fallback_attest = roothider_main.index("hidden_tweak_attest_active_fallback(transaction", fallback_pointer)
+        fallback_advertise = roothider_main.index(
+            "atomic_store_explicit(&dlopen_fallback_hook_installed, true, memory_order_release)",
+            fallback_attest,
+        )
+        require(fallback_pointer < fallback_attest < fallback_advertise,
+                "activated fallback must be retained and attested before ACTIVE advertisement")
+
+        support_body = c_function_body(roothider_main, "static bool hidden_tweak_load_support_library(")
+        support_store = support_body.index("hidden_tweak_store_loaded_library(libraryPath, handle)")
+        support_attest = support_body.index('hidden_tweak_attest_phase("support-library dlopen")')
+        require(support_store < support_attest,
+                "support handle must be retained before its post-dlopen attestation")
+        prepare_body = c_function_body(roothider_main, "static bool hidden_tweak_prepare_runtime(")
+        require('hidden_tweak_attest_phase("hidden-tweak prepare entry")' in prepare_body,
+                "hidden-tweak prepare entry must attest core and fallback")
+        note_body = c_function_body(roothider_main, "bool roothide_hidden_tweak_note_loader_result(bool succeeded)")
+        loader_success = note_body.index("gHiddenTweakAnyDlopenSucceeded = true")
+        loader_attest = note_body.index('hidden_tweak_attest_phase("TweakLoader dlopen")')
+        require(loader_success < loader_attest,
+                "successful TweakLoader must become PARTIAL-capable before post-load attestation")
+        loader_handle = main.index("gHiddenTweakLoaderHandle = tweakLoaderHandle")
+        loader_note = main.index("roothide_hidden_tweak_note_loader_result", loader_handle)
+        require(loader_handle < loader_note,
+                "main must retain successful TweakLoader handle before attestation")
+
+        selected_body = c_function_body(roothider_main, "bool roothide_hidden_tweak_load_selected(void)")
+        selected_entry = selected_body.index('hidden_tweak_attest_phase("selected-load entry")')
+        selected_store = selected_body.index("hidden_tweak_store_loaded_library(binary->path, handle)")
+        selected_attest = selected_body.index('hidden_tweak_attest_phase("selected tweak binary dlopen")')
+        selected_authorize = selected_body.index("hidden_tweak_verified_loaded_image_seam(binary->path)", selected_attest)
+        selected_active = selected_body.index("gHiddenTweakLoadState = HIDDEN_TWEAK_LOAD_ACTIVE")
+        selected_publish_attest = selected_body.index('hidden_tweak_attest_phase("selected ACTIVE publication")')
+        require(selected_entry < selected_store < selected_attest < selected_authorize,
+                "selected load must attest entry and every retained binary before capability authorization")
+        require(selected_publish_attest < selected_active,
+                "selected ACTIVE publication needs a final bounded attestation")
+
+        # Attestation must never migrate into O(1) readiness or loader/dyld
+        # wrappers. These checks intentionally inspect function bodies rather
+        # than a global substring, because phase helpers are allowed to attest.
+        for source, signature in (
+            (hider, "static bool hider_is_ready(void)"),
+            (hider, "static bool hider_strict_hooks_ready(void)"),
+            (hider, "static bool hider_strict_hook_is_ready("),
+            (hider, "static void *h_dlsym("),
+            (roothider_main, "bool roothide_hidden_tweak_hooks_ready(void)"),
+            (roothider_main, "void *dlopen_fallback_hook("),
+            (roothider_main, "void* dyld_dlopen_hook("),
+            (roothider_main, "void* dyld_dlopen_from_hook("),
+            (roothider_main, "void* dyld_dlopen_audited_hook("),
+            (roothider_main, "bool dyld_dlopen_preflight_hook("),
+        ):
+            require("attest" not in c_function_body(source, signature).lower(),
+                    f"hot path {signature} must not perform phase attestation")
+
+    check("phase_attestation_checkpoints_and_no_hot_path_static_contract", check_phase_attestation_source_contract)
 
     def check_remap_source_contract() -> None:
         require("hidden_dylib_hider_dlsym_remap" in hider, "remap entry point missing")

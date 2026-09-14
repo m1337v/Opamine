@@ -619,6 +619,12 @@ __attribute__((constructor)) static void initializer(void)
 /* after unsandboxing jbroot and applying library-trust-hook */
 roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 /*************************** roothide ************************/
+	/* Loader/check-in may add images after the core session's initial commit.
+	 * Re-prove it at this bounded startup phase; failure flips the hider's
+	 * permanent relay/state fail-closed and ordinary wrappers stay O(1). */
+	if (gHiddenInjection && !hidden_dylib_hider_attest_core()) {
+		rhi_diag_log("HIDER core attestation failed after roothideinit load phase");
+	}
 	rhi_diag_log("POST-ROOTHIDE-CHECKIN done");
 
 
@@ -691,6 +697,11 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 					gHiddenInjection ? "hidden" : "normal",
 					gExecutablePath);
 				roothide_init_with_executable(gExecutablePath);
+				/* roothidehooks/patch may load additional images; attestation belongs
+				 * here rather than a callback or wrapper hot path. */
+				if (gHiddenInjection && !hidden_dylib_hider_attest_core()) {
+					rhi_diag_log("HIDER core attestation failed after roothidehooks/patch phase");
+				}
 			}
 /******************* roothide ****************/
 
@@ -727,15 +738,26 @@ roothide_init_with_checkin(JB_RootPath); // will hook dlopen* if necessary
 							}
 							void *tweakLoaderHandle = dlopen(tweakLoaderPath, tweakLoaderMode);
 							rhi_diag_log("TweakLoader dlopen result=%p dlerror=%s", tweakLoaderHandle, tweakLoaderHandle ? "none" : (dlerror() ?: "(null)"));
+							/* A successful loader has run constructors. Retain it before the
+							 * bounded phase attestation so failure never leaves an untracked
+							 * successful dlopen or a re-open/rollback temptation. */
+							if (tweakLoaderHandle != NULL && gHiddenInjection && gHiddenTweakLoading) {
+								gHiddenTweakLoaderHandle = tweakLoaderHandle;
+							}
+							bool loaderPhaseIntact = true;
 							if (gHiddenInjection && gHiddenTweakLoading) {
-								roothide_hidden_tweak_note_loader_result(tweakLoaderHandle != NULL);
+								loaderPhaseIntact = roothide_hidden_tweak_note_loader_result(tweakLoaderHandle != NULL);
 							}
 							if (tweakLoaderHandle != NULL) {
 								root_hide_hidden_whitelist_log("TweakLoader loaded executable=%s", gExecutablePath);
 								if (gHiddenInjection && gHiddenTweakLoading) {
-									gHiddenTweakLoaderHandle = tweakLoaderHandle;
-									bool selectedTweaksLoaded = roothide_hidden_tweak_load_selected();
-									rhi_diag_log("POST-LOAD-SELECTED loaded=%d state=%d", selectedTweaksLoaded, roothide_hidden_tweak_load_state());
+									if (loaderPhaseIntact) {
+										bool selectedTweaksLoaded = roothide_hidden_tweak_load_selected();
+										rhi_diag_log("POST-LOAD-SELECTED loaded=%d state=%d", selectedTweaksLoaded, roothide_hidden_tweak_load_state());
+									}
+									else {
+										root_hide_hidden_whitelist_log("skip selected tweaks after failed TweakLoader attestation executable=%s state=%d", gExecutablePath, roothide_hidden_tweak_load_state());
+									}
 								}
 								else {
 									dlclose(tweakLoaderHandle);

@@ -371,6 +371,46 @@ static rhi_hider_hook_session_t g_strict_opendir_session = { .name = "strict-ope
 static rhi_hider_hook_session_t g_strict_readdir_session = { .name = "strict-readdir" };
 static rhi_hider_hook_session_t g_strict_closedir_session = { .name = "strict-closedir" };
 
+extern void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void hider_degrade_to_native(void);
+
+/* This is deliberately a bounded phase check, never a readiness-path repair.
+ * The underlying transaction attestation performs raw loads only and records
+ * its own terminal observation; all public hot paths continue to consume the
+ * two cheap state words below. */
+bool hidden_dylib_hider_attest_core(void)
+{
+	const rhi_rebind_attestation_t observation =
+		rhi_hider_hook_session_attest(&g_core_hook_session);
+	const bool session_ready = rhi_hider_hook_session_is_ready(&g_core_hook_session);
+	const hider_state_t publication_state = (hider_state_t)
+		atomic_load_explicit(&g_init_state, memory_order_acquire);
+	const bool callback_delivery_clean = !atomic_load_explicit(
+		&g_callback_delivery_failed, memory_order_acquire);
+	/* INITIALIZING is accepted only for hidden_dylib_hider_init's final bounded
+	 * proof. Every later caller requires the already-published READY state; a
+	 * callback fail-stop may never be overwritten by a still-intact slot view. */
+	const bool phase_is_live = publication_state == HIDER_STATE_INITIALIZING ||
+		publication_state == HIDER_STATE_READY;
+	if (observation == RHI_ATTEST_INTACT && session_ready &&
+	    phase_is_live && callback_delivery_clean) {
+		return true;
+	}
+
+	/* A core view which cannot prove every live slot must never remain
+	 * advertised.  Do not roll back or destroy the activated transaction: its
+	 * replacements may already be reachable from arbitrary constructors. The
+	 * permanent relay must switch to native delivery before the O(1) state
+	 * stores make every wrapper forward through its captured original. */
+	hider_degrade_to_native();
+	atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+	atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release);
+	rhi_diag_log("HIDER core attestation %s session-ready=%d init=%u callbacks=%d; readiness disabled",
+		rhi_rebind_attestation_name(observation), session_ready, publication_state,
+		callback_delivery_clean);
+	return false;
+}
+
 static bool hider_is_ready(void) {
 	return atomic_load_explicit(&g_init_state, memory_order_acquire) == HIDER_STATE_READY &&
 	       rhi_hider_hook_session_is_ready(&g_core_hook_session);
@@ -689,8 +729,6 @@ static hider_image_record_t *catalog_active_at_index_locked(uint32_t index, bool
 	return NULL;
 }
 
-static void hider_degrade_to_native(void);
-
 bool hidden_dylib_hider_catalog_snapshot(rhi_hider_catalog_snapshot_t *snapshot_out) {
 	if (!snapshot_out) {
 		return false;
@@ -850,6 +888,10 @@ static void hider_callback_fail_stop(void) {
 	atomic_store_explicit(&g_callback_delivery_failed, true, memory_order_release);
 	hider_degrade_to_native();
 	atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+	/* A callback ambiguity invalidates the strict view too. This prevents a
+	 * concurrent final strict READY CAS from leaving stale dlsym advertisement
+	 * after the core relay has already switched to native delivery. */
+	atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release);
 }
 
 typedef struct {
@@ -3465,8 +3507,6 @@ static kern_return_t h_mach_port_get_refs(ipc_space_t task, mach_port_name_t nam
 //------------------------------------------------------------------------------
 #pragma mark - Public Init
 
-extern void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
 // Called from main.c when gHiddenInjection is true, after env vars are
 // consumed and before roothide_init_with_executable / TweakLoader.
 void hidden_dylib_hider_init(void)
@@ -3631,13 +3671,73 @@ void hidden_dylib_hider_init(void)
 		atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
 		return;
 	}
-	atomic_store_explicit(&g_init_state, HIDER_STATE_READY, memory_order_release);
+	if (!hidden_dylib_hider_attest_core()) {
+		return;
+	}
+	/* A callback fail-stop can race the final bounded observation. Never revive
+	 * it with a blind READY store: INITIALIZING is the only state allowed to
+	 * publish core readiness. */
+	unsigned expected_ready = HIDER_STATE_INITIALIZING;
+	if (!atomic_compare_exchange_strong_explicit(&g_init_state, &expected_ready,
+	                                             HIDER_STATE_READY,
+	                                             memory_order_release,
+	                                             memory_order_acquire)) {
+		return;
+	}
 	rhi_diag_log("HIDER init complete — verified core hooks enabled");
+}
+
+/* Optional strict sessions are independent for installation, but any session
+ * which did reach ACTIVE must prove its exact slot word before strict READY is
+ * published.  Keep walking after a bad observation so one phase attests every
+ * active session, while preserving all activated transactions in place. */
+static bool hider_attest_active_strict_sessions(void)
+{
+	rhi_hider_hook_session_t *const sessions[] = {
+		&g_strict_class_image_session,
+		&g_strict_copy_images_session,
+		&g_strict_copy_names_session,
+		&g_strict_copy_class_list_session,
+		&g_strict_add_load_session,
+		&g_strict_getenv_session,
+		&g_strict_access_session,
+		&g_strict_stat_session,
+		&g_strict_lstat_session,
+		&g_strict_fopen_session,
+		&g_strict_opendir_session,
+		&g_strict_readdir_session,
+		&g_strict_closedir_session,
+	};
+	bool all_intact = true;
+	for (size_t i = 0; i < sizeof(sessions) / sizeof(*sessions); i++) {
+		rhi_hider_hook_session_t *session = sessions[i];
+		/* session->state is the one-way publication result.  Do not select on
+		 * the transaction's current state: a formerly ACTIVE session that has
+		 * degraded still needs its terminal observation to block strict READY. */
+		if (session->state != RHI_HOOK_ACTIVE) {
+			continue;
+		}
+		const rhi_rebind_attestation_t observation =
+			rhi_hider_hook_session_attest(session);
+		const bool session_ready = rhi_hider_hook_session_is_ready(session);
+		if (observation != RHI_ATTEST_INTACT || !session_ready) {
+			all_intact = false;
+			rhi_diag_log("HIDER strict %s attestation %s session-ready=%d; strict readiness disabled",
+				session->name ?: "(unnamed)",
+				rhi_rebind_attestation_name(observation), session_ready);
+		}
+	}
+	if (!all_intact) {
+		atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release);
+	}
+	return all_intact;
 }
 
 void hidden_dylib_hider_enable_strict_hooks(void)
 {
-	if (!hider_is_ready()) {
+	/* Before the first optional installation, re-prove the required core view.
+	 * This is a loader-phase boundary, not a condition folded into readiness. */
+	if (!hidden_dylib_hider_attest_core() || !hider_is_ready()) {
 		return;
 	}
 	unsigned expected = HIDER_STATE_UNINITIALIZED;
@@ -3701,9 +3801,24 @@ void hidden_dylib_hider_enable_strict_hooks(void)
 #undef START_STRICT_SESSION
 
 	// Do not expose strict-hook pointers through dlsym until every requested
-	// strict installation has run.  A concurrent/reentrant caller observes the
+	// strict installation has run and every ACTIVE session plus core has passed
+	// a read-only phase attestation. A concurrent/reentrant caller observes the
 	// original APIs during this short window instead of a half-installed set.
-	atomic_store_explicit(&g_strict_state, HIDER_STATE_READY, memory_order_release);
+	const bool strict_sessions_intact = hider_attest_active_strict_sessions();
+	const bool core_intact = hidden_dylib_hider_attest_core();
+	if (!strict_sessions_intact || !core_intact) {
+		atomic_store_explicit(&g_strict_state, HIDER_STATE_FAILED, memory_order_release);
+		return;
+	}
+	/* Preserve a concurrent core-attestation terminal state instead of
+	 * overwriting it with strict READY after the bounded checks complete. */
+	unsigned expected_ready = HIDER_STATE_INITIALIZING;
+	if (!atomic_compare_exchange_strong_explicit(&g_strict_state, &expected_ready,
+	                                             HIDER_STATE_READY,
+	                                             memory_order_release,
+	                                             memory_order_acquire)) {
+		return;
+	}
 	rhi_diag_log("HIDER strict hooks enabled");
 }
 

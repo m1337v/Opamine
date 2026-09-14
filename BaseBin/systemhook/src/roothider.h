@@ -61,7 +61,10 @@ bool roothide_hidden_tweak_prepare_minimal_runtime(void);
 bool roothide_hidden_tweak_load_selected(void);
 bool roothide_hidden_tweak_hooks_ready(void);
 HiddenTweakLoadState roothide_hidden_tweak_load_state(void);
-void roothide_hidden_tweak_note_loader_result(bool succeeded);
+/* Called after TweakLoader's dlopen result. A successful handle must already
+ * be retained by the caller; false means the bounded post-load attestation
+ * withheld selected-tweak progress. */
+bool roothide_hidden_tweak_note_loader_result(bool succeeded);
 
 int __sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);
 int __sysctl_hook(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);

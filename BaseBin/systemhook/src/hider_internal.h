@@ -17,6 +17,10 @@
 #endif
 
 RHI_HIDER_INTERNAL void hidden_dylib_hider_init(void);
+/* Bounded phase-boundary attestation for the required core session.  This is
+ * intentionally not part of ordinary readiness or any hook wrapper: callers
+ * use it only around loader/installation transitions. */
+RHI_HIDER_INTERNAL bool hidden_dylib_hider_attest_core(void);
 /* Consume the inherited profile before the parent process environment is
  * physically scrubbed.  The operation is idempotent so the hider also stays
  * safe when embedded by a future loader that does not use main.c. */
