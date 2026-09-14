@@ -362,10 +362,10 @@ baseline verifier also passes and confirms that Sileo has no URL-registration
 keys. Its one documented systemhook gap remains the bounded native fallback for
 unprovable two-level `RTLD_SELF`/`RTLD_NEXT` caller-relative semantics.
 
-The parent repository is not yet independently fetchable because XPF commit
-`1e5da55fc6d8221e90b18659d44564acb12f903c` currently exists only in the local
-RootHide XPF checkout. A public fork/branch must contain that commit before the
-parent gitlink can be pushed as a reproducible build.
+XPF commit `1e5da55fc6d8221e90b18659d44564acb12f903c` is published on the
+`m1337v/XPF` fork's `roothide-dopamine3` branch, and the parent `.gitmodules`
+entry points to that fork. The parent gitlink is therefore independently
+fetchable by CI and fresh clones.
 
 ## Timeline
 
