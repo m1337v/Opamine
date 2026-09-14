@@ -52,6 +52,9 @@ typedef enum {
  * of this process and callers must not automatically retry them.
  */
 bool roothide_hidden_tweak_envbuf_apply(char ***envc);
+/* Capture the selected-tweak bridge values before a hidden child scrubs its
+ * observable environment.  Repeated calls retain the first canonical view. */
+void roothide_hidden_tweak_consume_environment(void);
 bool roothide_hidden_tweak_env_is_configured(void);
 bool roothide_hidden_tweak_prepare_for_loader(void);
 bool roothide_hidden_tweak_prepare_minimal_runtime(void);

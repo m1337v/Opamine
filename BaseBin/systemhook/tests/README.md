@@ -45,6 +45,30 @@ publication in the parent (the only intentional wait) and the child chooses
 permanent pass-through, so it never relies on inherited filtering state or a
 vanished worker.
 
+The policy fixtures and characterization lane also cover a single shared path
+and environment view: exact loader basenames rather than broad substrings,
+directory-point versus directory-enumeration parity, and the absence of a
+hidden `opendir` target.  Startup checks assert that selected-tweak and hider
+bridge values are retained before the live `_NSGetEnviron` vector is compacted,
+with no `PATH` rewrite.  The host matrix models filtered self `KERN_PROCARGS2`
+size/exact/error cases plus XNU's special short-buffer path. The NULL-buffer
+size query word-rounds an otherwise byte-exact filtered result only within its
+private allocation and explicitly zeroes that padding; a non-NULL successful
+fetch still reports its unrounded consumed length. Buffers no larger than the
+argc word (or with an `ARG_MAX`-exceeding payload) fail with `EINVAL`;
+larger short buffers succeed, report consumed length, and receive the legacy
+page-window zero tail generated solely from the filtered private payload. It
+also covers self-only `P_TRACED` normalization and named/numeric `kern.bootargs`
+parity. ObjC copy APIs compact their runtime-owned arrays in place even when
+`outCount` is NULL, clear every hidden tail pointer (through the documented
+nil terminator for `objc_copyClassList`), and never use class names alone to
+decide visibility.
+
+These models do not establish the iOS private `KERN_PROCARGS2` layout, the
+target page geometry used by the current XNU short-buffer compatibility path,
+`sysctlnametomib("kern.bootargs")` availability, sandboxed `F_GETPATH`, or
+Objective-C runtime ownership behavior. Those remain explicit device gates.
+
 The `dlsym` lane additionally models caller-relative `RTLD_SELF` and
 `RTLD_NEXT` only for a caller with a safely validated flat Mach-O namespace
 (`MH_TWOLEVEL` clear). In that case it proves the resolver starts at (or after)

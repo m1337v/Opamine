@@ -17,6 +17,10 @@
 #endif
 
 RHI_HIDER_INTERNAL void hidden_dylib_hider_init(void);
+/* Consume the inherited profile before the parent process environment is
+ * physically scrubbed.  The operation is idempotent so the hider also stays
+ * safe when embedded by a future loader that does not use main.c. */
+RHI_HIDER_INTERNAL void hidden_dylib_hider_consume_environment_profile(void);
 RHI_HIDER_INTERNAL void hidden_dylib_hider_enable_strict_hooks(void);
 RHI_HIDER_INTERNAL void *hidden_dylib_hider_dlsym_remap(const char *name);
 RHI_HIDER_INTERNAL bool hidden_dylib_hider_envbuf_apply(char ***envc);

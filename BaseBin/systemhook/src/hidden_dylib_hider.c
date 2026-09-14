@@ -49,6 +49,8 @@
 #include "hider_identity.h"
 #include "hider_caller_policy.h"
 #include "hider_hook_session.h"
+#include "hider_environment_policy.h"
+#include "hider_path_policy.h"
 
 // From roothider_main.c — non-static after our edit
 extern bool hidden_tweak_filter_should_block_path(const char *path);
@@ -103,6 +105,13 @@ static kern_return_t (*orig_mach_port_get_refs)(ipc_space_t, mach_port_name_t, m
 static IMP orig_UIApplication_canOpenURL = NULL;
 static IMP orig_UIApplication_openURL = NULL;
 static IMP orig_UIApplication_openURL_options_completion = NULL;
+
+/* `kern.bootargs` is an ABI-private numeric selector.  Resolve it once while
+ * the native sysctl entry point is still authoritative instead of guessing a
+ * MIB constant that may drift across iOS releases. */
+static int g_bootargs_mib[CTL_MAXNAME] = {0};
+static size_t g_bootargs_mib_count = 0;
+static bool g_bootargs_mib_resolved = false;
 
 /* Internal callback pins must use dlopen/dlclose, but callers are entitled to
  * the error that was pending before our bookkeeping began.  Virtualize that
@@ -175,7 +184,6 @@ static kern_return_t h_mach_port_get_refs(ipc_space_t task, mach_port_name_t nam
 static BOOL h_UIApplication_canOpenURL(id self, SEL _cmd, id url);
 static BOOL h_UIApplication_openURL(id self, SEL _cmd, id url);
 static void h_UIApplication_openURL_options_completion(id self, SEL _cmd, id url, id options, void *completion);
-static bool fs_path_should_hide(const char *path);
 
 //------------------------------------------------------------------------------
 #pragma mark - Stable Image Catalog
@@ -240,97 +248,6 @@ static hider_image_event_t  *g_image_event_tail = NULL;
 static uint64_t              g_image_event_sequence = 0;
 static uint64_t              g_image_identity_sequence = 0;
 static os_unfair_lock        g_lock = OS_UNFAIR_LOCK_INIT;
-
-typedef enum {
-	DIR_FILTER_NONE = 0,
-	DIR_FILTER_PREBOOT_ROOT,
-	DIR_FILTER_PREBOOT_HASH_ROOT,
-} dir_filter_kind_t;
-
-static bool path_is_preboot_root(const char *path) {
-	return path && (!strcmp(path, "/private/preboot") || !strcmp(path, "/private/preboot/"));
-}
-
-static bool path_is_preboot_hash_root(const char *path) {
-	if (!path || !string_has_prefix(path, "/private/preboot/")) {
-		return false;
-	}
-
-	const char *relative = path + sizeof("/private/preboot/") - 1;
-	if (!relative[0]) {
-		return false;
-	}
-	if (strchr(relative, '/')) {
-		return false;
-	}
-	if (!strcmp(relative, "active")) {
-		return false;
-	}
-	return true;
-}
-
-static dir_filter_kind_t dir_filter_kind_for_path(const char *path) {
-	if (path_is_preboot_root(path)) {
-		return DIR_FILTER_PREBOOT_ROOT;
-	}
-	if (path_is_preboot_hash_root(path)) {
-		return DIR_FILTER_PREBOOT_HASH_ROOT;
-	}
-	return DIR_FILTER_NONE;
-}
-
-/* A DIR* is not a stable path identity: libc may recycle the pointer and a
- * directory may be renamed after opendir.  Resolve the descriptor on every
- * external readdir decision instead of retaining process-global DIR state.
- * F_GETPATH is intentionally best-effort; sandboxed or unusual descriptors
- * simply keep stock readdir behavior. */
-static bool dir_filter_kind_for_dir(DIR *dirp, dir_filter_kind_t *kind_out) {
-	if (!dirp || !kind_out) {
-		return false;
-	}
-
-	const int saved_errno = errno;
-	const int fd = dirfd(dirp);
-	char path[PATH_MAX];
-	if (fd < 0 || fcntl(fd, F_GETPATH, path) != 0) {
-		errno = saved_errno;
-		return false;
-	}
-
-	*kind_out = dir_filter_kind_for_path(path);
-	errno = saved_errno;
-	return true;
-}
-
-static bool preboot_root_entry_should_hide(const char *name) {
-	if (!name || !name[0]) {
-		return false;
-	}
-
-	return !strcmp(name, ".installed_palera1n")
-	    || !strcmp(name, "jb")
-	    || !strcmp(name, "procursus");
-}
-
-static bool preboot_hash_root_entry_should_hide(const char *name) {
-	if (!name || !name[0]) {
-		return false;
-	}
-
-	return string_has_prefix(name, "dopamine-")
-	    || string_has_prefix(name, "jb-");
-}
-
-static bool dir_entry_should_hide(dir_filter_kind_t kind, const char *name) {
-	switch (kind) {
-		case DIR_FILTER_PREBOOT_ROOT:
-			return preboot_root_entry_should_hide(name);
-		case DIR_FILTER_PREBOOT_HASH_ROOT:
-			return preboot_hash_root_entry_should_hide(name);
-		default:
-			return false;
-	}
-}
 
 /*
  * Registrations are process-lifetime objects too.  An image event never needs
@@ -483,6 +400,7 @@ static bool hider_strict_hook_is_ready(const rhi_hider_hook_session_t *session,
  */
 static char g_hider_bridge_profile[8] = "full";
 static char g_hider_bridge_disabled[96] = {0};
+static bool g_hider_profile_consumed = false;
 
 // Cache the executable path for dladdr / class_getImageName substitution
 static const char *g_executable_path = NULL;
@@ -549,7 +467,11 @@ static void retain_effective_hider_profile_for_child(void) {
 	else if (!g_hook_directory_enabled) hider_bridge_append_disabled("directory");
 }
 
-static void load_hider_profile_from_environment(void) {
+void hidden_dylib_hider_consume_environment_profile(void) {
+	if (g_hider_profile_consumed) {
+		return;
+	}
+	g_hider_profile_consumed = true;
 	const char *profile = getenv("ROOTHIDE_HIDER_PROFILE");
 	const char *disabled = getenv("ROOTHIDE_HIDER_DISABLED_HOOKS");
 
@@ -602,49 +524,6 @@ bool hidden_dylib_hider_envbuf_apply(char ***envc) {
 		&& (g_hider_bridge_disabled[0]
 			? envbuf_setenv(envc, "ROOTHIDE_HIDER_DISABLED_HOOKS", g_hider_bridge_disabled)
 			: envbuf_unsetenv(envc, "ROOTHIDE_HIDER_DISABLED_HOOKS"));
-}
-
-//------------------------------------------------------------------------------
-#pragma mark - Path Filter
-
-// Determine if an image path should be hidden from the app.
-// Visible to tweaks regardless.
-static bool image_path_should_hide(const char *path) {
-	if (!path || path[0] == '\0') return false;
-
-	const char *base = strrchr(path, '/');
-	if (base) base++; else base = path;
-
-	// Always hide systemhook (e.g. /usr/lib/systemhook-9D1722053A2B61DD.dylib)
-	if (strncmp(base, "systemhook-", 11) == 0 ||
-	    strcmp(base, "systemhook.dylib") == 0)
-		return true;
-
-	// Hide anything under .jbroot — ALL of it.
-	// The whitelist only controls which tweaks get LOADED (dlopen filtering),
-	// not which are VISIBLE in image enumeration.  Even whitelisted tweaks
-	// must be hidden from the app's _dyld_image_count / dladdr / etc.
-	if (strstr(path, "/.jbroot-") || strstr(path, "/.jbroot/")) {
-		return true;
-	}
-
-	// Known JB loader basenames that might appear outside .jbroot
-	static const char *hidden_bases[] = {
-		"TweakLoader.dylib",    "ellekit.dylib",
-		"libellekit.dylib",     "MobileSubstrate.dylib",
-		"CydiaSubstrate.dylib", "libsubstrate.dylib",
-		"libsubstitute.dylib",  "SubstrateLoader.dylib",
-		"substitute-loader.dylib",
-		"roothideinit.dylib",   "roothidepatch.dylib",
-		"libroothide.dylib",    "libroot.dylib",
-		NULL
-	};
-	for (int i = 0; hidden_bases[i]; i++) {
-		if (strcmp(base, hidden_bases[i]) == 0)
-			return true;
-	}
-
-	return false;
 }
 
 //------------------------------------------------------------------------------
@@ -742,7 +621,7 @@ static hider_image_record_t *catalog_create_record(const char *path,
 	}
 	record->header = mh;
 	record->slide = slide;
-	record->hidden = image_path_should_hide(path);
+	record->hidden = rhi_hider_image_path_hidden(path);
 	record->uuid_valid = catalog_copy_uuid(mh, slide, record->uuid);
 	return record;
 }
@@ -1075,7 +954,7 @@ static bool hider_dispatch_passthrough_dyld_event(hider_dyld_callback_kind_t kin
 	}
 	bool ordered = true;
 	const char *path = mh ? dyld_image_path_containing_address(mh) : NULL;
-	bool hidden = image_path_should_hide(path);
+	bool hidden = rhi_hider_image_path_hidden(path);
 	hider_dyld_callback_registration_t *registration =
 		atomic_load_explicit(&g_dyld_callbacks, memory_order_acquire);
 	for (; registration;
@@ -1321,7 +1200,7 @@ static bool hider_dispatch_passthrough_objc_event(const struct mach_header *mh) 
 	}
 	bool ordered = true;
 	const char *path = mh ? dyld_image_path_containing_address(mh) : NULL;
-	bool hidden = image_path_should_hide(path);
+	bool hidden = rhi_hider_image_path_hidden(path);
 	hider_objc_callback_registration_t *registration =
 		atomic_load_explicit(&g_objc_callbacks, memory_order_acquire);
 	for (; registration;
@@ -2175,7 +2054,7 @@ static int h_dladdr(const void *addr, Dl_info *info) {
 	// because dladdr never fails for valid addresses on stock iOS.
 	// This matches h_class_getImageName's strategy of returning g_executable_path.
 	if (info && info->dli_fname && g_executable_path && g_executable_header &&
-	    image_path_should_hide(info->dli_fname)) {
+	    rhi_hider_image_path_hidden(info->dli_fname)) {
 		// Rewrite the owning image to match the app executable. Preserve the
 		// symbol name so callers that stringify dli_sname don't crash on NULL.
 		// dli_saddr stays cleared because it would otherwise still point into the
@@ -2421,7 +2300,7 @@ static bool hider_dlsym_result_address_is_hidden(void *address) {
 	}
 	Dl_info owner_info = {0};
 	return orig_dladdr(address, &owner_info) != 0 && owner_info.dli_fname &&
-		image_path_should_hide(owner_info.dli_fname);
+		rhi_hider_image_path_hidden(owner_info.dli_fname);
 }
 
 static hider_dlsym_relative_result_t hider_dlsym_resolve_caller_relative(
@@ -2515,7 +2394,7 @@ static void *hider_dlsym_fallback_with_external_filter(
 	void *result = orig_dlsym(handle, symbol);
 	if (!caller_can_read_hidden && result) {
 		const char *path = dyld_image_path_containing_address(result);
-		if (path && image_path_should_hide(path)) {
+		if (path && rhi_hider_image_path_hidden(path)) {
 			if (orig_dlerror) {
 				(void)orig_dlerror();
 			}
@@ -2630,110 +2509,85 @@ static const char *h_class_getImageName(Class cls) {
 		return result;
 
 	// App caller: if class lives in a hidden image, return the app executable path
-	if (result && image_path_should_hide(result))
+	if (result && rhi_hider_image_path_hidden(result))
 		return g_executable_path;
 
 	return result;
 }
 
-static bool class_name_should_hide_from_app(const char *name) {
-	if (!name || !name[0]) return false;
-
-	static const char *hidden_names[] = {
-		// Marriott/Appdome residue scan false-positive classes.
-		"NSSubstituteWebResource",
-		"GEODisplayHeaderSubstitute",
-		"GEOPDDisplayHeaderSubstitute",
-		"_UIContextBinderSubstrate",
-		"_UINullSubstrate",
-		"_UIFBSSceneSubstrate",
-		// Common jailbreak/bypass runtime class names.
-		"ShadowRuleset",
-		"Shadow",
-		"ABypass",
-		"FlyJB",
-		"FLEXManager",
-		"FridaGadget",
-		"FridaAgent",
-		"EKHook",
-		"EKHookClass",
-		"TweakInjectLoader",
-		NULL
-	};
-
-	for (int i = 0; hidden_names[i]; i++) {
-		if (!strcmp(name, hidden_names[i]))
-			return true;
-	}
-
-	return false;
-}
-
 static bool class_should_hide_from_app(Class cls) {
 	if (!cls) return false;
 
-	const char *name = class_getName(cls);
-	if (class_name_should_hide_from_app(name))
-		return true;
-
+	/* Class names are not a trust boundary.  Apple and app classes may share
+	 * names with common tweak artifacts; only the runtime-owned image identity
+	 * decides whether a class is omitted from an external view. */
 	const char *image = orig_class_getImageName ? orig_class_getImageName(cls) : NULL;
-	return image && image_path_should_hide(image);
+	return image && rhi_hider_image_path_hidden(image);
 }
 
 __attribute__((noinline))
 static Class *h_objc_copyClassList(unsigned int *outCount) {
-	Class *result = orig_objc_copyClassList(outCount);
 	if (!hider_strict_hook_is_ready(&g_strict_copy_class_list_session, "objc_copyClassList"))
-		return result;
+		return orig_objc_copyClassList ? orig_objc_copyClassList(outCount) : NULL;
+
+	/* Always request the count privately: the runtime allocation is ours to
+	 * compact, and outCount is optional in the public API. */
+	unsigned int total = 0;
+	Class *result = orig_objc_copyClassList ? orig_objc_copyClassList(&total) : NULL;
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
-	if (caller_is_hidden(ra) || !result || !outCount)
+	if (caller_is_hidden(ra) || !result) {
+		if (outCount) *outCount = total;
 		return result;
+	}
 
-	unsigned int total = *outCount;
-	Class *filtered = total ? malloc(total * sizeof(Class)) : NULL;
-	if (total && !filtered)
-		return result;
-
+	/* objc_copyClassList returns a malloc-owned, nil-terminated pointer array.
+	 * Compact its elements in place so allocation pressure cannot reveal an
+	 * unfiltered list, then clear the old tail (including the documented nil
+	 * terminator) while preserving the original ownership contract for free(). */
 	unsigned int kept = 0;
 	for (unsigned int i = 0; i < total; i++) {
 		Class cls = result[i];
 		if (!class_should_hide_from_app(cls))
-			filtered[kept++] = cls;
+			result[kept++] = cls;
+	}
+	for (unsigned int i = kept; i <= total; i++) {
+		result[i] = NULL;
 	}
 
-	free(result);
-	*outCount = kept;
-	return filtered;
+	if (outCount) *outCount = kept;
+	return result;
 }
 
 __attribute__((noinline))
 static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount) {
-	const char * _Nonnull *result = orig_objc_copyImageNames(outCount);
 	if (!hider_strict_hook_is_ready(&g_strict_copy_images_session, "objc_copyImageNames"))
-		return result;
+		return orig_objc_copyImageNames ? orig_objc_copyImageNames(outCount) : NULL;
+
+	unsigned int total = 0;
+	const char * _Nonnull *result = orig_objc_copyImageNames ?
+		orig_objc_copyImageNames(&total) : NULL;
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
-	if (caller_is_hidden(ra) || !result || !outCount)
+	if (caller_is_hidden(ra) || !result) {
+		if (outCount) *outCount = total;
 		return result;
-
-	// Filter: only keep non-hidden image names.
-	// The result is malloc'd by the runtime; we can't modify in place safely,
-	// so we build a filtered copy.
-	unsigned int total = *outCount;
-	const char **filtered = malloc(total * sizeof(const char *));
-	if (!filtered) return result;
-
-	unsigned int kept = 0;
-	for (unsigned int i = 0; i < total; i++) {
-		if (!image_path_should_hide(result[i]))
-			filtered[kept++] = result[i];
 	}
 
-	// Free the original and return ours (caller will free())
-	free(result);
-	*outCount = kept;
-	return (const char * _Nonnull *)filtered;
+	/* The ObjC runtime returns a malloc-owned pointer array, so this is the
+	 * same no-allocation compaction contract as objc_copyClassList above. */
+	const char **mutable_result = (const char **)(void *)result;
+	unsigned int kept = 0;
+	for (unsigned int i = 0; i < total; i++) {
+		if (!rhi_hider_image_path_hidden(result[i]))
+			mutable_result[kept++] = result[i];
+	}
+	for (unsigned int i = kept; i < total; i++) {
+		mutable_result[i] = NULL;
+	}
+
+	if (outCount) *outCount = kept;
+	return result;
 }
 
 // NOTE: objc_getClass / NSClassFromString are intentionally NOT hooked.
@@ -2754,7 +2608,7 @@ static const char * _Nonnull *h_objc_copyClassNamesForImage(const char *image, u
 		return orig_objc_copyClassNamesForImage(image, outCount);
 
 	// App caller asking about a hidden image → return nothing
-	if (image && image_path_should_hide(image)) {
+	if (image && rhi_hider_image_path_hidden(image)) {
 		if (outCount) *outCount = 0;
 		return NULL;
 	}
@@ -2997,11 +2851,8 @@ static bool mount_entry_should_hide(const struct statfs *fs) {
 	if (!fs) return false;
 	const char *from = fs->f_mntfromname;
 	const char *on   = fs->f_mntonname;
-	// Hide any mount referencing .jbroot or procursus
-	if ((from && (strstr(from, ".jbroot") || strstr(from, "procursus"))) ||
-	    (on   && (strstr(on,   ".jbroot") || strstr(on,   "procursus"))))
-		return true;
-	return false;
+	return rhi_hider_filesystem_path_hidden(from) ||
+	       rhi_hider_filesystem_path_hidden(on);
 }
 
 static void sanitize_mount_entry(struct statfs *fs) {
@@ -3020,16 +2871,38 @@ static int h_getfsstat(struct statfs *buf, int bufsize, int mode) {
 	if (caller_is_hidden(ra))
 		return orig_getfsstat(buf, bufsize, mode);
 
-	// If buf is NULL, caller is querying count — we must still return
-	// the filtered count so the caller allocates the right buffer size.
-	if (!buf || bufsize <= 0) {
+	/* Preserve XNU's boundary behavior: a negative size is invalid and a
+	 * non-NULL zero-capacity buffer succeeds natively with no copied entries.
+	 * Only the normal NULL-buffer count query gets a filtered count. */
+	if (bufsize < 0 || (buf != NULL && bufsize == 0)) {
+		return orig_getfsstat(buf, bufsize, mode);
+	}
+
+	// A NULL buffer asks for the count; return only the visible count so the
+	// caller allocates an appropriately sized follow-up buffer.
+	if (!buf) {
 		// Query real count, then do a temporary full fetch to count visible entries
 		int real_count = orig_getfsstat(NULL, 0, mode);
 		if (real_count <= 0) return real_count;
+		if ((size_t)real_count > SIZE_MAX / sizeof(struct statfs)) {
+			errno = ENOMEM;
+			return -1;
+		}
 		size_t tmpsize = (size_t)real_count * sizeof(struct statfs);
+		if (tmpsize > (size_t)INT_MAX) {
+			errno = ENOMEM;
+			return -1;
+		}
 		struct statfs *tmp = malloc(tmpsize);
-		if (!tmp) return real_count;
+		if (!tmp) {
+			errno = ENOMEM;
+			return -1;
+		}
 		int fetched = orig_getfsstat(tmp, (int)tmpsize, mode);
+		if (fetched < 0) {
+			free(tmp);
+			return fetched;
+		}
 		int kept = 0;
 		for (int i = 0; i < fetched; i++) {
 			if (!mount_entry_should_hide(&tmp[i])) kept++;
@@ -3063,7 +2936,7 @@ static int h_statfs(const char *path, struct statfs *buf) {
 	if (caller_is_hidden(ra))
 		return orig_statfs(path, buf);
 
-	if (path && fs_path_should_hide(path)) {
+	if (path && rhi_hider_filesystem_path_hidden(path)) {
 		errno = ENOENT;
 		return -1;
 	}
@@ -3088,7 +2961,7 @@ static int h_statvfs(const char *path, struct statvfs *buf) {
 
 	// Darwin's statvfs result does not expose mount path strings, so the useful
 	// app-visible probe here is the input path itself. Keep it stock otherwise.
-	if (path && fs_path_should_hide(path)) {
+	if (path && rhi_hider_filesystem_path_hidden(path)) {
 		errno = ENOENT;
 		return -1;
 	}
@@ -3107,6 +2980,232 @@ static int h_statvfs(const char *path, struct statvfs *buf) {
 #define P_TRACED 0x00000800
 #endif
 
+static bool hider_sysctl_is_read_only(const void *newp, size_t newlen)
+{
+	return newp == NULL && newlen == 0;
+}
+
+static bool hider_sysctl_is_self_procargs2(const int *name, u_int namelen,
+	                                          size_t *oldlenp,
+	                                          const void *newp, size_t newlen)
+{
+	return name && oldlenp && hider_sysctl_is_read_only(newp, newlen) &&
+	       namelen == 3U && name[0] == CTL_KERN &&
+	       name[1] == KERN_PROCARGS2 && name[2] == getpid();
+}
+
+static bool hider_sysctl_is_bootargs_mib(const int *name, u_int namelen)
+{
+	return g_bootargs_mib_resolved && name &&
+	       (size_t)namelen == g_bootargs_mib_count &&
+	       memcmp(name, g_bootargs_mib, g_bootargs_mib_count * sizeof(*name)) == 0;
+}
+
+static void hider_resolve_bootargs_mib(void)
+{
+	if (g_bootargs_mib_resolved) {
+		return;
+	}
+	size_t count = CTL_MAXNAME;
+	if (sysctlnametomib("kern.bootargs", g_bootargs_mib, &count) == 0 &&
+	    count > 0 && count <= CTL_MAXNAME) {
+		g_bootargs_mib_count = count;
+		g_bootargs_mib_resolved = true;
+	}
+}
+
+static int hider_sysctl_synthesize_empty_bootargs(void *oldp, size_t *oldlenp,
+	                                                 const void *newp, size_t newlen,
+	                                                 int entry_errno)
+{
+	if (!oldlenp || !hider_sysctl_is_read_only(newp, newlen)) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	const size_t required = 1U;
+	if (!oldp) {
+		*oldlenp = required;
+		errno = entry_errno;
+		return 0;
+	}
+	if (*oldlenp < required) {
+		*oldlenp = required;
+		errno = ENOMEM;
+		return -1;
+	}
+	((char *)oldp)[0] = '\0';
+	*oldlenp = required;
+	errno = entry_errno;
+	return 0;
+}
+
+/* Never give a caller's buffer to the native PROCARGS2 query. The kernel
+ * payload is first materialized privately, fully validated and compacted.
+ *
+ * XNU's sysctl_procargsx has a special (and historically odd) short-buffer
+ * contract: KERN_PROCARGS2 reserves its first int for argc; a supplied buffer
+ * of no more than that word is EINVAL, while a larger short buffer succeeds,
+ * reports the consumed length, and returns the legacy page-rounded zero tail.
+ * Reproduce that behavior only over the already-filtered private payload, so
+ * no short-buffer path can expose the native unfiltered bytes. */
+static int hider_sysctl_filtered_self_procargs2(int *name, u_int namelen,
+	                                               void *oldp, size_t *oldlenp,
+	                                               int entry_errno)
+{
+	if (!orig_sysctl || !oldlenp) {
+		errno = EIO;
+		return -1;
+	}
+
+	for (unsigned attempt = 0; attempt < 3U; attempt++) {
+		size_t raw_length = 0;
+		if (orig_sysctl(name, namelen, NULL, &raw_length, NULL, 0) != 0) {
+			return -1;
+		}
+		if (raw_length == 0) {
+			errno = EIO;
+			return -1;
+		}
+
+		void *raw = malloc(raw_length);
+		if (!raw) {
+			errno = ENOMEM;
+			return -1;
+		}
+
+		size_t fetched_length = raw_length;
+		int result = orig_sysctl(name, namelen, raw, &fetched_length, NULL, 0);
+		if (result != 0) {
+			const int fetch_errno = errno;
+			free(raw);
+			/* A moving PROCARGS2 payload can outgrow the sizing request. Retry
+			 * only our private materialization, never a user-provided buffer. */
+			if (fetch_errno == ENOMEM && attempt + 1U < 3U) {
+				continue;
+			}
+			errno = fetch_errno;
+			return -1;
+		}
+		if (fetched_length > raw_length) {
+			free(raw);
+			if (attempt + 1U < 3U) {
+				continue;
+			}
+			errno = EIO;
+			return -1;
+		}
+
+		size_t filtered_length = 0;
+		if (!rhi_hider_procargs2_filter_inplace(raw, fetched_length, raw_length,
+		                                        &filtered_length)) {
+			free(raw);
+			errno = EIO;
+			return -1;
+		}
+		/* XNU rounds only the NULL-buffer PROCARGS2 size calculation to an int
+		 * boundary. A non-NULL fetch still reports its unrounded consumed size.
+		 * Keep those contracts separate; the standalone parser remains byte-exact. */
+		const size_t filtered_fetch_length = filtered_length;
+		if (filtered_length > SIZE_MAX - (sizeof(int) - 1U)) {
+			free(raw);
+			errno = EIO;
+			return -1;
+		}
+		const size_t filtered_size_length =
+			(filtered_length + sizeof(int) - 1U) & ~(sizeof(int) - 1U);
+		if (filtered_size_length > raw_length) {
+			free(raw);
+			errno = EIO;
+			return -1;
+		}
+		if (filtered_size_length > filtered_length) {
+			memset((uint8_t *)raw + filtered_length, 0,
+			       filtered_size_length - filtered_length);
+		}
+
+		if (!oldp) {
+			*oldlenp = filtered_size_length;
+			free(raw);
+			errno = entry_errno;
+			return 0;
+		}
+
+		/* Match XNU's KERN_PROCARGS2 argument validation before touching
+		 * the caller buffer. `buflen` in sysctl_procargsx excludes argc. */
+		const size_t caller_capacity = *oldlenp;
+		if (caller_capacity <= sizeof(int) ||
+		    caller_capacity - sizeof(int) > ARG_MAX) {
+			free(raw);
+			errno = EINVAL;
+			return -1;
+		}
+		if (filtered_fetch_length < sizeof(int)) {
+			free(raw);
+			errno = EIO;
+			return -1;
+		}
+
+		const size_t payload_length = filtered_fetch_length - sizeof(int);
+		const size_t payload_capacity = caller_capacity - sizeof(int);
+		uint8_t *payload = (uint8_t *)raw + sizeof(int);
+		const uint8_t *copy_data = payload;
+		size_t copy_length = payload_length;
+
+		if (payload_capacity < payload_length) {
+			const long page_size_long = getpagesize();
+			if (page_size_long <= 0) {
+				free(raw);
+				errno = EIO;
+				return -1;
+			}
+			const size_t page_size = (size_t)page_size_long;
+			if ((page_size & (page_size - 1U)) != 0U ||
+			    payload_capacity > SIZE_MAX - (page_size - 1U)) {
+				free(raw);
+				errno = EIO;
+				return -1;
+			}
+
+			/* This is sysctl_procargsx's smallbuffer_start calculation with
+			 * the filtered materialization as the private copy range. */
+			if (payload_length > SIZE_MAX - (page_size - 1U) ||
+			    payload_length > SIZE_MAX - payload_capacity) {
+				free(raw);
+				errno = EIO;
+				return -1;
+			}
+			const size_t rounded_capacity =
+				(payload_capacity + page_size - 1U) & ~(page_size - 1U);
+			const size_t rounded_payload_length =
+				(payload_length + page_size - 1U) & ~(page_size - 1U);
+			const size_t rounded_overlap = rounded_capacity < rounded_payload_length ?
+				rounded_capacity : rounded_payload_length;
+			/* `smallbuffer_start` is relative to XNU's rounded backing copy,
+			 * while copy_data is relative to the payload tail. Translate the
+			 * former before zeroing our compact private materialization. */
+			const size_t zero_sum = payload_length + payload_capacity;
+			const size_t zero_offset = zero_sum > rounded_overlap ?
+				zero_sum - rounded_overlap : 0U;
+			if (zero_offset < payload_length) {
+				memset(payload + zero_offset, 0, payload_length - zero_offset);
+			}
+			copy_data = payload + payload_length - payload_capacity;
+			copy_length = payload_capacity;
+		}
+
+		memcpy(oldp, raw, sizeof(int));
+		memcpy((uint8_t *)oldp + sizeof(int), copy_data, copy_length);
+		*oldlenp = sizeof(int) + copy_length;
+		free(raw);
+		errno = entry_errno;
+		return 0;
+	}
+
+	errno = EIO;
+	return -1;
+}
+
 __attribute__((noinline))
 static int h_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
                     void *newp, size_t newlen) {
@@ -3115,17 +3214,33 @@ static int h_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+	const int entry_errno = errno;
+
+	if (hider_sysctl_is_self_procargs2(name, namelen, oldlenp, newp, newlen)) {
+		return hider_sysctl_filtered_self_procargs2(name, namelen, oldp, oldlenp,
+		                                            entry_errno);
+	}
+	if (hider_sysctl_is_read_only(newp, newlen) && oldlenp &&
+	    hider_sysctl_is_bootargs_mib(name, namelen)) {
+		return hider_sysctl_synthesize_empty_bootargs(oldp, oldlenp, newp, newlen,
+		                                              entry_errno);
+	}
 
 	int result = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-	if (result != 0 || !oldp || !oldlenp || !name)
+	if (result != 0 || !oldp || !oldlenp || !name ||
+	    !hider_sysctl_is_read_only(newp, newlen))
 		return result;
 
-	// Only filter KERN_PROC queries (name[0]==CTL_KERN, name[1]==KERN_PROC)
+	/* Only fully returned self rows change.  Other-PID and size-only queries
+	 * retain exact native behavior, even when a KERN_PROC_ALL result contains
+	 * a mix of targets. */
 	if (namelen >= 2 && name[0] == CTL_KERN && name[1] == KERN_PROC) {
 		struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
 		size_t count = *oldlenp / sizeof(struct kinfo_proc);
 		for (size_t i = 0; i < count; i++) {
-			kp[i].kp_proc.p_flag &= ~P_TRACED;
+			if (kp[i].kp_proc.p_pid == getpid()) {
+				kp[i].kp_proc.p_flag &= ~P_TRACED;
+			}
 		}
 	}
 
@@ -3135,20 +3250,8 @@ static int h_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
 //------------------------------------------------------------------------------
 #pragma mark - getenv hook
 //
-// Hide DYLD_INSERT_LIBRARIES and other JB-related environment variables.
-// Detection SDKs (ICGN, SF) probe for DYLD_* vars to detect injection.
-
-static bool env_name_should_hide(const char *name) {
-	if (!name) return false;
-	// Block all DYLD_* variables — they reveal injection
-	if (strncmp(name, "DYLD_", 5) == 0) return true;
-	if (strncmp(name, "ROOTHIDE_", 9) == 0) return true;
-	// JB safe-mode / injection markers
-	if (strcmp(name, "_MSSafeMode") == 0) return true;
-	if (strcmp(name, "_SafeMode") == 0) return true;
-	if (strcmp(name, "_SubstituteSafeMode") == 0) return true;
-	return false;
-}
+// This hook shares the exact marker predicate used for direct environment
+// enumeration and materialized KERN_PROCARGS2 reads below.
 
 __attribute__((noinline))
 static char *h_getenv(const char *name) {
@@ -3159,7 +3262,7 @@ static char *h_getenv(const char *name) {
 		return orig_getenv(name);
 
 	// App caller: hide JB-related env vars
-	if (env_name_should_hide(name))
+	if (rhi_hider_env_name_hidden(name))
 		return NULL;
 
 	return orig_getenv(name);
@@ -3179,7 +3282,7 @@ static void *h_dlopen(const char *path, int mode) {
 
 	// App caller: block probe-loading of hidden paths.
 	// Also block RTLD_NOLOAD probes (checking if already loaded).
-	if (path && image_path_should_hide(path))
+	if (path && rhi_hider_filesystem_path_hidden(path))
 		return NULL;
 
 	return orig_dlopen(path, mode);
@@ -3192,99 +3295,6 @@ static void *h_dlopen(const char *path, int mode) {
 // using stat/access/lstat/fopen. RootHide kernel-level hiding covers most paths,
 // but these hooks provide defense-in-depth for any gaps.
 
-// Check if a filesystem path targets a known jailbreak artifact.
-// Only blocks paths that are unambiguously JB-related — we don't want to
-// interfere with legitimate app file operations.
-static bool fs_path_should_hide(const char *path) {
-	if (!path) return false;
-
-	// Paths containing .jbroot (roothide prefix)
-	if (strstr(path, "/.jbroot-") || strstr(path, "/.jbroot/")) return true;
-
-	// Rootless preboot probes recovered from TrueMoney and common jailbreak
-	// layouts. Keep the bare preboot root and /private/preboot/active stock-like:
-	// third-party apps can observe those on non-jailbroken systems too. Only hide
-	// the actual jailbreak-owned descendants and direct artifact markers.
-	static const char *preboot_exact_paths[] = {
-		"/private/preboot/.installed_palera1n",
-		"/private/preboot/jb",
-		"/private/preboot/jb/",
-		"/private/preboot/procursus",
-		"/private/preboot/procursus/",
-		NULL
-	};
-	for (int i = 0; preboot_exact_paths[i]; i++) {
-		if (strcmp(path, preboot_exact_paths[i]) == 0) return true;
-	}
-	if (string_has_prefix(path, "/private/preboot/")) {
-		const char *prebootRelative = path + sizeof("/private/preboot/") - 1;
-		if (strstr(prebootRelative, "/dopamine-") != NULL) return true;
-		if (strstr(prebootRelative, "/jb-") != NULL) return true;
-		if (strstr(prebootRelative, "/procursus") != NULL) return true;
-		if (strstr(prebootRelative, "/.installed_dopamine") != NULL) return true;
-		if (strstr(prebootRelative, "/.installed_palera1n") != NULL) return true;
-	}
-
-	// Common jailbreak artifacts from SF's needle table
-	static const char *jb_paths[] = {
-		"/Applications/Cydia.app",
-		"/Library/MobileSubstrate",
-		"/usr/sbin/frida-server",
-		"/usr/lib/libjailbreak.dylib",
-		"/usr/lib/libhooker.dylib",
-		"/usr/lib/libsubstitute.dylib",
-		"/usr/lib/substrate",
-		"/usr/lib/TweakInject",
-		"/var/lib/dpkg",
-		"/var/lib/cydia",
-		"/var/log/syslog",
-		"/var/tmp/cydia.log",
-		"/private/var/lib/cydia",
-		"/private/var/tmp/cydia.log",
-		"/private/jailbreak.txt",
-		"/jb/jailbreakd.plist",
-		"/jb/libjailbreak.dylib",
-		"/jb/amfid_payload.dylib",
-		"/.cydia_no_stash",
-		"/usr/share/jailbreak",
-		"/etc/apt/sources.list.d/cydia.list",
-		NULL
-	};
-	for (int i = 0; jb_paths[i]; i++) {
-		if (strcmp(path, jb_paths[i]) == 0) return true;
-	}
-
-	// JB apps that might exist in /Applications
-	if (strncmp(path, "/Applications/", 14) == 0) {
-		static const char *jb_apps[] = {
-			"Cydia.app", "Sileo.app", "Zebra.app", "Filza.app",
-			"Substitute.app", "checkra1n.app", "crackerxi.app",
-			NULL
-		};
-		const char *appname = path + 14;
-		for (int i = 0; jb_apps[i]; i++) {
-			if (strcmp(appname, jb_apps[i]) == 0) return true;
-		}
-	}
-
-	// Basename checks for JB dylibs in arbitrary directories
-	const char *base = strrchr(path, '/');
-	if (base) base++; else base = path;
-	if (strstr(base, "systemhook") ||
-	    strstr(base, "roothideinit") ||
-	    strstr(base, "SubstrateLoader") ||
-	    strstr(base, "TweakInject") ||
-	    strstr(base, "MobileSubstrate") ||
-	    strstr(base, "CydiaSubstrate") ||
-	    strstr(base, "libsubstitute") ||
-	    strstr(base, "SSLKillSwitch") ||
-	    strstr(base, "FridaGadget") ||
-	    strstr(base, "cynject"))
-		return true;
-
-	return false;
-}
-
 __attribute__((noinline))
 static int h_access(const char *path, int amode) {
 	if (!hider_strict_hook_is_ready(&g_strict_access_session, "access"))
@@ -3293,7 +3303,7 @@ static int h_access(const char *path, int amode) {
 	if (caller_is_hidden(ra))
 		return orig_access(path, amode);
 
-	if (fs_path_should_hide(path)) {
+	if (rhi_hider_filesystem_path_hidden(path)) {
 		errno = ENOENT;
 		return -1;
 	}
@@ -3308,7 +3318,7 @@ static int h_stat(const char *path, struct stat *buf) {
 	if (caller_is_hidden(ra))
 		return orig_stat(path, buf);
 
-	if (fs_path_should_hide(path)) {
+	if (rhi_hider_filesystem_path_hidden(path)) {
 		errno = ENOENT;
 		return -1;
 	}
@@ -3323,7 +3333,7 @@ static int h_lstat(const char *path, struct stat *buf) {
 	if (caller_is_hidden(ra))
 		return orig_lstat(path, buf);
 
-	if (fs_path_should_hide(path)) {
+	if (rhi_hider_filesystem_path_hidden(path)) {
 		errno = ENOENT;
 		return -1;
 	}
@@ -3338,7 +3348,7 @@ static FILE *h_fopen(const char *path, const char *mode) {
 	if (caller_is_hidden(ra))
 		return orig_fopen(path, mode);
 
-	if (fs_path_should_hide(path)) {
+	if (rhi_hider_filesystem_path_hidden(path)) {
 		errno = ENOENT;
 		return NULL;
 	}
@@ -3349,8 +3359,13 @@ __attribute__((noinline))
 static DIR *h_opendir(const char *path) {
 	if (!hider_strict_hook_is_ready(&g_strict_opendir_session, "opendir"))
 		return orig_opendir ? orig_opendir(path) : NULL;
-	/* h_readdir resolves the live directory descriptor for every filtered
-	 * entry. opendir intentionally remains ownership-neutral. */
+	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
+	if (caller_is_hidden(ra))
+		return orig_opendir ? orig_opendir(path) : NULL;
+	if (rhi_hider_filesystem_path_hidden(path)) {
+		errno = ENOENT;
+		return NULL;
+	}
 	return orig_opendir ? orig_opendir(path) : NULL;
 }
 
@@ -3363,16 +3378,21 @@ static struct dirent *h_readdir(DIR *dirp) {
 		return orig_readdir(dirp);
 	}
 
-	dir_filter_kind_t kind = DIR_FILTER_NONE;
-	if (!dir_filter_kind_for_dir(dirp, &kind) || kind == DIR_FILTER_NONE) {
-		/* F_GETPATH is unavailable for some descriptor types/sandboxes. Do not
-		 * turn that inability to classify into a detector-visible failure. */
-		return orig_readdir(dirp);
-	}
+	/* A DIR* may be recycled or renamed. Resolve its current descriptor on each
+	 * call rather than retaining side state. Failure still gets universal image
+	 * basename filtering, while all other entries retain native behavior. */
+	char parent_path[PATH_MAX] = {0};
+	const int saved_errno = errno;
+	const int fd = dirp ? dirfd(dirp) : -1;
+	const bool parent_known = fd >= 0 && fcntl(fd, F_GETPATH, parent_path) == 0;
+	errno = saved_errno;
 
 	struct dirent *entry = NULL;
 	while ((entry = orig_readdir(dirp)) != NULL) {
-		if (!dir_entry_should_hide(kind, entry->d_name)) {
+		const bool hidden = parent_known ?
+			rhi_hider_directory_entry_hidden(parent_path, entry->d_name) :
+			rhi_hider_image_path_hidden(entry->d_name);
+		if (!hidden) {
 			return entry;
 		}
 	}
@@ -3405,20 +3425,10 @@ static int h_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 
 	/* Preserve the normal two-pass contract without first exposing the real
 	 * boot-argument length. Writes and malformed calls still go to the kernel. */
-	if (name && oldlenp && !newp && strcmp(name, "kern.bootargs") == 0) {
-		const size_t required = 1;
-		if (!oldp) {
-			*oldlenp = required;
-			return 0;
-		}
-		if (*oldlenp < required) {
-			*oldlenp = required;
-			errno = ENOMEM;
-			return -1;
-		}
-		((char *)oldp)[0] = '\0';
-		*oldlenp = required;
-		return 0;
+	if (name && oldlenp && hider_sysctl_is_read_only(newp, newlen) &&
+	    strcmp(name, "kern.bootargs") == 0) {
+		return hider_sysctl_synthesize_empty_bootargs(oldp, oldlenp, newp, newlen,
+		                                              errno);
 	}
 
 	return orig_sysctlbyname(name, oldp, oldlenp, newp, newlen);
@@ -3513,6 +3523,12 @@ void hidden_dylib_hider_init(void)
 	orig_readdir = readdir;
 	orig_closedir = closedir;
 	orig_mach_port_get_refs = mach_port_get_refs;
+	/* Numeric bootargs callers must receive the same synthetic view as the
+	 * sysctlbyname hook. Resolve this only before the first import mutation. */
+	hider_resolve_bootargs_mib();
+	if (!g_bootargs_mib_resolved) {
+		rhi_diag_log("HIDER kern.bootargs numeric MIB unavailable; numeric parity requires device verification");
+	}
 	if (pthread_atfork(hider_catalog_atfork_prepare,
 	                   hider_catalog_atfork_parent,
 	                   hider_catalog_atfork_child) != 0) {
@@ -3573,7 +3589,7 @@ void hidden_dylib_hider_init(void)
 		orig_objc_addLoadImageFunc(on_objc_image_loaded);
 	}
 
-	load_hider_profile_from_environment();
+	hidden_dylib_hider_consume_environment_profile();
 
 	/*
 	 * 4. Prepare every required core import mutation before the first write.

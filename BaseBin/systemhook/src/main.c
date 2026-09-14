@@ -1,10 +1,12 @@
 #include "common.h"
 #include "hider_caller_policy.h"
+#include "hider_environment_policy.h"
 #include "hider_internal.h"
 #include "roothider.h"
 
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
+#include <crt_externs.h>
 #include <mach-o/getsect.h>
 #include <dlfcn.h>
 #include <sys/stat.h>
@@ -470,6 +472,27 @@ static bool consume_hidden_tweak_loading_env(void)
 	return enabled;
 }
 
+/* The runtime owns this pointer vector.  We deliberately compact only its
+ * slots (never free strings) and calculate the exact ABI capacity including
+ * the terminator before handing it to the policy primitive. */
+static void scrub_hidden_process_environment(void)
+{
+	char ***environment_pointer = _NSGetEnviron();
+	if (!environment_pointer || !*environment_pointer) {
+		return;
+	}
+
+	char **environment = *environment_pointer;
+	size_t count = 0;
+	while (environment[count] != NULL) {
+		if (count == SIZE_MAX - 1U) {
+			return;
+		}
+		count++;
+	}
+	(void)rhi_hider_env_scrub_vector(environment, count + 1U, NULL);
+}
+
 void rhi_diag_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void rhi_diag_log(const char *fmt, ...)
 {
@@ -521,19 +544,18 @@ __attribute__((constructor)) static void initializer(void)
 	bool hiddenTweakRuntimeSupport = hidden_tweak_loading_should_apply_runtime_patch();
 	bool hiddenTweakMinimalRuntime = hidden_tweak_loading_uses_minimal_runtime();
 	rhi_diag_log("POST-RUNTIME-PATCH hiddenTweakRuntimeSupport=%d", hiddenTweakRuntimeSupport);
-	sanitize_dyld_insert_libraries_env();
-	rhi_diag_log("POST-SANITIZE DYLD_INSERT_LIBRARIES=%s", getenv("DYLD_INSERT_LIBRARIES") ?: "(null)");
-
-	// For hidden injection: fully scrub all JB-related env vars so
-	// getenv / environ / _NSGetEnviron can't leak them.
+	/* Bridge consumers must run before the one physical environment scrub.
+	 * They retain canonical strings for xpcproxy children, so the child can
+	 * consume the same policy without exposing parent marker variables. */
 	if (gHiddenInjection) {
-		unsetenv("DYLD_INSERT_LIBRARIES");
-		unsetenv("DYLD_LIBRARY_PATH");
-		unsetenv("DYLD_FRAMEWORK_PATH");
-		unsetenv("_MSSafeMode");
-		unsetenv("_SafeMode");
-		// ROOTHIDE_* already consumed+unset by consume_*_env above
+		roothide_hidden_tweak_consume_environment();
+		hidden_dylib_hider_consume_environment_profile();
+		scrub_hidden_process_environment();
+	} else {
+		/* Preserve existing normal-injection DYLD normalization. */
+		sanitize_dyld_insert_libraries_env();
 	}
+	rhi_diag_log("POST-SANITIZE DYLD_INSERT_LIBRARIES=%s", getenv("DYLD_INSERT_LIBRARIES") ?: "(null)");
 
 	// Install dylib image hiding hooks for hidden-injection processes.
 	// Must happen after env consumption (filter is loaded) and before

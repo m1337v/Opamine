@@ -399,6 +399,125 @@ class SysctlDouble:
         return (0, value, required)
 
 
+class Procargs2Double:
+    """Deterministic contract model for the private PROCARGS2 materializer.
+
+    This models only the wrapper decisions (never the Darwin-private byte
+    layout, which is covered by the sanitizer fixture and remains device-gated).
+    It captures current XNU's distinct PROCARGS2 short-buffer contract: reserve
+    an argc word, reject a caller buffer no larger than that word, and otherwise
+    return success with the historical page-window zero tail. That operation is
+    applied only to the filtered private payload; failed materialization never
+    returns raw bytes to its caller.
+    """
+
+    ENOMEM = 12
+    EIO = 5
+    EINVAL = 22
+    WORD_BYTES = 4
+    ARG_MAX = 262144
+    PAGE_SIZE = 16
+
+    def __init__(self, visible: bytes =
+                 b"\x02\x00\x00\x00argv\x00PATH=/usr/bin\x00HOME=/var/mobile\x00\x00") -> None:
+        self.visible = visible
+        padding = (-len(visible)) % self.WORD_BYTES
+        # The environment-policy primitive remains byte-exact; the sysctl
+        # wrapper alone creates this validated public word-aligned view.
+        self.materialized = visible + b"\x00" * padding
+
+    @classmethod
+    def legacy_short_payload(cls, payload: bytes, capacity: int, *, page_size: int | None = None) -> bytes:
+        """XNU sysctl_procargsx smallbuffer window, over filtered bytes."""
+
+        page = page_size or cls.PAGE_SIZE
+        rounded_capacity = (capacity + page - 1) & ~(page - 1)
+        rounded_payload = (len(payload) + page - 1) & ~(page - 1)
+        zero_offset = max(len(payload) + capacity - min(rounded_capacity, rounded_payload), 0)
+        private = bytearray(payload)
+        private[zero_offset:] = b"\x00" * (len(payload) - zero_offset)
+        return bytes(private[len(payload) - capacity:])
+
+    def query(
+        self,
+        capacity: int | None,
+        *,
+        self_pid: bool = True,
+        readonly: bool = True,
+        internal: bool = False,
+        malformed: bool = False,
+        allocation_failed: bool = False,
+        grow_once: bool = False,
+    ) -> tuple[str | int, bytes, int]:
+        if not self_pid or not readonly or internal:
+            return ("native", b"raw-marker\x00", len(b"raw-marker\x00"))
+        if malformed:
+            return (self.EIO, b"", 0)
+        if allocation_failed:
+            return (self.ENOMEM, b"", 0)
+        # A bounded private retry does not change which filtered payload is
+        # returned to the public caller.
+        if grow_once:
+            _ = b"transiently-longer-private-payload"
+        if capacity is None:
+            return (0, b"", len(self.materialized))
+        if capacity <= self.WORD_BYTES or capacity - self.WORD_BYTES > self.ARG_MAX:
+            # XNU returns before calculate_size, so oldlen remains the input.
+            return (self.EINVAL, b"", capacity)
+        payload = self.visible[self.WORD_BYTES:]
+        payload_capacity = capacity - self.WORD_BYTES
+        if payload_capacity >= len(payload):
+            return (0, self.visible, len(self.visible))
+        return (0, self.visible[:self.WORD_BYTES] +
+                self.legacy_short_payload(payload, payload_capacity), capacity)
+
+
+def clear_self_traced(rows: list[tuple[int, int]], self_pid: int, traced: int) -> list[tuple[int, int]]:
+    """Model mutation of only complete self KERN_PROC rows."""
+
+    return [(pid, flags & ~traced if pid == self_pid else flags) for pid, flags in rows]
+
+
+def compact_objc_storage(values: list[tuple[str, bool]], *, class_list: bool) -> tuple[list[str | None], int]:
+    """Model stable in-place compaction and sanitization of original-owned storage."""
+
+    total = len(values)
+    storage: list[str | None] = [value for value, _ in values]
+    if class_list:
+        # objc_copyClassList documents a nil terminator after its count.
+        storage.append(None)
+    kept = 0
+    for value, hidden in values:
+        if not hidden:
+            storage[kept] = value
+            kept += 1
+    # ClassList clears through its documented terminator; ImageNames clears
+    # every count-owned tail element without inventing a terminator contract.
+    clear_end = total + 1 if class_list else total
+    for index in range(kept, clear_end):
+        storage[index] = None
+    return storage, kept
+
+
+def compact_objc_view(values: list[tuple[str, bool]], out_count_requested: bool) -> tuple[list[str], int | None]:
+    """The runtime-owned class pointer array is compacted in place; no allocation path."""
+
+    storage, kept = compact_objc_storage(values, class_list=True)
+    return [value for value in storage[:kept] if value is not None], kept if out_count_requested else None
+
+
+def getfsstat_route(buf_present: bool, bufsize: int) -> str:
+    """Model the wrapper's XNU boundary routing before it filters entries."""
+
+    if bufsize < 0:
+        return "native-invalid"
+    if buf_present and bufsize == 0:
+        return "native-zero-capacity"
+    if not buf_present:
+        return "filtered-count"
+    return "filtered-buffer"
+
+
 class DirectoryDouble:
     """Model fresh fd-path classification with no retained DIR ownership."""
 
@@ -931,7 +1050,90 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         require("jetsamMultiplier, ENOMEM" in common, "posix_spawn mutation failure must return its errno value")
         require("trust_binary, 0, -1" in common, "execve mutation failure must return -1 with errno set")
 
+        # Every bridge value is retained before the only physical environment
+        # compaction and before the hider can publish import hooks.
+        consume_hidden = main.find("gHiddenInjection = consume_hidden_injection_env()")
+        consume_selected = main.find("roothide_hidden_tweak_consume_environment()", consume_hidden)
+        consume_profile = main.find("hidden_dylib_hider_consume_environment_profile()", consume_selected)
+        scrub = main.find("scrub_hidden_process_environment()", consume_profile)
+        publish = main.find("hidden_dylib_hider_init()", scrub)
+        require(min(consume_hidden, consume_selected, consume_profile, scrub, publish) >= 0,
+                "hidden startup seams must all be present")
+        require(consume_hidden < consume_selected < consume_profile < scrub < publish,
+                "bridge consumption must precede physical scrub and hook publication")
+        require("_NSGetEnviron" in main and "count + 1U" in main and
+                "rhi_hider_env_scrub_vector" in main,
+                "physical environment scrub must use an exact terminated vector")
+        require("roothide_hidden_tweak_consume_environment" in roothider_main and
+                "gHiddenTweakEnvironmentConsumed" in roothider_main,
+                "selected-tweak bridge consumption must be idempotent")
+        require("hidden_dylib_hider_consume_environment_profile" in hider and
+                "g_hider_profile_consumed" in hider,
+                "hider profile bridge consumption must be idempotent")
+
     check("environment_handoff_source_contract", check_environment_handoff_source_contract)
+
+    def check_environment_view_matrix_fixture() -> None:
+        markers = ("DYLD_INSERT_LIBRARIES", "ROOTHIDE_HIDER_PROFILE", "_SafeMode")
+        public = ("PATH", "HOME")
+        for marker in markers:
+            require(marker.startswith(("DYLD_", "ROOTHIDE_", "_")), "marker fixture drift")
+        require(all(not value.startswith(("DYLD_", "ROOTHIDE_", "_SafeMode")) for value in public),
+                "PATH and unrelated environment variables must stay visible")
+        procargs = Procargs2Double()
+        result, data, needed = procargs.query(None)
+        require(result == 0 and data == b"" and needed == len(procargs.materialized),
+                "filtered PROCARGS2 size query must report the word-aligned filtered view")
+        result, data, needed = procargs.query(Procargs2Double.WORD_BYTES)
+        require(result == Procargs2Double.EINVAL and data == b"" and
+                needed == Procargs2Double.WORD_BYTES,
+                "PROCARGS2 must reject buffers no larger than its argc word")
+        result, data, needed = procargs.query(Procargs2Double.WORD_BYTES + Procargs2Double.ARG_MAX + 1)
+        require(result == Procargs2Double.EINVAL and data == b"" and
+                needed == Procargs2Double.WORD_BYTES + Procargs2Double.ARG_MAX + 1,
+                "PROCARGS2 must preserve XNU's oversized-buffer EINVAL boundary")
+        short_capacity = len(procargs.visible) - 1
+        result, data, needed = procargs.query(short_capacity)
+        expected_short = procargs.visible[:Procargs2Double.WORD_BYTES] + \
+            Procargs2Double.legacy_short_payload(
+                procargs.visible[Procargs2Double.WORD_BYTES:],
+                short_capacity - Procargs2Double.WORD_BYTES)
+        require(result == 0 and needed == short_capacity and data == expected_short and
+                b"raw-marker" not in data,
+                "short PROCARGS2 must use the filtered private page-window zero-tail contract")
+        # XNU's zero boundary is relative to a rounded backing range, not the
+        # payload start. Cover equal rounded windows and a cross-page window.
+        equal_window = b"abcdefghijklmnopqrst"
+        require(Procargs2Double.legacy_short_payload(equal_window, 17) ==
+                equal_window[3:5] + b"\x00" * 15,
+                "same rounded PROCARGS2 window must translate its zero boundary from backing storage")
+        cross_page = b"abcdefghijklmnopqrst"
+        require(Procargs2Double.legacy_short_payload(cross_page, 15) ==
+                cross_page[5:19] + b"\x00",
+                "cross-page PROCARGS2 window must retain only the pre-zero tail prefix")
+        result, data, needed = procargs.query(len(procargs.materialized), grow_once=True)
+        require(result == 0 and data == procargs.visible and needed == len(procargs.visible),
+                "a sufficient PROCARGS2 fetch must report its unrounded filtered consumed length")
+        odd = Procargs2Double(b"\x01\x00\x00\x00/x\x00ODD=1\x00\x00")
+        require(len(odd.visible) % Procargs2Double.WORD_BYTES != 0,
+                "odd PROCARGS2 fixture must exercise sysctl-only alignment")
+        result, data, needed = odd.query(None)
+        require(result == 0 and needed == len(odd.materialized) and
+                odd.materialized.startswith(odd.visible) and
+                odd.materialized[len(odd.visible):] == b"\x00" * (len(odd.materialized) - len(odd.visible)),
+                "odd filtered PROCARGS2 size query must include explicit zero word padding")
+        result, data, needed = odd.query(len(odd.materialized))
+        require(result == 0 and data == odd.visible and needed == len(odd.visible),
+                "odd filtered PROCARGS2 fetch must keep XNU's unrounded consumed length")
+        require(procargs.query(None, malformed=True)[0] == Procargs2Double.EIO,
+                "malformed PROCARGS2 must fail closed")
+        require(procargs.query(None, allocation_failed=True)[0] == Procargs2Double.ENOMEM,
+                "allocation failure must fail closed")
+        for kwargs in ({"self_pid": False}, {"readonly": False}, {"internal": True}):
+            require(procargs.query(None, **kwargs)[0] == "native",
+                    "other-PID, writes, and internal callers must remain native")
+
+    check("environment_procargs2_view_matrix_fixture", check_environment_view_matrix_fixture)
 
     def check_profile_model() -> None:
         require(profile_state(None, None) == ProfileState(), "empty profile must keep all strict hooks enabled")
@@ -1392,6 +1594,18 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         result, _, _ = sysctl.query("kern.unknown", None)
         require(result == SysctlDouble.ENOENT, "unknown sysctl must remain an error")
 
+        # Named and resolved numeric routes must share one synthetic result.
+        numeric = SysctlDouble()
+        for capacity in (None, 0, 1, 4):
+            require(sysctl.query("kern.bootargs", capacity) == numeric.query("kern.bootargs", capacity),
+                    "named and numeric bootargs paths must have identical two-pass semantics")
+
+        traced = 0x800
+        rows = [(101, traced | 0x1), (202, traced | 0x2), (303, 0x4)]
+        filtered_rows = clear_self_traced(rows, 202, traced)
+        require(filtered_rows == [(101, traced | 0x1), (202, 0x2), (303, 0x4)],
+                "KERN_PROC mutation must clear P_TRACED only in the self row")
+
     check("sysctlbyname_two_pass_fixture", check_sysctl_fixture)
 
     def check_sysctl_source_contract() -> None:
@@ -1399,21 +1613,67 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         require('"kern.bootargs"' in hider, "bootargs policy missing")
         require("orig_sysctlbyname" in hider, "original sysctlbyname path missing")
         require("oldlenp" in hider, "sysctlbyname length parameter missing")
-        require("const size_t required = 1" in hider, "bootargs size probe must publish only the synthetic one-byte result")
+        require("hider_sysctl_synthesize_empty_bootargs" in hider,
+                "named and numeric bootargs must use one synthetic helper")
+        require("const size_t required = 1U" in hider,
+                "bootargs size probe must publish only the synthetic one-byte result")
         require("errno = ENOMEM" in hider, "undersized bootargs buffers must preserve ENOMEM semantics")
+        require("sysctlnametomib(\"kern.bootargs\"" in hider and "g_bootargs_mib_resolved" in hider,
+                "numeric bootargs policy must resolve, not guess, the current MIB")
+        require("hider_sysctl_filtered_self_procargs2" in hider and
+                "rhi_hider_procargs2_filter_inplace" in hider,
+                "self PROCARGS2 must materialize and filter privately")
+        require("const size_t caller_capacity = *oldlenp" in hider and
+                "caller_capacity <= sizeof(int)" in hider and
+                "caller_capacity - sizeof(int) > ARG_MAX" in hider,
+                "PROCARGS2 must preserve the current XNU argc-word and ARG_MAX boundaries")
+        require("getpagesize()" in hider and "rounded_capacity" in hider and
+                "rounded_payload_length" in hider and "rounded_overlap" in hider and
+                "memset(payload + zero_offset, 0, payload_length - zero_offset)" in hider,
+                "short PROCARGS2 must reproduce the filtered private legacy zero-tail window")
+        require("const size_t filtered_fetch_length" in hider and
+                "const size_t filtered_size_length" in hider and
+                "filtered_size_length > raw_length" in hider and
+                "memset((uint8_t *)raw + filtered_length, 0," in hider,
+                "PROCARGS2 must word-round only the size query within private capacity and zero padding")
+        require("if (!oldp) {\n\t\t\t*oldlenp = filtered_size_length;" in hider and
+                "const size_t payload_length = filtered_fetch_length - sizeof(int);" in hider,
+                "PROCARGS2 must keep aligned sizing separate from unrounded fetch/short semantics")
+        require("memcpy(oldp, raw, sizeof(int))" in hider and
+                "memcpy((uint8_t *)oldp + sizeof(int), copy_data, copy_length)" in hider,
+                "PROCARGS2 must copy argc and data only from its filtered private result")
+        require("kp[i].kp_proc.p_pid == getpid()" in hider,
+                "P_TRACED normalization must be self-only")
+        require("!hider_sysctl_is_read_only(newp, newlen)" in hider,
+                "sysctl writes must remain native")
 
     check("sysctlbyname_production_static_contract", check_sysctl_source_contract)
 
-    sysctl_match = re.search(r"\nstatic int h_sysctlbyname\([^\n]+\n(?:[^\n]*\n){0,3}", hider)
-    require(sysctl_match is not None, "h_sysctlbyname definition missing")
-    sysctl_body = hider[sysctl_match.start():sysctl_match.start() + 1600]
-    if "!oldp" in sysctl_body and "const size_t required = 1" not in sysctl_body:
-        known_gaps.append({
-            "id": "sysctlbyname-size-query",
-            "severity": "medium",
-            "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
-            "detail": "kern.bootargs rewriting is guarded by oldp, so a NULL size query is delegated without a hidden one-byte contract.",
-        })
+    def check_getfsstat_boundary_fixture() -> None:
+        require(getfsstat_route(False, 0) == "filtered-count",
+                "the canonical NULL/zero count query needs a filtered count")
+        require(getfsstat_route(False, 4096) == "filtered-count",
+                "NULL count queries remain filtered regardless of nonnegative size")
+        require(getfsstat_route(True, 0) == "native-zero-capacity",
+                "non-NULL zero-capacity getfsstat must retain native success semantics")
+        require(getfsstat_route(True, -1) == "native-invalid" and
+                getfsstat_route(False, -1) == "native-invalid",
+                "negative getfsstat sizes must retain native EINVAL behavior")
+        require(getfsstat_route(True, 4096) == "filtered-buffer",
+                "only a real caller buffer receives in-place mount filtering")
+
+    check("getfsstat_boundary_matrix_fixture", check_getfsstat_boundary_fixture)
+
+    def check_getfsstat_source_contract() -> None:
+        start = hider.index("static int h_getfsstat(struct statfs *buf, int bufsize, int mode) {")
+        body = hider[start:hider.index("static int h_statfs", start)]
+        require("bufsize < 0 || (buf != NULL && bufsize == 0)" in body and
+                "return orig_getfsstat(buf, bufsize, mode);" in body,
+                "negative and non-NULL zero-size getfsstat calls must remain native")
+        require("if (!buf)" in body and "malloc(tmpsize)" in body,
+                "only NULL-buffer count queries may materialize a filtered count")
+
+    check("getfsstat_boundary_source_contract", check_getfsstat_source_contract)
 
     def check_directory_fixture() -> None:
         directory = DirectoryDouble()
@@ -1432,13 +1692,24 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         path, _ = directory.classify("dir-1", errno=0)
         require(path == "/new/allowed", "reused directory token must resolve only its current path")
 
+        # F_GETPATH failure still applies universal image-basename filtering;
+        # unrelated entries keep stock enumeration behavior.
+        hidden_basename = "systemhook-ABC.dylib"
+        visible_basename = "MobileSubstrateBackup.dylib"
+        require(hidden_basename.startswith("systemhook-"), "hidden fallback fixture drift")
+        require(not visible_basename.startswith("systemhook-"), "basename fallback must avoid broad substring rules")
+
     check("directory_pointer_reuse_fresh_path_fixture", check_directory_fixture)
 
     def check_directory_source_contract() -> None:
-        for symbol in ("h_opendir", "h_readdir", "h_closedir", "dir_filter_kind_for_dir"):
+        for symbol in ("h_opendir", "h_readdir", "h_closedir", "rhi_hider_directory_entry_hidden"):
             require(symbol in hider, f"directory symbol missing: {symbol}")
-        require("dirfd(dirp)" in hider and "fcntl(fd, F_GETPATH, path)" in hider, "readdir must classify each live DIR descriptor via F_GETPATH")
+        require("dirfd(dirp)" in hider and "fcntl(fd, F_GETPATH, parent_path)" in hider, "readdir must classify each live DIR descriptor via F_GETPATH")
         require("const int saved_errno = errno" in hider and "errno = saved_errno" in hider, "directory path resolution must preserve errno")
+        require("rhi_hider_image_path_hidden(entry->d_name)" in hider,
+                "F_GETPATH failure must retain universal hidden-basename filtering")
+        require("rhi_hider_filesystem_path_hidden(path)" in hider and "errno = ENOENT" in hider,
+                "opendir must deny externally requested hidden directories")
         for obsolete in ("register_dir_filter", "lookup_dir_filter", "unregister_dir_filter", "g_dir_filters", "g_dir_filter_lock"):
             require(obsolete not in hider, f"obsolete DIR state must be removed: {obsolete}")
 
@@ -1451,8 +1722,111 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     opendir_body = hider[opendir_start:hider.index("static struct dirent *h_readdir", opendir_start)]
     closedir_start = closedir_match.start()
     closedir_body = hider[closedir_start:hider.index("static int h_sysctlbyname", closedir_start)]
-    require("dir_filter_kind_for_dir" not in opendir_body, "opendir must not capture a directory category")
+    require("F_GETPATH" not in opendir_body, "opendir must not capture a directory category")
     require("g_dir_filter" not in closedir_body and "unregister_dir_filter" not in closedir_body, "closedir must remain ownership-neutral")
+
+    def check_path_and_objc_view_fixture() -> None:
+        # Name similarity is not ownership: only the hidden-owning-image bit
+        # changes an external ObjC enumeration view.
+        source = [
+            ("NSSubstituteWebResource", False),
+            ("Shadow", False),
+            ("InjectedClass", True),
+        ]
+        names, count = compact_objc_view(source, True)
+        require(names == ["NSSubstituteWebResource", "Shadow"] and count == 2,
+                "ObjC compaction must preserve legitimate same-named classes")
+        names_without_count, count_without_count = compact_objc_view(source, False)
+        require(names_without_count == names and count_without_count is None,
+                "nullable ObjC outCount must not disable external filtering")
+        class_storage, class_kept = compact_objc_storage(source, class_list=True)
+        require(class_storage[:class_kept] == names and
+                class_storage[class_kept:] == [None] * (len(source) + 1 - class_kept),
+                "objc_copyClassList must clear hidden tail pointers through its nil terminator")
+        image_storage, image_kept = compact_objc_storage(source, class_list=False)
+        require(image_storage[:image_kept] == names and
+                image_storage[image_kept:] == [None] * (len(source) - image_kept),
+                "objc_copyImageNames must clear every hidden tail pointer")
+
+    check("path_and_objc_view_fixture", check_path_and_objc_view_fixture)
+
+    def check_path_and_objc_source_contract() -> None:
+        require('#include "hider_path_policy.h"' in hider and
+                '#include "hider_environment_policy.h"' in hider,
+                "hider must consume the centralized policy modules")
+        for obsolete in ("image_path_should_hide", "fs_path_should_hide", "class_name_should_hide_from_app"):
+            require(obsolete not in hider, f"duplicate/overfit policy must be removed: {obsolete}")
+        require("rhi_hider_image_path_hidden" in hider and "rhi_hider_filesystem_path_hidden" in hider,
+                "image and filesystem probes must use centralized path policy")
+        class_start = hider.index("static Class *h_objc_copyClassList(unsigned int *outCount) {")
+        image_start = hider.index("static const char * _Nonnull *h_objc_copyImageNames(unsigned int *outCount) {")
+        class_body = hider[class_start:image_start]
+        image_body = hider[image_start:hider.index("// NOTE: objc_getClass", image_start)]
+        for body in (class_body, image_body):
+            require("&total" in body and "malloc(" not in body and "free(result)" not in body,
+                    "ObjC copy APIs must compact their original-owned arrays in place")
+            require("if (outCount)" in body, "ObjC nullable outCount must be handled explicitly")
+        require("for (unsigned int i = kept; i <= total; i++)" in class_body and
+                "result[i] = NULL" in class_body,
+                "objc_copyClassList must clear its compacted tail through the documented terminator")
+        require("for (unsigned int i = kept; i < total; i++)" in image_body and
+                "mutable_result[i] = NULL" in image_body,
+                "objc_copyImageNames must clear its compacted count-owned tail")
+        require("orig_class_getImageName" in hider and "rhi_hider_image_path_hidden(image)" in hider,
+                "class visibility must use owning image identity")
+        require("rhi_hider_env_name_hidden(name)" in hider,
+                "getenv must share direct-environment and PROCARGS2 marker policy")
+
+    check("path_and_objc_production_static_contract", check_path_and_objc_source_contract)
+
+    def check_csops_visibility_matrix() -> None:
+        CS_VALID, CS_HARD, CS_KILL, CS_DEBUGGED, CS_GET_TASK_ALLOW = 1, 2, 4, 8, 16
+
+        def normalize(flags: int, *, hidden_process: bool, self_query: bool,
+                      external: bool, fully_debugged: bool) -> int:
+            flags |= CS_VALID
+            flags &= ~CS_DEBUGGED
+            if fully_debugged and not external:
+                flags |= CS_DEBUGGED
+            if hidden_process and self_query:
+                flags |= CS_VALID | CS_HARD | CS_KILL
+                flags &= ~CS_GET_TASK_ALLOW
+                if external:
+                    flags &= ~CS_DEBUGGED
+            return flags
+
+        initial = CS_DEBUGGED | CS_GET_TASK_ALLOW
+        external = normalize(initial, hidden_process=True, self_query=True,
+                             external=True, fully_debugged=True)
+        internal = normalize(initial, hidden_process=True, self_query=True,
+                             external=False, fully_debugged=True)
+        non_hidden = normalize(initial, hidden_process=False, self_query=True,
+                               external=False, fully_debugged=True)
+        require(external & (CS_VALID | CS_HARD | CS_KILL) == (CS_VALID | CS_HARD | CS_KILL) and
+                not external & (CS_DEBUGGED | CS_GET_TASK_ALLOW),
+                "external hidden csops view must be stock-like even when globally debugged")
+        require(internal & CS_DEBUGGED and not internal & CS_GET_TASK_ALLOW,
+                "authorized hidden caller preserves debug truth but not task-allow")
+        require(non_hidden & CS_DEBUGGED and non_hidden & CS_GET_TASK_ALLOW,
+                "non-hidden csops behavior must retain legacy normalization")
+
+    check("csops_visibility_matrix_fixture", check_csops_visibility_matrix)
+
+    def check_csops_source_contract() -> None:
+        for hook in ("csops_hook", "csops_audittoken_hook"):
+            start = main.index(f"int {hook}")
+            body = main[start:main.index("\n}", start) + 2]
+            require("__builtin_extract_return_addr(__builtin_return_address(0))" in body,
+                    f"{hook} must classify the true caller at wrapper entry")
+            require("external_hidden_view" in body and "normalize_csops_status_flags" in body,
+                    f"{hook} must apply caller-aware shared normalization")
+        normalize_start = main.index("static void normalize_csops_status_flags")
+        normalize_body = main[normalize_start:main.index("\n}\n\nint csops_hook", normalize_start)]
+        require("CS_GET_TASK_ALLOW" in normalize_body and "CS_HARD" in normalize_body and
+                "CS_KILL" in normalize_body and "external_hidden_view" in normalize_body,
+                "shared csops normalizer must encode the hidden external capability matrix")
+
+    check("csops_production_static_contract", check_csops_source_contract)
 
     def check_callback_registration_replay_fixture() -> None:
         catalog = CallbackCatalogDouble()

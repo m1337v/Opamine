@@ -44,6 +44,7 @@ static atomic_int gHiddenTweakHookState = RHI_HOOK_NOT_ATTEMPTED;
 static _Atomic(rhi_rebind_transaction_t *) gHiddenTweakFallbackTransaction = NULL;
 static char *gHiddenTweakModeString = NULL;
 static char *gHiddenTweakListString = NULL;
+static bool gHiddenTweakEnvironmentConsumed = false;
 
 typedef struct {
 	char *path;
@@ -785,8 +786,12 @@ static void hidden_tweak_expand_with_companions(void)
 	} while (changed);
 }
 
-static void load_hidden_tweak_filter_from_environment(void)
+void roothide_hidden_tweak_consume_environment(void)
 {
+	if (gHiddenTweakEnvironmentConsumed) {
+		return;
+	}
+	gHiddenTweakEnvironmentConsumed = true;
 	clear_hidden_tweak_filter();
 	gHiddenTweakAllowMode = true;
 
@@ -1967,7 +1972,7 @@ void roothide_init()
 
 void roothide_init_with_checkin(const char* rootdir)
 {
-	load_hidden_tweak_filter_from_environment();
+	roothide_hidden_tweak_consume_environment();
 
 	if (dyld_patch_fallback_enabled || gHiddenTweakNameCount > 0)
 	{
