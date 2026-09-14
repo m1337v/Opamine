@@ -1927,10 +1927,11 @@ static rhi_rebind_result_t prepare_dyld_vtable_transaction(void ***gDyldPtr)
 // litehook_rebind_symbol replaces the GOT entry for dlopen in all loaded images,
 // so the original dlopen address stays valid through the DSC.
 /* Captured before the first replacement write; atomic so a replacement that
- * becomes reachable during commit cannot race this publication.  Use the
- * integer null pointer constant because Clang 15 rejects converting its NULL
- * macro (void *) to an atomic function pointer in a constant initializer. */
-static _Atomic(void *(*)(const char *, int)) dlopen_fallback_orig = 0;
+ * becomes reachable during commit cannot race this publication.  Keep this in
+ * static storage without an explicit initializer: Apple Clang 15 rejects both
+ * its (void *) NULL macro and integer zero for an atomic function pointer.  The
+ * predecessor is release-stored before the transaction exposes this hook. */
+static _Atomic(void *(*)(const char *, int)) dlopen_fallback_orig;
 void *dlopen_fallback_hook(const char *path, int mode)
 {
 	/* A late image can invalidate this physical GOT replacement. Forward via

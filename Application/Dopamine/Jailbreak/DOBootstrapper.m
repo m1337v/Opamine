@@ -20,11 +20,15 @@
 #define LIBKRW_DOPAMINE_BUNDLED_VERSION @"2.0.3"
 #define LIBROOT_DOPAMINE_BUNDLED_VERSION @"1.0.1"
 #define BASEBIN_LINK_BUNDLED_VERSION @"1.0.0"
+#define ROOTHIDE_CORE_BUNDLED_VERSION @"0.1.0-0+opamine1"
+#define SILEO_BUNDLED_VERSION @"2.5.1-13+opamine1"
 
 static NSDictionary *gBundledPackages = @{
     @"libkrw0-dopamine" : LIBKRW_DOPAMINE_BUNDLED_VERSION,
     @"libroot-dopamine" : LIBROOT_DOPAMINE_BUNDLED_VERSION,
     @"dopamine-basebin-link" : BASEBIN_LINK_BUNDLED_VERSION,
+    @"roothide" : ROOTHIDE_CORE_BUNDLED_VERSION,
+    @"org.coolstar.sileo" : SILEO_BUNDLED_VERSION,
 };
 
 struct hfs_mount_args {
@@ -609,17 +613,20 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 - (NSString *)installedVersionForPackageWithIdentifier:(NSString *)identifier
 {
     NSString *dpkgStatus = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/var/lib/dpkg/status") encoding:NSUTF8StringEncoding error:nil];
-    NSString *packageStartLine = [NSString stringWithFormat:@"Package: %@", identifier];
-    
+    if (!dpkgStatus) return nil;
+
     NSArray *packageInfos = [dpkgStatus componentsSeparatedByString:@"\n\n"];
     for (NSString *packageInfo in packageInfos) {
-        if ([packageInfo hasPrefix:packageStartLine]) {
-            __block NSString *version = nil;
-            [packageInfo enumerateLinesUsingBlock:^(NSString * _Nonnull line, BOOL * _Nonnull stop) {
-                if ([line hasPrefix:@"Version: "]) {
-                    version = [line substringFromIndex:9];
-                }
-            }];
+        __block NSString *package = nil;
+        __block NSString *status = nil;
+        __block NSString *version = nil;
+        [packageInfo enumerateLinesUsingBlock:^(NSString * _Nonnull line, BOOL * _Nonnull stop) {
+            if ([line hasPrefix:@"Package: "]) package = [line substringFromIndex:9];
+            else if ([line hasPrefix:@"Status: "]) status = [line substringFromIndex:8];
+            else if ([line hasPrefix:@"Version: "]) version = [line substringFromIndex:9];
+        }];
+        if ([package isEqualToString:identifier] &&
+            [status isEqualToString:@"install ok installed"]) {
             return version;
         }
     }
@@ -647,8 +654,16 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     
     NSString *installedVersion = [self installedVersionForPackageWithIdentifier:identifier];
     if (!installedVersion) return YES;
-    
-    return [installedVersion numericalVersionRepresentation] < [bundledVersion numericalVersionRepresentation];
+
+    // Package revisions can contain Debian suffixes such as "-13+opamine1".
+    // Let dpkg compare them instead of truncating them into three numeric fields.
+    int comparison = exec_cmd_trusted(JBROOT_PATH("/usr/bin/dpkg"),
+                                      "--compare-versions",
+                                      installedVersion.fileSystemRepresentation,
+                                      "lt",
+                                      bundledVersion.fileSystemRepresentation,
+                                      NULL);
+    return comparison == 0;
 }
 
 #if 0
@@ -1329,9 +1344,25 @@ int getCFMajorVersion(void)
     
     BOOL shouldInstallLibkrw = [self shouldInstallPackage:@"libkrw0-dopamine"];
     BOOL shouldInstallBasebinLink = [self shouldInstallPackage:@"dopamine-basebin-link"];
+    BOOL shouldInstallRoothideCore = [self shouldInstallPackage:@"roothide"];
+    // Respect the package-manager choice: update Sileo only when it is already installed.
+    BOOL sileoInstalled = [self installedVersionForPackageWithIdentifier:@"org.coolstar.sileo"] != nil;
+    BOOL shouldInstallSileo = sileoInstalled && [self shouldInstallPackage:@"org.coolstar.sileo"];
     
-    if (shouldInstallLibkrw || shouldInstallBasebinLink) {
+    if (shouldInstallLibkrw || shouldInstallBasebinLink || shouldInstallRoothideCore || shouldInstallSileo) {
         [[DOUIManager sharedInstance] sendLog:@"Updating Bundled Packages" debug:NO];
+
+        if (shouldInstallRoothideCore) {
+            NSString *roothideCorePath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"roothide.deb"];
+            int r = [self installPackage:roothideCorePath];
+            if (r != 0) return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to install RootHide Core: %d\n", r]}];
+        }
+
+        if (shouldInstallSileo) {
+            NSString *sileoPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"sileo.deb"];
+            int r = [self installPackage:sileoPath];
+            if (r != 0) return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedFinalising userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to install the hardened Sileo package: %d\n", r]}];
+        }
         
         if (shouldInstallLibkrw) {
             NSString *libkrwPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"libkrw-dopamine.deb"];
