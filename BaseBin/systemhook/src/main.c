@@ -1,4 +1,5 @@
 #include "common.h"
+#include "hider_caller_policy.h"
 #include "hider_internal.h"
 #include "roothider.h"
 
@@ -242,13 +243,13 @@ int necp_session_action_hook(int necp_fd, uint32_t action, uint8_t *in_buffer, s
 // Additionally we also remove CS_DEBUGGED while we're at it, as on arm64e this also is not set and everything is fine
 // That way we have unified behaviour between both arm64 and arm64e
 
-static void normalize_csops_status_flags(pid_t pid, uint32_t *csflag)
+static void normalize_csops_status_flags(pid_t pid, uint32_t *csflag, bool external_hidden_view)
 {
 	if (!csflag) return;
 
 	*csflag |= CS_VALID;
 	*csflag &= ~CS_DEBUGGED;
-	if (pid == getpid() && gFullyDebugged) {
+	if (pid == getpid() && gFullyDebugged && !external_hidden_view) {
 		*csflag |= CS_DEBUGGED;
 	}
 
@@ -256,19 +257,27 @@ static void normalize_csops_status_flags(pid_t pid, uint32_t *csflag)
 	// userland csops probes even though the jailbreak may have relaxed the
 	// kernel-side flags to allow injection/debug semantics.
 	if (pid == getpid() && gHiddenInjection) {
-		*csflag |= (CS_HARD | CS_KILL);
+		*csflag |= (CS_VALID | CS_HARD | CS_KILL);
 		*csflag &= ~CS_GET_TASK_ALLOW;
+		if (external_hidden_view) {
+			// Hidden processes must retain the stock external view even when
+			// the process itself was marked debugged for injection.
+			*csflag &= ~CS_DEBUGGED;
+		}
 	}
 }
 
 int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
 {
+	const void *return_address = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool external_hidden_view = gHiddenInjection &&
+		!rhi_hider_caller_can_read_hidden(return_address);
 	int rv = syscall(SYS_csops, pid, ops, useraddr, usersize);
 	if (rv != 0) return rv;
 	if (ops == CS_OPS_STATUS) {
 		if (useraddr && usersize == sizeof(uint32_t)) {
 			uint32_t* csflag = (uint32_t *)useraddr;
-			normalize_csops_status_flags(pid, csflag);
+			normalize_csops_status_flags(pid, csflag, external_hidden_view);
 		}
 	}
 	return rv;
@@ -276,12 +285,15 @@ int csops_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize)
 
 int csops_audittoken_hook(pid_t pid, unsigned int ops, void *useraddr, size_t usersize, audit_token_t *token)
 {
+	const void *return_address = __builtin_extract_return_addr(__builtin_return_address(0));
+	bool external_hidden_view = gHiddenInjection &&
+		!rhi_hider_caller_can_read_hidden(return_address);
 	int rv = syscall(SYS_csops_audittoken, pid, ops, useraddr, usersize, token);
 	if (rv != 0) return rv;
 	if (ops == CS_OPS_STATUS) {
 		if (useraddr && usersize == sizeof(uint32_t)) {
 			uint32_t* csflag = (uint32_t *)useraddr;
-			normalize_csops_status_flags(pid, csflag);
+			normalize_csops_status_flags(pid, csflag, external_hidden_view);
 		}
 	}
 	return rv;
