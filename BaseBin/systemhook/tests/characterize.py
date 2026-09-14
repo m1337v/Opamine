@@ -295,6 +295,296 @@ class DirectoryDouble:
         self.paths.pop(token, None)
 
 
+class TrackingState(str, Enum):
+    FILTERED = "filtered"
+    DEGRADING = "degrading"
+    NATIVE = "native"
+
+
+class CallbackState(str, Enum):
+    REPLAYING = "replaying"
+    ACTIVE = "active"
+    NATIVE = "native"
+
+
+@dataclass
+class CatalogImageDouble:
+    path: str
+    header: int
+    identity: int
+    hidden: bool = False
+    active: bool = True
+    added: int = 0
+    removed: int = 0
+
+
+@dataclass
+class CatalogEventDouble:
+    kind: str
+    image: CatalogImageDouble
+    sequence: int
+
+
+@dataclass
+class DyldRegistrationDouble:
+    callback: Callable[[CatalogImageDouble], None]
+    hidden_reader: bool
+    state: CallbackState = CallbackState.REPLAYING
+    boundary: int = 0
+    marker: int = 0
+
+
+class CallbackCatalogDouble:
+    """Portable WP4 contract model.  It intentionally makes all callback
+    delivery observable so the checks below catch lock/replay ordering bugs."""
+
+    def __init__(self) -> None:
+        self.state = TrackingState.FILTERED
+        self.images: list[CatalogImageDouble] = []
+        self.events: list[CatalogEventDouble] = []
+        self.registrations: list[DyldRegistrationDouble] = []
+        self.sequence = 0
+        self.identity = 0
+        self.locked = False
+        self.callback_under_lock = False
+        self.force_allocation_failure = False
+
+    def _degrade(self) -> None:
+        if self.state is TrackingState.FILTERED:
+            self.state = TrackingState.DEGRADING
+            for registration in self.registrations:
+                registration.state = CallbackState.NATIVE
+            self.state = TrackingState.NATIVE
+
+    def add(self, path: str, header: int, hidden: bool = False) -> CatalogImageDouble:
+        if self.force_allocation_failure:
+            self._degrade()
+            raise MemoryError("deterministic catalog allocation failure")
+        self.identity += 1
+        self.sequence += 1
+        image = CatalogImageDouble(path, header, self.identity, hidden, True, self.sequence)
+        self.images.append(image)
+        event = CatalogEventDouble("add", image, self.sequence)
+        self.events.append(event)
+        if self.state is TrackingState.FILTERED:
+            self._dispatch_live(event)
+        return image
+
+    def remove(self, image: CatalogImageDouble) -> None:
+        self.sequence += 1
+        image.active = False
+        image.removed = self.sequence
+        event = CatalogEventDouble("remove", image, self.sequence)
+        self.events.append(event)
+        if self.state is TrackingState.FILTERED:
+            self._dispatch_live(event)
+
+    def _visible(self, registration: DyldRegistrationDouble, image: CatalogImageDouble) -> bool:
+        return registration.hidden_reader or not image.hidden
+
+    def _deliver(self, registration: DyldRegistrationDouble, image: CatalogImageDouble) -> None:
+        require(not self.locked, "callback must never run under catalog/registry lock")
+        self.callback_under_lock = self.callback_under_lock or self.locked
+        if self._visible(registration, image):
+            registration.callback(image)
+
+    def _dispatch_live(self, event: CatalogEventDouble) -> None:
+        for registration in self.registrations:
+            if registration.state is CallbackState.ACTIVE:
+                if event.kind == "remove":
+                    # The C implementation has a synchronous dyld callback
+                    # window for a remove. This model only needs ordering.
+                    self._deliver(registration, event.image)
+                elif event.image.active:
+                    self._deliver(registration, event.image)
+                else:
+                    self._degrade()
+
+    def register_add(self, callback: Callable[[CatalogImageDouble], None], hidden_reader: bool = False) -> DyldRegistrationDouble:
+        registration = DyldRegistrationDouble(callback, hidden_reader)
+        self.locked = True
+        if self.state is not TrackingState.FILTERED or self.force_allocation_failure:
+            self.locked = False
+            self._degrade()
+            registration.state = CallbackState.NATIVE
+            return registration
+        registration.boundary = self.sequence
+        registration.marker = self.sequence
+        self.registrations.append(registration)
+        self.locked = False
+
+        # Historical catalog, then only post-registration adds. An add that
+        # was unloaded before delivery is a fail-stop handoff, never stale use.
+        for image in self.images:
+            if image.added <= registration.boundary and (not image.removed or image.removed > registration.boundary):
+                if not image.active:
+                    self._degrade()
+                    return registration
+                self._deliver(registration, image)
+        registration.state = CallbackState.ACTIVE
+        for event in list(self.events):
+            if event.sequence <= registration.marker:
+                continue
+            if event.kind == "remove" or not event.image.active:
+                self._degrade()
+                return registration
+            self._deliver(registration, event.image)
+        return registration
+
+    def snapshot(self) -> tuple[int, list[tuple[str, int, int]]]:
+        # Return owned tuples rather than catalog references.
+        return self.sequence, [(str(image.path), image.header, image.identity)
+                               for image in self.images if image.active]
+
+
+class PermanentRelayDouble:
+    """Model the one-way permanent-bootstrap-relay fallback.
+
+    A source event selects exactly one route.  FILTERED uses catalog delivery;
+    PASSTHROUGH uses the already-installed native relay and sends the exact
+    live event to already ACTIVE linked registrations.  New registrations use
+    the original API after the route flips, so there is no second registration
+    of a retained callback.  A replaying registration cannot safely receive a
+    remove after the source callback returns; the model records that ambiguity
+    as a fail-stop rather than inventing a stale delivery.
+    """
+
+    def __init__(self) -> None:
+        self.state = TrackingState.FILTERED
+        self.route = "filtered"
+        self.linked: list[tuple[str, CallbackState, Callable[[str, int], None]]] = []
+        self.native_registrations: list[str] = []
+        self.delivery_failed = False
+        self.ready = True
+        self.events: list[tuple[str, int]] = []
+        self.caller_policy_events: list[tuple[str, int]] = []
+        self.timeline: list[tuple[str, str, int]] = []
+
+    def link(self, kind: str, callback: Callable[[str, int], None],
+             state: CallbackState = CallbackState.ACTIVE) -> None:
+        require(self.route == "filtered", "only filtered registrations are retained by the relay")
+        self.linked.append((kind, state, callback))
+
+    def register_after_transition(self, kind: str) -> None:
+        require(self.route == "passthrough", "native registration is only for a new post-transition client")
+        self.native_registrations.append(kind)
+
+    def degrade(self) -> None:
+        if self.state is TrackingState.FILTERED:
+            self.state = TrackingState.DEGRADING
+        self.route = "passthrough"
+        self.state = TrackingState.NATIVE
+
+    def source_event(self, kind: str, header: int, transition: bool = False) -> None:
+        if kind in ("add", "remove"):
+            self.caller_policy_events.append((kind, header))
+            self.timeline.append(("caller-policy", kind, header))
+        if not self.ready:
+            return
+        if transition:
+            self.degrade()
+        if self.route == "filtered":
+            self.events.append((f"filtered:{kind}", header))
+            self.timeline.append(("filtered", kind, header))
+            return
+        # This represents the source callback itself: no lock, queue, pin,
+        # allocation, or original registration surrounds the callback.
+        self.events.append((f"raw:{kind}", header))
+        self.timeline.append(("raw", kind, header))
+        for registration_kind, state, callback in self.linked:
+            if registration_kind != kind:
+                continue
+            if state is not CallbackState.ACTIVE:
+                self.delivery_failed = True
+                self.ready = False
+                self.degrade()
+                continue
+            callback(kind, header)
+
+    def fail_stop_after_partial_filtered_delivery(self, kind: str, header: int) -> None:
+        """Model a route flip discovered after an earlier filtered callback.
+
+        Re-driving the event raw would duplicate that earlier callback, so the
+        hider relinquishes readiness and no later event is advertised as part
+        of a coherent callback stream.
+        """
+        require(self.route == "filtered", "partial delivery starts in filtered mode")
+        for registration_kind, state, callback in self.linked:
+            if registration_kind == kind and state is CallbackState.ACTIVE:
+                callback(kind, header)
+                break
+        self.events.append((f"filtered:{kind}", header))
+        self.delivery_failed = True
+        self.ready = False
+        self.degrade()
+
+    def child_after_fork(self) -> None:
+        # The parent had fenced publication with its catalog lock.  The child
+        # must not rely on an inherited filtered catalog or worker.
+        self.state = TrackingState.NATIVE
+        self.route = "passthrough"
+
+
+@dataclass
+class PinnedImageDouble:
+    identity: int
+    generation: int
+    active: bool = True
+
+
+class CallbackPinDouble:
+    """Model a callback-local RTLD_NOLOAD lifetime pin.
+
+    Handles are deliberately not cached. The post-acquisition
+    identity/generation check is observable.  A failed bookkeeping probe
+    consumes only its own loader error while TLS virtualization retains the
+    callback caller's pre-existing one.
+    """
+
+    def __init__(self) -> None:
+        self.generation = 1
+        self.opens = 0
+        self.closes = 0
+        self.loader_error: str | None = "caller pending error"
+        self.bookkeeping_failures_consumed = 0
+        self._handles: set[int] = set()
+
+    def acquire(
+        self,
+        image: PinnedImageDouble,
+        after_open: Callable[[], None] | None = None,
+        fail_no_load: bool = False,
+    ) -> int | None:
+        expected_identity = image.identity
+        expected_generation = self.generation
+        if not image.active:
+            return None
+        if fail_no_load:
+            # The real helper snapshots the pending caller error into fixed
+            # TLS, then consumes this internal RTLD_NOLOAD failure.
+            self.bookkeeping_failures_consumed += 1
+            return None
+        self.opens += 1
+        handle = self.opens
+        self._handles.add(handle)
+        if after_open:
+            after_open()
+        if (not image.active or image.identity != expected_identity or
+                self.generation != expected_generation):
+            self.release(handle)
+            return None
+        return handle
+
+    def release(self, handle: int) -> None:
+        require(handle in self._handles, "only a currently acquired pin may be released")
+        self.closes += 1
+        self._handles.remove(handle)
+
+    @property
+    def retained_handles(self) -> int:
+        return len(self._handles)
+
+
 class CallerCapabilityDouble:
     """Model exact-range trust and generation-invalidated return-address cache."""
 
@@ -636,6 +926,8 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
                 "rhi_hider_caller_register_own_function",
                 "rhi_hider_identity_executable_path",
                 "hidden_dylib_hider_init",
+                "hidden_dylib_hider_catalog_snapshot",
+                "hidden_dylib_hider_catalog_generation_is_current",
                 "rhi_rebind_transaction_prepare_global",
                 "rhi_hider_hook_session_start",
             ):
@@ -902,23 +1194,330 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     require("dir_filter_kind_for_dir" not in opendir_body, "opendir must not capture a directory category")
     require("g_dir_filter" not in closedir_body and "unregister_dir_filter" not in closedir_body, "closedir must remain ownership-neutral")
 
+    def check_callback_registration_replay_fixture() -> None:
+        catalog = CallbackCatalogDouble()
+        first = catalog.add("/app/Main", 0x1000)
+        second = catalog.add("/app/Framework", 0x2000)
+        delivered: list[int] = []
+
+        def callback(image: CatalogImageDouble) -> None:
+            delivered.append(image.header)
+            if image is first:
+                catalog.add("/app/PostRegistration", 0x3000)
+
+        registration = catalog.register_add(callback)
+        require(registration.state is CallbackState.ACTIVE, "registration must publish only after replay")
+        require(delivered == [first.header, second.header, 0x3000],
+                "historical images must precede queued post-registration additions")
+        require(not catalog.callback_under_lock, "replay callback must run out of lock")
+
+    check("callback_registration_replay_order_fixture", check_callback_registration_replay_fixture)
+
+    def check_catalog_remove_reuse_fixture() -> None:
+        catalog = CallbackCatalogDouble()
+        old = catalog.add("/app/Old", 0x4000)
+        catalog.remove(old)
+        replacement = catalog.add("/app/NewAtSameAddress", 0x4000)
+        delivered: list[tuple[int, int]] = []
+        catalog.register_add(lambda image: delivered.append((image.header, image.identity)))
+        require(delivered == [(0x4000, replacement.identity)],
+                "address reuse must create a new catalog identity and never replay the removed image")
+        require(old.identity != replacement.identity and not old.active and replacement.active,
+                "removed catalog identities must persist inertly")
+
+    check("callback_catalog_remove_address_reuse_fixture", check_catalog_remove_reuse_fixture)
+
+    def check_recursive_unload_fixture() -> None:
+        catalog = CallbackCatalogDouble()
+        anchor = catalog.add("/app/Anchor", 0x5000)
+        delivered: list[int] = []
+
+        def callback(image: CatalogImageDouble) -> None:
+            delivered.append(image.header)
+            if image is anchor:
+                temporary = catalog.add("/app/Temporary", 0x6000)
+                catalog.remove(temporary)
+
+        registration = catalog.register_add(callback)
+        require(catalog.state is TrackingState.NATIVE and registration.state is CallbackState.NATIVE,
+                "queued add/remove during replay must fail-stop to native delivery")
+        require(0x6000 not in delivered, "an unloaded header must never be dispatched from replay")
+
+    check("callback_recursive_load_unload_failstop_fixture", check_recursive_unload_fixture)
+
+    def check_callback_allocation_failure_fixture() -> None:
+        catalog = CallbackCatalogDouble()
+        catalog.add("/app/Main", 0x7000)
+        delivered: list[int] = []
+        catalog.force_allocation_failure = True
+        registration = catalog.register_add(lambda image: delivered.append(image.header))
+        require(catalog.state is TrackingState.NATIVE and registration.state is CallbackState.NATIVE,
+                "registration allocation failure must transition FILTERED -> DEGRADING -> NATIVE")
+        require(not delivered, "failed filtered registration must not silently publish a partial replay")
+
+    check("callback_allocation_failure_degradation_fixture", check_callback_allocation_failure_fixture)
+
+    def check_catalog_snapshot_ownership_fixture() -> None:
+        catalog = CallbackCatalogDouble()
+        image = catalog.add("/app/OwnedPath", 0x8000)
+        generation, snapshot = catalog.snapshot()
+        image.path = "/mutated/source"
+        require(snapshot == [("/app/OwnedPath", 0x8000, image.identity)],
+                "consumer snapshot must own path/header identity outside catalog lock")
+        require(generation == catalog.sequence, "catalog snapshot must expose a recheckable generation")
+
+    check("callback_catalog_snapshot_ownership_fixture", check_catalog_snapshot_ownership_fixture)
+
+    def check_objc_timing_lane_fixture() -> None:
+        # The model has no implicit ObjC event in add(); only the runtime relay
+        # is permitted to produce that lane's deliveries.
+        catalog = CallbackCatalogDouble()
+        catalog.add("/app/Main", 0x9000)
+        objc_events: list[int] = []
+        dyld_events: list[int] = []
+        catalog.register_add(lambda image: dyld_events.append(image.header))
+        require(objc_events == [] and dyld_events == [0x9000],
+                "dyld replay must not synthesize ObjC runtime callbacks")
+
+    check("objc_runtime_timing_lane_separation_fixture", check_objc_timing_lane_fixture)
+
+    def check_callback_lifetime_pin_fixture() -> None:
+        pins = CallbackPinDouble()
+        image = PinnedImageDouble(identity=41, generation=1)
+        handle = pins.acquire(image)
+        require(handle is not None, "active catalog identity must acquire a short-lived callback pin")
+        pins.release(handle)
+        require(pins.opens == pins.closes and pins.retained_handles == 0,
+                "every delivery pin must be released; handles cannot be retained in the catalog")
+        require(pins.loader_error == "caller pending error",
+                "successful pin bookkeeping must preserve the caller's pending dlerror state")
+
+        failed = pins.acquire(image, fail_no_load=True)
+        require(failed is None and pins.bookkeeping_failures_consumed == 1 and
+                pins.loader_error == "caller pending error",
+                "failed RTLD_NOLOAD must consume its own error while TLS preserves the caller error")
+
+        reused = PinnedImageDouble(identity=42, generation=1)
+        rejected = pins.acquire(reused, after_open=lambda: (
+            setattr(reused, "identity", 43), setattr(pins, "generation", 2)))
+        require(rejected is None and pins.opens == pins.closes and pins.retained_handles == 0,
+                "post-open identity/generation change must release and reject a stale callback header")
+
+    check("callback_lifetime_pin_revalidate_release_fixture", check_callback_lifetime_pin_fixture)
+
+    def check_permanent_relay_transition_fixture() -> None:
+        relay = PermanentRelayDouble()
+        delivered: list[tuple[str, int]] = []
+        relay.link("remove", lambda kind, header: delivered.append((kind, header)))
+        relay.source_event("remove", 0xABCD, transition=True)
+        require(relay.route == "passthrough" and relay.state is TrackingState.NATIVE,
+                "degradation must flip the public delivery route exactly once")
+        require(relay.events == [("raw:remove", 0xABCD)] and delivered == [("remove", 0xABCD)],
+                "the transition-causing remove must be delivered once, raw, before its source relay returns")
+        relay.source_event("remove", 0xABCE)
+        require(delivered == [("remove", 0xABCD), ("remove", 0xABCE)],
+                "already-linked callbacks stay permanently multiplexed in raw source order")
+        relay.register_after_transition("remove")
+        require(relay.native_registrations == ["remove"] and len(relay.linked) == 1,
+                "only a new post-transition registration uses the original API")
+
+    check("permanent_relay_transition_remove_fixture", check_permanent_relay_transition_fixture)
+
+    def check_passthrough_caller_policy_fixture() -> None:
+        relay = PermanentRelayDouble()
+        relay.degrade()
+        relay.source_event("add", 0xADE0)
+        relay.source_event("remove", 0xADE0)
+        require(relay.caller_policy_events == [("add", 0xADE0), ("remove", 0xADE0)],
+                "pass-through add/remove must still invalidate caller-policy image ranges")
+        require(relay.timeline == [
+                    ("caller-policy", "add", 0xADE0), ("raw", "add", 0xADE0),
+                    ("caller-policy", "remove", 0xADE0), ("raw", "remove", 0xADE0),
+                ],
+                "caller-policy invalidation must precede raw pass-through delivery")
+
+    check("permanent_relay_passthrough_caller_policy_fixture", check_passthrough_caller_policy_fixture)
+
+    def check_passthrough_objc_lane_fixture() -> None:
+        relay = PermanentRelayDouble()
+        delivered: list[tuple[str, int]] = []
+        relay.link("objc", lambda kind, header: delivered.append((kind, header)))
+        relay.source_event("objc", 0xBEEF, transition=True)
+        require(delivered == [("objc", 0xBEEF)] and relay.events == [("raw:objc", 0xBEEF)],
+                "ObjC fallback delivery remains on its own native relay lane, not dyld add timing")
+
+    check("permanent_relay_objc_lane_fixture", check_passthrough_objc_lane_fixture)
+
+    def check_replay_ambiguity_failstop_fixture() -> None:
+        relay = PermanentRelayDouble()
+        relay.link("remove", lambda _kind, _header: None, CallbackState.REPLAYING)
+        relay.source_event("remove", 0xC001, transition=True)
+        require(relay.delivery_failed and relay.events == [("raw:remove", 0xC001)],
+                "a replaying registration must not receive a deferred/stale remove after fallback")
+
+    check("permanent_relay_replay_remove_failstop_fixture", check_replay_ambiguity_failstop_fixture)
+
+    def check_mid_dispatch_route_flip_failstop_fixture() -> None:
+        relay = PermanentRelayDouble()
+        delivered: list[tuple[str, int]] = []
+        relay.link("remove", lambda kind, header: delivered.append((kind, header)))
+        relay.link("remove", lambda kind, header: delivered.append((kind, header)))
+        relay.fail_stop_after_partial_filtered_delivery("remove", 0xC010)
+        require(relay.delivery_failed and not relay.ready and relay.route == "passthrough" and
+                delivered == [("remove", 0xC010)],
+                "a route flip after partial filtered delivery must fail readiness, not raw-replay duplicates")
+        relay.source_event("remove", 0xC011)
+        require(delivered == [("remove", 0xC010)],
+                "terminal callback ambiguity must not advertise a later coherent stream")
+
+    check("permanent_relay_mid_dispatch_failstop_fixture", check_mid_dispatch_route_flip_failstop_fixture)
+
+    def check_atfork_passthrough_fixture() -> None:
+        child = PermanentRelayDouble()
+        child.link("remove", lambda _kind, _header: None)
+        child.child_after_fork()
+        child.source_event("remove", 0xC002)
+        require(child.state is TrackingState.NATIVE and child.route == "passthrough" and
+                child.events == [("raw:remove", 0xC002)],
+                "fork child must use its inherited permanent relay without a worker or filtered catalog")
+
+    check("atfork_passthrough_no_hang_fixture", check_atfork_passthrough_fixture)
+
     def check_task_snapshot_coherence_contract() -> None:
         require("RHI_TASK_SNAPSHOT_GENERATION_LIMIT" not in hider, "snapshot generations must not have a detector-controlled fixed cap")
         require("RHI_TASK_SNAPSHOT_COPY_ATTEMPTS" in hider, "snapshot copy must use bounded stability retries")
-        require("copy_dyld_image_path" in hider and "image_paths" in hider, "published task snapshot must own its image paths")
+        require("hider_image_record" in hider and "record->path" in hider,
+                "published task snapshot must derive paths from process-lifetime catalog ownership")
         require("task_snapshot_source_is_current" in hider, "snapshot source must be revalidated around copies")
         require("TASK_SNAPSHOT_FATAL" in hider, "snapshot result must distinguish fatal publication failure")
-        require("g_image_tracking_degraded = true" in hider, "fatal snapshot publication failure must degrade all linked views")
+        require("HIDER_TRACKING_DEGRADING" in hider and "hider_degrade_to_native" in hider,
+                "fatal snapshot publication failure must hand every linked view to native APIs")
 
     check("task_snapshot_coherence_production_contract", check_task_snapshot_coherence_contract)
 
-    if "g_add_cbs[g_add_cb_n++]" in hider and "for (uint32_t i = 0; i < n; i++)\n\t\tfunc(image_snapshot" in hider:
-        known_gaps.append({
-            "id": "dyld-callback-registration-replay-order",
-            "severity": "medium",
-            "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
-            "detail": "A newly registered add-image callback is visible before its out-of-lock replay completes; WP4 must queue post-registration events until replay order is established.",
-        })
+    def check_callback_catalog_source_contract() -> None:
+        for token in (
+            "hider_image_record", "HIDER_CALLBACK_REPLAYING", "HIDER_CALLBACK_ACTIVE",
+            "HIDER_CALLBACK_NATIVE", "HIDER_TRACKING_FILTERED", "HIDER_TRACKING_DEGRADING",
+            "HIDER_TRACKING_NATIVE", "catalog_append_event_locked", "hider_degrade_to_native",
+            "HIDER_DELIVERY_FILTERED", "HIDER_DELIVERY_PASSTHROUGH",
+            "hider_dispatch_passthrough_dyld_event", "hider_dispatch_passthrough_objc_event",
+            "callback_invoking", "recursive_event",
+            "on_objc_image_loaded", "orig_objc_addLoadImageFunc(on_objc_image_loaded)",
+            "hidden_dylib_hider_catalog_snapshot", "hidden_dylib_hider_catalog_generation_is_current",
+        ):
+            require(token in hider, f"stable callback/catalog contract missing: {token}")
+        require("g_add_cbs" not in hider and "g_objc_addload_cbs" not in hider,
+                "snapshot callback arrays must be removed")
+        for obsolete in ("g_all", "g_visible", "arr_add", "g_image_tracking_degraded"):
+            require(re.search(rf"\b{obsolete}\b", hider) is None,
+                    f"obsolete pre-catalog state must be fully migrated: {obsolete}")
+        require("hider_dispatch_objc_event" not in hider[hider.find("static void on_image_added"):hider.find("static void on_image_removed")],
+                "dyld add callback must not synthesize ObjC callbacks")
+        require("rhi_hider_catalog_snapshot_t" in hider_internal and
+                "RHI_HIDER_INTERNAL bool hidden_dylib_hider_catalog_snapshot" in hider_internal,
+                "caller-relative resolver seam must expose a hidden stable snapshot API")
+        require("header/slide are opaque" in hider_internal and "identities only" in hider_internal and
+                "must never be dereferenced" in hider_internal and "hidden_dylib_hider.c" in hider_internal,
+                "snapshot consumers must treat header/slide as opaque; any resolver pinning stays local")
+
+        # Event nodes must be pre-owned by the process-lifetime image record.
+        for token in ("hider_image_event_t       add_event", "hider_image_event_t       remove_event",
+                      "hider_objc_event_t        objc_event"):
+            require(token in hider, f"catalog record must embed pre-owned event node: {token}")
+
+        def body(start: str, end: str) -> str:
+            begin = hider.find(start)
+            finish = hider.find(end, begin)
+            require(begin >= 0 and finish > begin, f"unable to isolate source body {start}")
+            return hider[begin:finish]
+
+        added_body = body("static void on_image_added", "static void on_image_removed")
+        removed_body = body("static void on_image_removed", "static void on_objc_image_loaded")
+        objc_body = body("static void on_objc_image_loaded(const struct mach_header *mh) {",
+                         "#pragma mark - Hooked dyld Functions")
+        require("calloc(" not in added_body and "calloc(" not in removed_body and "calloc(" not in objc_body,
+                "native lifecycle relays may not allocate per event")
+        require("catalog_create_event" not in hider,
+                "event allocation helper must not survive the pre-owned node design")
+
+        for token in ("orig_dlopen", "orig_dlclose", "RTLD_NOLOAD", "hider_callback_pin_acquire",
+                      "hider_callback_pin_release",
+                      "record->identity == identity", "g_image_generation == generation"):
+            require(token in hider, f"out-of-lane callback lifetime proof missing: {token}")
+        pin_body = body("static void hider_callback_pin_release", "static bool hider_call_dyld_callback")
+        require("hider_loader_error_preserve_for_internal_call" in pin_body and
+                "hider_loader_error_consume_internal_failure" in pin_body and
+                "g_loader_error_pending" in hider and "RHI_LOADER_ERROR_CAPACITY" in hider,
+                "callback pins must virtualize a pre-existing dlerror and consume only their own failure")
+        dlerror_body = body("__attribute__((noinline))\nstatic char *h_dlerror(void) {",
+                            "#pragma mark - ObjC runtime hooks")
+        require(dlerror_body.find("g_loader_error_pending") < dlerror_body.find("caller_is_hidden"),
+                "virtualized callback errors must be delivered before caller-policy forwarding")
+        raw_dyld_body = body("static bool hider_dispatch_passthrough_dyld_event(hider_dyld_callback_kind_t kind,\n\t                                                const struct mach_header *mh,\n\t                                                intptr_t slide) {",
+                             "static bool hider_dispatch_dyld_event_to_registration")
+        raw_objc_body = body("static bool hider_dispatch_passthrough_objc_event(const struct mach_header *mh) {",
+                             "static bool hider_dispatch_objc_event_to_registration")
+        for raw_body in (raw_dyld_body, raw_objc_body):
+            for forbidden in ("os_unfair_lock_lock", "calloc(", "hider_callback_pin_",
+                              "orig_dyld_register_func", "orig_objc_addLoadImageFunc"):
+                require(forbidden not in raw_body,
+                        f"raw source-relay pass-through must not lock/allocate/pin/register: {forbidden}")
+            require(raw_body.find("g_callback_delivery_failed") < raw_body.find("dyld_image_path_containing_address"),
+                    "a terminal callback ambiguity must suppress later raw callback delivery")
+        require("hider_migrate_callbacks_to_native" not in hider and
+                "hider_native_migration_worker" not in hider and
+                "hider_native_relay_try_enter" not in hider,
+                "retained callbacks must not use worker/gated post-hoc native registration")
+        require("orig_objc_addLoadImageFunc" not in objc_body,
+                "ObjC relay must never synchronously register callbacks")
+        require("header_identities == 1" in objc_body and "runtime_uuid_valid" in objc_body and
+                "runtime_path" in objc_body,
+                "ObjC relay must reject delayed/reused header identities")
+        for relay_body, kind in ((added_body, "HIDER_DYLD_CALLBACK_ADD"),
+                                 (removed_body, "HIDER_DYLD_CALLBACK_REMOVE")):
+            require("HIDER_DELIVERY_PASSTHROUGH" in relay_body and
+                    "hider_dispatch_passthrough_dyld_event" in relay_body and kind in relay_body,
+                    "each dyld relay must synchronously forward a pass-through event")
+        for relay_body, caller_update in ((added_body, "rhi_hider_caller_image_added"),
+                                          (removed_body, "rhi_hider_caller_image_removed")):
+            policy_index = relay_body.find(caller_update)
+            route_index = relay_body.find("HIDER_DELIVERY_PASSTHROUGH")
+            raw_index = relay_body.find("hider_dispatch_passthrough_dyld_event")
+            require(0 <= policy_index < route_index < raw_index,
+                    "caller-policy image invalidation must precede every pass-through fast return")
+        require("HIDER_DELIVERY_PASSTHROUGH" in objc_body and
+                "hider_dispatch_passthrough_objc_event" in objc_body,
+                "ObjC relay must synchronously forward its own pass-through event")
+        require(added_body.count("hider_dispatch_passthrough_dyld_event") >= 2 and
+                removed_body.count("hider_dispatch_passthrough_dyld_event") >= 2 and
+                objc_body.count("hider_dispatch_passthrough_objc_event") >= 2,
+                "a transition-causing source event and every later event must both use raw relay delivery")
+        fail_stop_body = body("static void hider_callback_fail_stop", "typedef struct {")
+        require("g_callback_delivery_failed" in fail_stop_body and
+                "HIDER_STATE_FAILED" in fail_stop_body and
+                "hider_degrade_to_native" in fail_stop_body,
+                "partial source dispatch must make readiness terminally false before public fallback")
+        for relay_body, dispatch in ((added_body, "hider_dispatch_dyld_event(&record->add_event)"),
+                                     (removed_body, "hider_dispatch_dyld_event(&record->remove_event)"),
+                                     (objc_body, "hider_dispatch_objc_event(&record->objc_event)")):
+            dispatch_index = relay_body.find(dispatch)
+            require(dispatch_index >= 0 and
+                    "hider_callback_fail_stop" in relay_body[dispatch_index:],
+                    "a route flip after partial filtered dispatch must fail-stop, never raw-replay all callbacks")
+        atfork_body = body("static void hider_catalog_atfork_prepare", "static void hider_degrade_to_native")
+        require("pthread_atfork" in hider and "hider_catalog_atfork_child" in atfork_body and
+                "HIDER_TRACKING_NATIVE" in atfork_body and
+                "HIDER_DELIVERY_PASSTHROUGH" in atfork_body and
+                "pthread_create" not in atfork_body,
+                "atfork child must abandon filtering and use the inherited permanent relay without a worker")
+
+        init_atfork = hider.find("pthread_atfork(hider_catalog_atfork_prepare")
+        init_replay = hider.find("orig_dyld_register_func_for_add_image(on_image_added)")
+        require(init_atfork >= 0 and init_atfork < init_replay,
+                "atfork catalog fence and saved originals must exist before initial dyld catalog replay")
+
+    check("callback_catalog_production_static_contract", check_callback_catalog_source_contract)
 
     def check_mode_inventory() -> None:
         matrix = json.loads(OWNERSHIP.read_text(encoding="utf-8"))

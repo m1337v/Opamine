@@ -3,9 +3,9 @@
  *
  * Strategy:
  *   - Hook dyld enumeration functions via litehook (in-place DSC replacement)
- *   - Maintain two image arrays: g_all (complete) and g_visible (filtered)
+ *   - Maintain a stable, process-lifetime image catalog with filtered views
  *   - Caller capability via exact validated image ranges:
- *     systemhook/authorized selected tweaks → g_all, everyone else → g_visible
+ *     systemhook/authorized selected tweaks → complete view, everyone else → filtered view
  *   - Also hooks task_info(TASK_DYLD_INFO) to present filtered dyld_all_image_infos
  *
  * Advantage over Shadow/Choicy: we're in systemhook, hooking at the DSC level
@@ -15,6 +15,7 @@
 
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
+#include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
 #include <mach/mig.h>
@@ -40,6 +41,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <strings.h>
+#include <pthread.h>
 
 #include "common.h"
 #include "envbuf.h"
@@ -82,6 +84,7 @@ static const char * _Nonnull *(*orig_objc_copyImageNames)(unsigned int *) = NULL
 static const char * _Nonnull *(*orig_objc_copyClassNamesForImage)(const char *, unsigned int *) = NULL;
 static void (*orig_objc_addLoadImageFunc)(objc_func_loadImage) = NULL;
 static void *(*orig_dlopen)(const char *, int) = NULL;
+static int (*orig_dlclose)(void *) = NULL;
 static pid_t (*orig_fork)(void) = NULL;
 static int (*orig_getfsstat)(struct statfs *, int, int) = NULL;
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t) = NULL;
@@ -101,6 +104,40 @@ static IMP orig_UIApplication_canOpenURL = NULL;
 static IMP orig_UIApplication_openURL = NULL;
 static IMP orig_UIApplication_openURL_options_completion = NULL;
 
+/* Internal callback pins must use dlopen/dlclose, but callers are entitled to
+ * the error that was pending before our bookkeeping began.  Virtualize that
+ * one pending result in fixed TLS before an internal loader call consumes it;
+ * on an internal failure, consume only the bookkeeping error and leave the
+ * virtual caller result for h_dlerror.  This is allocation-free and does not
+ * cache a libdyld-owned error pointer. */
+#define RHI_LOADER_ERROR_CAPACITY 512U
+static _Thread_local char g_loader_error_message[RHI_LOADER_ERROR_CAPACITY];
+static _Thread_local bool g_loader_error_pending = false;
+
+static void hider_loader_error_clear_pending(void) {
+	g_loader_error_pending = false;
+}
+
+static void hider_loader_error_preserve_for_internal_call(void) {
+	if (g_loader_error_pending || !orig_dlerror) {
+		return;
+	}
+	char *pending = orig_dlerror();
+	if (pending) {
+		strlcpy(g_loader_error_message, pending, sizeof(g_loader_error_message));
+		g_loader_error_pending = true;
+	}
+}
+
+static void hider_loader_error_consume_internal_failure(void) {
+	/* The pre-call application error, if any, already lives in TLS.  Discard the
+	 * error produced by our RTLD_NOLOAD/dlclose bookkeeping so it cannot leak
+	 * out through the caller's later dlerror(). */
+	if (orig_dlerror) {
+		(void)orig_dlerror();
+	}
+}
+
 // Forward declarations of hook functions (needed by translate_hook_to_orig)
 static uint32_t h_image_count(void);
 static const char *h_get_image_name(uint32_t idx);
@@ -108,6 +145,7 @@ static const struct mach_header *h_get_image_header(uint32_t idx);
 static intptr_t h_get_image_vmaddr_slide(uint32_t idx);
 static void h_register_func_for_add_image(void (*func)(const struct mach_header *, intptr_t));
 static void h_register_func_for_remove_image(void (*func)(const struct mach_header *, intptr_t));
+static void on_objc_image_loaded(const struct mach_header *mh);
 static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
                                   task_info_t info_out, mach_msg_type_number_t *cnt);
 static int h_dladdr(const void *addr, Dl_info *info);
@@ -140,107 +178,68 @@ static void h_UIApplication_openURL_options_completion(id self, SEL _cmd, id url
 static bool fs_path_should_hide(const char *path);
 
 //------------------------------------------------------------------------------
-#pragma mark - Image Entry + Dynamic Array
-
-typedef struct {
-	const char               *name;     // dyld-owned pointer, valid while image loaded
-	const struct mach_header *header;
-	intptr_t                  slide;
-} image_entry_t;
-
-typedef struct {
-	image_entry_t *items;
-	uint32_t       count;
-	uint32_t       cap;
-} image_array_t;
+#pragma mark - Stable Image Catalog
 
 /*
- * All arrays in this file are append-only or protected by g_lock.  Never
- * assign realloc() directly to a live array: a failed growth must preserve
- * the old, still-valid view for callers already inside a dyld callback.
+ * dyld owns the source image strings and unmaps a header at dlclose.  Keeping
+ * pointers into either structure in a callback replay queue therefore creates
+ * a timing-dependent stale-header bug.  The catalog deliberately never frees
+ * a record: each load gets a new identity, its path/UUID are ours, and a
+ * remove merely makes that identity inactive.  In particular an address being
+ * reused for a later load cannot revive a prior record.
  */
-static bool arr_ensure(image_array_t *a, uint32_t need) {
-	if (need <= a->cap) return true;
-	if ((size_t)need > SIZE_MAX / sizeof(image_entry_t)) return false;
+typedef struct hider_image_record hider_image_record_t;
 
-	uint32_t nc = a->cap ? a->cap : 64;
-	while (nc < need) {
-		if (nc > UINT32_MAX / 2) {
-			nc = need;
-			break;
-		}
-		nc *= 2;
-	}
-	if ((size_t)nc > SIZE_MAX / sizeof(image_entry_t)) return false;
+typedef enum {
+	HIDER_IMAGE_EVENT_ADD = 0,
+	HIDER_IMAGE_EVENT_REMOVE,
+} hider_image_event_kind_t;
 
-	image_entry_t *items = realloc(a->items, (size_t)nc * sizeof(*items));
-	if (!items) return false;
+typedef struct hider_image_event {
+	struct hider_image_event *next;
+	hider_image_record_t     *record;
+	uint64_t                  sequence;
+	hider_image_event_kind_t  kind;
+} hider_image_event_t;
 
-	a->items = items;
-	a->cap = nc;
-	return true;
-}
+typedef struct hider_objc_event {
+	struct hider_objc_event *next;
+	hider_image_record_t   *record;
+	uint64_t                sequence;
+} hider_objc_event_t;
 
-static bool arr_add(image_array_t *a, const char *name,
-                    const struct mach_header *mh, intptr_t slide) {
-	if (a->count == UINT32_MAX || !arr_ensure(a, a->count + 1)) {
-		return false;
-	}
-	a->items[a->count].name   = name;  // store dyld's canonical pointer directly
-	a->items[a->count].header = mh;
-	a->items[a->count].slide  = slide;
-	a->count++;
-	return true;
-}
+struct hider_image_record {
+	hider_image_record_t    *next;
+	char                     *path;
+	const struct mach_header *header;
+	intptr_t                  slide;
+	uint8_t                   uuid[16];
+	uint64_t                  added_event;
+	uint64_t                  removed_event;
+	uint64_t                  added_generation;
+	uint64_t                  identity;
+	bool                      uuid_valid;
+	bool                      hidden;
+	bool                      active;
+	bool                      objc_event_emitted;
+	hider_image_event_t       add_event;
+	hider_image_event_t       remove_event;
+	hider_objc_event_t        objc_event;
+};
 
-static bool reserve_entries(void **items, uint32_t *cap, uint32_t need, size_t item_size) {
-	if (need <= *cap) return true;
-	if (!item_size || (size_t)need > SIZE_MAX / item_size) return false;
+typedef enum {
+	HIDER_TRACKING_FILTERED = 0,
+	HIDER_TRACKING_DEGRADING,
+	HIDER_TRACKING_NATIVE,
+} hider_tracking_state_t;
 
-	uint32_t next_cap = *cap ? *cap : 8;
-	while (next_cap < need) {
-		if (next_cap > UINT32_MAX / 2) {
-			next_cap = need;
-			break;
-		}
-		next_cap *= 2;
-	}
-	if ((size_t)next_cap > SIZE_MAX / item_size) return false;
-
-	void *resized = realloc(*items, (size_t)next_cap * item_size);
-	if (!resized) return false;
-
-	*items = resized;
-	*cap = next_cap;
-	return true;
-}
-
-static void arr_remove_by_header(image_array_t *a, const struct mach_header *mh) {
-	for (uint32_t i = 0; i < a->count; i++) {
-		if (a->items[i].header == mh) {
-			// name is dyld-owned, don't free
-			if (i + 1 < a->count)
-				memmove(&a->items[i], &a->items[i + 1],
-				        (a->count - i - 1) * sizeof(image_entry_t));
-			a->count--;
-			return;
-		}
-	}
-}
-
-static bool arr_contains_header(const image_array_t *a, const struct mach_header *mh) {
-	for (uint32_t i = 0; i < a->count; i++) {
-		if (a->items[i].header == mh) return true;
-	}
-	return false;
-}
-
-//------------------------------------------------------------------------------
-#pragma mark - State
-
-static image_array_t g_all     = {0};  // Every image (tweaks see this)
-static image_array_t g_visible = {0};  // Filtered (app sees this)
-static os_unfair_lock g_lock   = OS_UNFAIR_LOCK_INIT;
+static hider_image_record_t *g_catalog_head = NULL;
+static hider_image_record_t *g_catalog_tail = NULL;
+static hider_image_event_t  *g_image_event_head = NULL;
+static hider_image_event_t  *g_image_event_tail = NULL;
+static uint64_t              g_image_event_sequence = 0;
+static uint64_t              g_image_identity_sequence = 0;
+static os_unfair_lock        g_lock = OS_UNFAIR_LOCK_INIT;
 
 typedef enum {
 	DIR_FILTER_NONE = 0,
@@ -333,25 +332,60 @@ static bool dir_entry_should_hide(dir_filter_kind_t kind, const char *name) {
 	}
 }
 
-// Callback tracking — stores app AND tweak registrations separately
-typedef struct {
-	void (*func)(const struct mach_header *, intptr_t);
-	bool  from_hidden;  // true = registered by code in a hidden image (tweak)
-} cb_entry_t;
+/*
+ * Registrations are process-lifetime objects too.  An image event never needs
+ * to malloc a callback snapshot, and a registering callback stays invisible
+ * to live dispatch until its historical replay completes.  This is the same
+ * important property HookKit has for hook transactions: publication is an
+ * explicit state transition, not an append to an exposed array.
+ */
+typedef enum {
+	HIDER_CALLBACK_REPLAYING = 0,
+	HIDER_CALLBACK_ACTIVE,
+	HIDER_CALLBACK_NATIVE,
+} hider_callback_state_t;
 
-static cb_entry_t *g_add_cbs    = NULL;
-static uint32_t    g_add_cb_n   = 0;
-static uint32_t    g_add_cb_cap = 0;
-static cb_entry_t *g_rem_cbs    = NULL;
-static uint32_t    g_rem_cb_n   = 0;
-static uint32_t    g_rem_cb_cap = 0;
-typedef struct {
+typedef enum {
+	HIDER_DYLD_CALLBACK_ADD = 0,
+	HIDER_DYLD_CALLBACK_REMOVE,
+} hider_dyld_callback_kind_t;
+
+typedef struct hider_dyld_callback_registration {
+	_Atomic(struct hider_dyld_callback_registration *) next;
+	void (*func)(const struct mach_header *, intptr_t);
+	hider_image_event_t *event_marker; /* Last event covered by replay. */
+	uint64_t replay_boundary;
+	hider_dyld_callback_kind_t kind;
+	bool from_hidden;
+	atomic_uint state;
+	atomic_bool delivering;
+	atomic_bool callback_invoking;
+	atomic_bool recursive_event;
+	atomic_bool queued_event;
+} hider_dyld_callback_registration_t;
+
+typedef struct hider_objc_callback_registration {
+	_Atomic(struct hider_objc_callback_registration *) next;
 	objc_func_loadImage func;
-	bool                from_hidden;
-} objc_load_cb_entry_t;
-static objc_load_cb_entry_t *g_objc_addload_cbs = NULL;
-static uint32_t              g_objc_addload_cb_n = 0;
-static uint32_t              g_objc_addload_cb_cap = 0;
+	hider_objc_event_t *event_marker;
+	bool from_hidden;
+	atomic_uint state;
+	atomic_bool delivering;
+	atomic_bool callback_invoking;
+	atomic_bool recursive_event;
+	atomic_bool queued_event;
+} hider_objc_callback_registration_t;
+
+/* Heads are acquire/release-published for emergency source delivery. Nodes
+ * never move or free, so a relay which cannot take the catalog lock can still
+ * walk a complete prefix without racing a registration's initialization. */
+static _Atomic(hider_dyld_callback_registration_t *) g_dyld_callbacks = NULL;
+static hider_dyld_callback_registration_t *g_dyld_callbacks_tail = NULL;
+static _Atomic(hider_objc_callback_registration_t *) g_objc_callbacks = NULL;
+static hider_objc_callback_registration_t *g_objc_callbacks_tail = NULL;
+static hider_objc_event_t *g_objc_event_head = NULL;
+static hider_objc_event_t *g_objc_event_tail = NULL;
+static uint64_t g_objc_event_sequence = 0;
 
 /*
  * task_info callers retain the returned dyld_all_image_infos pointer after
@@ -363,8 +397,6 @@ static uint32_t              g_objc_addload_cb_cap = 0;
 typedef struct task_snapshot_generation {
 	struct dyld_all_image_infos snapshot;
 	struct dyld_image_info *images;
-	char **image_paths;
-	uint32_t image_path_capacity;
 	struct dyld_uuid_info *uuids;
 	uint64_t image_generation;
 	struct task_snapshot_generation *previous;
@@ -375,7 +407,18 @@ typedef struct task_snapshot_generation {
 static task_snapshot_generation_t *g_ti_current = NULL;
 static uint64_t                     g_image_generation = 0;
 static struct dyld_all_image_infos *g_real_aii = NULL;  // cached from first task_info call
-static bool                         g_image_tracking_degraded = false;
+static hider_tracking_state_t       g_image_tracking_state = HIDER_TRACKING_FILTERED;
+typedef enum {
+	HIDER_DELIVERY_FILTERED = 0,
+	HIDER_DELIVERY_PASSTHROUGH,
+} hider_delivery_route_t;
+/* The bootstrap dyld/ObjC relays are permanent multiplexers. Filtering and
+ * callback delivery are separate: once an invariant fails, public image views
+ * become native while already-linked registrations receive raw live events
+ * from those same relays. They are never post-hoc registered with dyld/ObjC. */
+static atomic_uint                   g_callback_delivery_route = HIDER_DELIVERY_FILTERED;
+static atomic_bool                   g_callback_delivery_failed;
+static _Thread_local bool            g_hider_atfork_catalog_held;
 
 typedef enum {
 	HIDER_STATE_UNINITIALIZED = 0,
@@ -620,102 +663,981 @@ static bool caller_is_hidden(const void *ra) {
 //------------------------------------------------------------------------------
 #pragma mark - dyld Notification Callbacks (registered before hooking)
 
-static void on_image_added(const struct mach_header *mh, intptr_t slide) {
-	rhi_hider_caller_image_added(mh, slide);
-	const char *path = dyld_image_path_containing_address(mh);
-	if (!path) return;
+static bool hider_tracking_is_filtered_locked(void) {
+	return g_image_tracking_state == HIDER_TRACKING_FILTERED;
+}
 
-	bool hide = image_path_should_hide(path);
+/* Catalog delivery is only valid while both the public view and permanent
+ * relay route are filtered.  After pass-through starts, source callbacks use
+ * their live raw data directly and catalog records are no longer dereferenced
+ * for user delivery. */
+static bool hider_tracking_can_dispatch_locked(void) {
+	return g_image_tracking_state == HIDER_TRACKING_FILTERED &&
+	       atomic_load_explicit(&g_callback_delivery_route, memory_order_acquire) ==
+		       HIDER_DELIVERY_FILTERED;
+}
 
+static char *catalog_copy_path(const char *path) {
+	if (!path) {
+		return NULL;
+	}
+	size_t length = strnlen(path, PATH_MAX);
+	if (length == PATH_MAX || length == SIZE_MAX) {
+		return NULL;
+	}
+	char *copy = malloc(length + 1);
+	if (!copy) {
+		return NULL;
+	}
+	memcpy(copy, path, length);
+	copy[length] = '\0';
+	return copy;
+}
+
+static bool catalog_copy_uuid(const struct mach_header *header, intptr_t slide, uint8_t uuid_out[16]) {
+	if (!header || !uuid_out) {
+		return false;
+	}
+	uintptr_t text_start = 0;
+	uintptr_t text_end = 0;
+	if (!rhi_hider_identity_image_text_range(header, slide, &text_start, &text_end)) {
+		return false;
+	}
+	const struct mach_header_64 *header64 = (const struct mach_header_64 *)header;
+	if (header64->magic != MH_MAGIC_64) {
+		return false;
+	}
+	const uint8_t *cursor = (const uint8_t *)(header64 + 1);
+	const uint8_t *end = cursor + header64->sizeofcmds;
+	for (uint32_t index = 0; index < header64->ncmds; index++) {
+		if ((size_t)(end - cursor) < sizeof(struct load_command)) {
+			return false;
+		}
+		const struct load_command *command = (const struct load_command *)cursor;
+		if (command->cmdsize < sizeof(*command) || (size_t)(end - cursor) < command->cmdsize) {
+			return false;
+		}
+		if (command->cmd == LC_UUID && command->cmdsize >= sizeof(struct uuid_command)) {
+			memcpy(uuid_out, ((const struct uuid_command *)command)->uuid, 16);
+			return true;
+		}
+		cursor += command->cmdsize;
+	}
+	return false;
+}
+
+static hider_image_record_t *catalog_create_record(const char *path,
+	                                                  const struct mach_header *mh,
+	                                                  intptr_t slide) {
+	hider_image_record_t *record = calloc(1, sizeof(*record));
+	if (!record) {
+		return NULL;
+	}
+	if (path) {
+		record->path = catalog_copy_path(path);
+		if (!record->path) {
+			free(record);
+			return NULL;
+		}
+	}
+	record->header = mh;
+	record->slide = slide;
+	record->hidden = image_path_should_hide(path);
+	record->uuid_valid = catalog_copy_uuid(mh, slide, record->uuid);
+	return record;
+}
+
+static hider_image_record_t *catalog_find_active_locked(const struct mach_header *mh,
+	                                                        intptr_t slide) {
+	for (hider_image_record_t *record = g_catalog_head; record; record = record->next) {
+		if (record->active && record->header == mh && record->slide == slide) {
+			return record;
+		}
+	}
+	return NULL;
+}
+
+static bool catalog_append_event_locked(hider_image_event_t *event,
+	                                       hider_image_record_t *record,
+	                                       hider_image_event_kind_t kind) {
+	if (!event || !record || g_image_event_sequence == UINT64_MAX) {
+		return false;
+	}
+	event->record = record;
+	event->kind = kind;
+	event->sequence = ++g_image_event_sequence;
+	if (kind == HIDER_IMAGE_EVENT_ADD) {
+		record->added_event = event->sequence;
+	} else {
+		record->removed_event = event->sequence;
+	}
+	if (g_image_event_tail) {
+		g_image_event_tail->next = event;
+	} else {
+		g_image_event_head = event;
+	}
+	g_image_event_tail = event;
+	return true;
+}
+
+static bool catalog_record_visible_to(const hider_image_record_t *record, bool from_hidden) {
+	return record && (from_hidden || !record->hidden);
+}
+
+static uint32_t catalog_active_count_locked(bool include_hidden) {
+	uint32_t count = 0;
+	for (hider_image_record_t *record = g_catalog_head; record; record = record->next) {
+		if (record->active && catalog_record_visible_to(record, include_hidden)) {
+			if (count == UINT32_MAX) {
+				return UINT32_MAX;
+			}
+			count++;
+		}
+	}
+	return count;
+}
+
+static hider_image_record_t *catalog_active_at_index_locked(uint32_t index, bool include_hidden) {
+	for (hider_image_record_t *record = g_catalog_head; record; record = record->next) {
+		if (!record->active || !catalog_record_visible_to(record, include_hidden)) {
+			continue;
+		}
+		if (index == 0) {
+			return record;
+		}
+		index--;
+	}
+	return NULL;
+}
+
+static void hider_degrade_to_native(void);
+
+bool hidden_dylib_hider_catalog_snapshot(rhi_hider_catalog_snapshot_t *snapshot_out) {
+	if (!snapshot_out) {
+		return false;
+	}
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+
+	uint32_t count = 0;
+	size_t path_bytes = 0;
+	uint64_t generation = 0;
 	os_unfair_lock_lock(&g_lock);
-
-	if (!g_image_tracking_degraded) {
-		bool recorded = arr_add(&g_all, path, mh, slide);
-		if (recorded && !hide) {
-			recorded = arr_add(&g_visible, path, mh, slide);
+	if (!hider_tracking_is_filtered_locked()) {
+		os_unfair_lock_unlock(&g_lock);
+		return false;
+	}
+	for (hider_image_record_t *record = g_catalog_head; record; record = record->next) {
+		if (!record->active || count == UINT32_MAX) {
+			if (count == UINT32_MAX) {
+				os_unfair_lock_unlock(&g_lock);
+				hider_degrade_to_native();
+				return false;
+			}
+			continue;
 		}
-		if (!recorded) {
-			/*
-			 * We cannot maintain a coherent filtered view after an allocation
-			 * failure.  Subsequent public dyld/task_info calls fall through to
-			 * their original APIs instead of manufacturing a partial view.
-			 */
-			g_image_tracking_degraded = true;
-		} else {
-			g_image_generation++;
+		size_t length = record->path ? strnlen(record->path, PATH_MAX) : 0;
+		if (length == PATH_MAX || length > SIZE_MAX - path_bytes - 1) {
+			os_unfair_lock_unlock(&g_lock);
+			hider_degrade_to_native();
+			return false;
 		}
+		path_bytes += length + 1;
+		count++;
 	}
-
-	// Copy callbacks that need notification (under lock)
-	uint32_t n = g_add_cb_n;
-	cb_entry_t *snapshot = n ? malloc(n * sizeof(cb_entry_t)) : NULL;
-	uint32_t snapshot_n = 0;
-	if (snapshot) {
-		memcpy(snapshot, g_add_cbs, n * sizeof(cb_entry_t));
-		snapshot_n = n;
-	}
-	uint32_t objc_n = g_objc_addload_cb_n;
-	objc_load_cb_entry_t *objc_snapshot = objc_n ? malloc(objc_n * sizeof(objc_load_cb_entry_t)) : NULL;
-	uint32_t objc_snapshot_n = 0;
-	if (objc_snapshot) {
-		memcpy(objc_snapshot, g_objc_addload_cbs, objc_n * sizeof(objc_load_cb_entry_t));
-		objc_snapshot_n = objc_n;
-	}
-	bool tracking_degraded = g_image_tracking_degraded;
-
+	generation = g_image_generation;
 	os_unfair_lock_unlock(&g_lock);
 
-	// Deliver outside lock to avoid deadlock if callback does dyld calls.  A
-	// failed callback snapshot intentionally drops this synthetic notification
-	// rather than indexing NULL or claiming a registration we cannot service.
-	for (uint32_t i = 0; i < snapshot_n; i++) {
-		// Tweak callback → always gets notified
-		// App callback → only for visible images
-		if (tracking_degraded || snapshot[i].from_hidden || !hide)
-			snapshot[i].func(mh, slide);
+	if (count && ((size_t)count > (SIZE_MAX - path_bytes) / sizeof(rhi_hider_catalog_image_t))) {
+		hider_degrade_to_native();
+		return false;
 	}
-	free(snapshot);
+	size_t allocation_size = (size_t)count * sizeof(rhi_hider_catalog_image_t) + path_bytes;
+	rhi_hider_catalog_image_t *images = allocation_size ? calloc(1, allocation_size) : NULL;
+	if (allocation_size && !images) {
+		hider_degrade_to_native();
+		return false;
+	}
+	char *path_cursor = images ? (char *)(images + count) : NULL;
 
-	// ObjC load-image callbacks use the objc_addLoadImageFunc signature
-	// (header only, no slide). Keep the same visibility policy as the dyld
-	// add-image callbacks without returning NULL from dlsym for a real API.
-	for (uint32_t i = 0; i < objc_snapshot_n; i++) {
-		if (tracking_degraded || objc_snapshot[i].from_hidden || !hide)
-			objc_snapshot[i].func(mh);
+	os_unfair_lock_lock(&g_lock);
+	if (!hider_tracking_is_filtered_locked() || g_image_generation != generation) {
+		os_unfair_lock_unlock(&g_lock);
+		free(images);
+		return false;
 	}
-	free(objc_snapshot);
+	uint32_t index = 0;
+	for (hider_image_record_t *record = g_catalog_head; record; record = record->next) {
+		if (!record->active) {
+			continue;
+		}
+		rhi_hider_catalog_image_t *image = &images[index++];
+		image->header = record->header;
+		image->slide = record->slide;
+		image->identity = record->identity;
+		image->uuid_valid = record->uuid_valid;
+		image->main_executable = record->header == g_executable_header;
+		memcpy(image->uuid, record->uuid, sizeof(image->uuid));
+		if (record->path) {
+			size_t length = strlen(record->path);
+			memcpy(path_cursor, record->path, length + 1);
+			image->path = path_cursor;
+			path_cursor += length + 1;
+		}
+	}
+	os_unfair_lock_unlock(&g_lock);
+	snapshot_out->images = images;
+	snapshot_out->count = count;
+	snapshot_out->generation = generation;
+	return true;
+}
+
+void hidden_dylib_hider_catalog_snapshot_dispose(rhi_hider_catalog_snapshot_t *snapshot) {
+	if (!snapshot) {
+		return;
+	}
+	free(snapshot->images);
+	memset(snapshot, 0, sizeof(*snapshot));
+}
+
+bool hidden_dylib_hider_catalog_generation_is_current(uint64_t generation) {
+	os_unfair_lock_lock(&g_lock);
+	bool current = hider_tracking_is_filtered_locked() && g_image_generation == generation;
+	os_unfair_lock_unlock(&g_lock);
+	return current;
+}
+
+static bool catalog_was_active_at(const hider_image_record_t *record, uint64_t boundary) {
+	return record && record->added_event && record->added_event <= boundary &&
+	       (!record->removed_event || record->removed_event > boundary);
+}
+
+static bool hider_dispatch_passthrough_dyld_event(hider_dyld_callback_kind_t kind,
+	                                                const struct mach_header *mh,
+	                                                intptr_t slide);
+static bool hider_dispatch_passthrough_objc_event(const struct mach_header *mh);
+
+/* Fork never clones an active worker: bootstrap relays are the only delivery
+ * mechanism. Fence catalog/registration publication in prepare; a child then
+ * chooses raw passthrough for the process lifetime, avoiding inherited locks
+ * or an incomplete filtered catalog. */
+static void hider_catalog_atfork_prepare(void) {
+	os_unfair_lock_lock(&g_lock);
+	g_hider_atfork_catalog_held = true;
+}
+
+static void hider_catalog_atfork_parent(void) {
+	if (g_hider_atfork_catalog_held) {
+		g_hider_atfork_catalog_held = false;
+		os_unfair_lock_unlock(&g_lock);
+	}
+}
+
+static void hider_catalog_atfork_child(void) {
+	g_image_tracking_state = HIDER_TRACKING_NATIVE;
+	atomic_store_explicit(&g_callback_delivery_route, HIDER_DELIVERY_PASSTHROUGH,
+	                      memory_order_release);
+	g_hider_atfork_catalog_held = false;
+	os_unfair_lock_unlock(&g_lock);
+}
+
+/* Permanent bootstrap relays multiplex existing registrations. Once filtering
+ * cannot be kept coherent, public image APIs switch to their originals and the
+ * relays switch to raw live passthrough. No retained callback is registered
+ * with an original API after the fact. */
+static void hider_degrade_to_native(void) {
+	os_unfair_lock_lock(&g_lock);
+	if (g_image_tracking_state == HIDER_TRACKING_FILTERED) {
+		g_image_tracking_state = HIDER_TRACKING_DEGRADING;
+		g_image_generation++;
+	}
+	atomic_store_explicit(&g_callback_delivery_route, HIDER_DELIVERY_PASSTHROUGH,
+	                      memory_order_release);
+	/* There is no deferred callback migration: the permanent relay is already
+	 * installed.  Complete the state transition while publication is fenced so
+	 * all public image APIs immediately delegate to native dyld. */
+	g_image_tracking_state = HIDER_TRACKING_NATIVE;
+	os_unfair_lock_unlock(&g_lock);
+}
+
+/* A raw source callback can only be delivered exactly once while its header is
+ * live. If a registration is replaying or already executing, attempting a
+ * later catch-up would either reverse ordering or dereference an unloaded
+ * header. Stop advertising hider readiness rather than hide that loss behind
+ * a best-effort route switch. This is deliberately callable from either
+ * source lane: it never waits, invokes an original registration, or runs user
+ * code while holding g_lock. */
+static void hider_callback_fail_stop(void) {
+	atomic_store_explicit(&g_callback_delivery_failed, true, memory_order_release);
+	hider_degrade_to_native();
+	atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+}
+
+typedef struct {
+	void *handle;
+} hider_callback_pin_t;
+
+static void hider_callback_pin_release(hider_callback_pin_t *pin) {
+	if (!pin || !pin->handle) {
+		return;
+	}
+	if (orig_dlclose) {
+		hider_loader_error_preserve_for_internal_call();
+		if (orig_dlclose(pin->handle) != 0) {
+			hider_loader_error_consume_internal_failure();
+		}
+	}
+	pin->handle = NULL;
+}
+
+static bool hider_callback_pin_acquire(const hider_image_record_t *record,
+	                                      hider_callback_pin_t *pin) {
+	if (!record || !pin || !orig_dlopen || !orig_dlclose) {
+		return false;
+	}
+	memset(pin, 0, sizeof(*pin));
+	uint64_t identity = 0;
+	uint64_t generation = 0;
+	bool main_executable = false;
+	const char *path = NULL;
+	os_unfair_lock_lock(&g_lock);
+	bool valid = hider_tracking_can_dispatch_locked() && record->active;
+	if (valid) {
+		identity = record->identity;
+		generation = g_image_generation;
+		main_executable = record->header == g_executable_header;
+		path = record->path;
+		valid = main_executable || path != NULL;
+	}
+	os_unfair_lock_unlock(&g_lock);
+	if (!valid) {
+		return false;
+	}
+
+	/* A pin is deliberately per delivery. RTLD_NOLOAD cannot introduce a new
+	 * image; NULL is the only valid handle acquisition for the main executable.
+	 * Preserve a prior caller error in TLS before this loader operation, then
+	 * consume a failed bookkeeping error so neither case leaks through h_dlerror.
+	 * A failed pin still fail-stops/degrades without exposing this record. */
+	hider_loader_error_preserve_for_internal_call();
+	pin->handle = orig_dlopen(main_executable ? NULL : path,
+	                         RTLD_LAZY | (main_executable ? 0 : RTLD_NOLOAD));
+	if (!pin->handle) {
+		hider_loader_error_consume_internal_failure();
+		return false;
+	}
+
+	os_unfair_lock_lock(&g_lock);
+	valid = hider_tracking_can_dispatch_locked() && record->active &&
+	        record->identity == identity && g_image_generation == generation;
+	os_unfair_lock_unlock(&g_lock);
+	if (!valid) {
+		hider_callback_pin_release(pin);
+		return false;
+	}
+	return true;
+}
+
+static bool hider_call_dyld_callback(hider_dyld_callback_registration_t *registration,
+	                                    const hider_image_event_t *event,
+	                                    bool native_notification_lane) {
+	if (!registration || !event || !event->record || !registration->func) {
+		return false;
+	}
+	if (!catalog_record_visible_to(event->record, registration->from_hidden)) {
+		return true;
+	}
+	hider_callback_pin_t pin = {0};
+	if (!native_notification_lane && !hider_callback_pin_acquire(event->record, &pin)) {
+		return false;
+	}
+	atomic_store_explicit(&registration->callback_invoking, true, memory_order_release);
+	registration->func(event->record->header, event->record->slide);
+	atomic_store_explicit(&registration->callback_invoking, false, memory_order_release);
+	if (!native_notification_lane) {
+		hider_callback_pin_release(&pin);
+	}
+	return true;
+}
+
+/* Raw pass-through never queues a native event: remove has no historical
+ * replay, and a header is only guaranteed mapped until this source relay
+ * returns. Registrations are append-only and acquire/release-published, so
+ * this walk has no catalog lock, allocation, pin, or loader re-entry. ACTIVE
+ * callbacks receive the exact live event in order. A REPLAYING/delivering node
+ * is an unavoidable ordering ambiguity; record fail-stop rather than invoke a
+ * stale remove after its historical replay. */
+static bool hider_dispatch_passthrough_dyld_event(hider_dyld_callback_kind_t kind,
+	                                                const struct mach_header *mh,
+	                                                intptr_t slide) {
+	if (atomic_load_explicit(&g_callback_delivery_failed, memory_order_acquire)) {
+		return false;
+	}
+	bool ordered = true;
+	const char *path = mh ? dyld_image_path_containing_address(mh) : NULL;
+	bool hidden = image_path_should_hide(path);
+	hider_dyld_callback_registration_t *registration =
+		atomic_load_explicit(&g_dyld_callbacks, memory_order_acquire);
+	for (; registration;
+	     registration = atomic_load_explicit(&registration->next, memory_order_acquire)) {
+		if (registration->kind != kind) {
+			continue;
+		}
+		unsigned state = atomic_load_explicit(&registration->state, memory_order_acquire);
+		if (state != HIDER_CALLBACK_ACTIVE) {
+			ordered = false;
+			continue;
+		}
+		bool expected = false;
+		if (!atomic_compare_exchange_strong_explicit(&registration->delivering, &expected, true,
+		                                             memory_order_acq_rel, memory_order_acquire)) {
+			ordered = false;
+			continue;
+		}
+		if (registration->from_hidden || !hidden) {
+			atomic_store_explicit(&registration->callback_invoking, true, memory_order_release);
+			registration->func(mh, slide);
+			atomic_store_explicit(&registration->callback_invoking, false, memory_order_release);
+		}
+		if (atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel)) {
+			ordered = false;
+		}
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+	}
+	if (!ordered) hider_callback_fail_stop();
+	return ordered;
+}
+
+static bool hider_dispatch_dyld_event_to_registration(hider_dyld_callback_registration_t *registration,
+	                                                      hider_image_event_t *event) {
+	if (!registration || !event) {
+		return true;
+	}
+	unsigned state = atomic_load_explicit(&registration->state, memory_order_acquire);
+	if (state != HIDER_CALLBACK_ACTIVE && state != HIDER_CALLBACK_REPLAYING) {
+		return true;
+	}
+	bool expected = false;
+	if (!atomic_compare_exchange_strong_explicit(&registration->delivering, &expected, true,
+	                                             memory_order_acq_rel, memory_order_acquire)) {
+		atomic_store_explicit(&registration->queued_event, true, memory_order_release);
+		if (atomic_load_explicit(&registration->callback_invoking, memory_order_acquire)) {
+			atomic_store_explicit(&registration->recursive_event, true, memory_order_release);
+		}
+		/* A queued remove cannot outlive this source callback. The caller stops
+		 * readiness instead of later replaying an unmapped header. */
+		return event->kind != HIDER_IMAGE_EVENT_REMOVE;
+	}
+
+	bool usable = false;
+	os_unfair_lock_lock(&g_lock);
+	usable = hider_tracking_can_dispatch_locked() &&
+	         (event->kind == HIDER_IMAGE_EVENT_REMOVE || event->record->active);
+	os_unfair_lock_unlock(&g_lock);
+	if (!usable) {
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+		return false;
+	}
+
+	if (!hider_call_dyld_callback(registration, event, true)) {
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+		return false;
+	}
+	bool recursive = atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel);
+	atomic_store_explicit(&registration->delivering, false, memory_order_release);
+	if (recursive) {
+		/* A nested callback would otherwise be delivered after its caller
+		 * returned. That reverses dyld ordering; the caller fail-stops. */
+		return false;
+	}
+	return true;
+}
+
+static bool hider_dispatch_dyld_event(hider_image_event_t *event) {
+	hider_dyld_callback_registration_t *registration = NULL;
+	for (;;) {
+		os_unfair_lock_lock(&g_lock);
+		registration = registration
+			? atomic_load_explicit(&registration->next, memory_order_acquire)
+			: atomic_load_explicit(&g_dyld_callbacks, memory_order_acquire);
+		os_unfair_lock_unlock(&g_lock);
+		if (!registration) {
+			break;
+		}
+		if (!hider_dispatch_dyld_event_to_registration(registration, event)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool hider_complete_dyld_add_replay(hider_dyld_callback_registration_t *registration) {
+	if (!registration) {
+		return false;
+	}
+	atomic_store_explicit(&registration->delivering, true, memory_order_release);
+
+	/* Historical replay is selected by the catalog boundary captured while the
+	 * registration was still REPLAYING.  A record removed after that boundary
+	 * is never dereferenced: that is the only safe response to immediate
+	 * load/unload recursion before the replay reaches it. */
+	hider_image_record_t *record = NULL;
+	for (;;) {
+		bool historical = false;
+		bool active = false;
+		bool dispatchable = false;
+		os_unfair_lock_lock(&g_lock);
+		record = record ? record->next : g_catalog_head;
+		if (!record) {
+			os_unfair_lock_unlock(&g_lock);
+			break;
+		}
+		historical = catalog_was_active_at(record, registration->replay_boundary);
+		active = record->active;
+		dispatchable = hider_tracking_can_dispatch_locked();
+		os_unfair_lock_unlock(&g_lock);
+		if (!dispatchable) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (!historical) {
+			continue;
+		}
+		if (!active) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		hider_image_event_t replay_event = {
+			.record = record,
+			.kind = HIDER_IMAGE_EVENT_ADD,
+		};
+		if (!hider_call_dyld_callback(registration, &replay_event, false)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+	}
+
+	/* Publish only after every historical image was delivered.  Events appended
+	 * during replay are then drained in catalog order; a deferred removal is a
+	 * stale-header risk and intentionally forces native fallback. */
+	os_unfair_lock_lock(&g_lock);
+	bool dispatchable = hider_tracking_can_dispatch_locked();
+	hider_image_event_t *tail = g_image_event_tail;
+	if (dispatchable) {
+		/* The lock makes REPLAYING -> ACTIVE and the queue boundary one
+		 * publication. Events before it are drained below; events after it see
+		 * ACTIVE and either queue behind this delivery or dispatch afterwards. */
+		atomic_store_explicit(&registration->state, HIDER_CALLBACK_ACTIVE, memory_order_release);
+	}
+	os_unfair_lock_unlock(&g_lock);
+	if (!dispatchable) {
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+		hider_degrade_to_native();
+		return false;
+	}
+	hider_image_event_t *event = registration->event_marker;
+	for (;;) {
+		os_unfair_lock_lock(&g_lock);
+		event = event ? event->next : g_image_event_head;
+		if (!event) {
+			if (g_image_event_tail == tail &&
+			    !atomic_load_explicit(&registration->queued_event, memory_order_acquire)) {
+				atomic_store_explicit(&registration->delivering, false, memory_order_release);
+				os_unfair_lock_unlock(&g_lock);
+				return true;
+			}
+			tail = g_image_event_tail;
+			atomic_store_explicit(&registration->queued_event, false, memory_order_release);
+			os_unfair_lock_unlock(&g_lock);
+			continue;
+		}
+		bool active = event->record->active;
+		os_unfair_lock_unlock(&g_lock);
+		if (event->kind == HIDER_IMAGE_EVENT_REMOVE || !active) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (!hider_call_dyld_callback(registration, event, false)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (event == tail) {
+			os_unfair_lock_lock(&g_lock);
+			if (g_image_event_tail == tail &&
+			    !atomic_load_explicit(&registration->queued_event, memory_order_acquire)) {
+				atomic_store_explicit(&registration->delivering, false, memory_order_release);
+				os_unfair_lock_unlock(&g_lock);
+				return true;
+			}
+			tail = g_image_event_tail;
+			atomic_store_explicit(&registration->queued_event, false, memory_order_release);
+			os_unfair_lock_unlock(&g_lock);
+		}
+	}
+}
+
+static bool hider_call_objc_callback(hider_objc_callback_registration_t *registration,
+	                                  const hider_objc_event_t *event,
+	                                  bool native_notification_lane) {
+	if (!registration || !event || !event->record || !registration->func) {
+		return false;
+	}
+	if (!catalog_record_visible_to(event->record, registration->from_hidden)) {
+		return true;
+	}
+	hider_callback_pin_t pin = {0};
+	if (!native_notification_lane && !hider_callback_pin_acquire(event->record, &pin)) {
+		return false;
+	}
+	atomic_store_explicit(&registration->callback_invoking, true, memory_order_release);
+	registration->func(event->record->header);
+	atomic_store_explicit(&registration->callback_invoking, false, memory_order_release);
+	if (!native_notification_lane) {
+		hider_callback_pin_release(&pin);
+	}
+	return true;
+}
+
+/* ObjC delivery has the same live-header rule as dyld, but its timing lane is
+ * separate: this is called only from the real objc_addLoadImageFunc relay. */
+static bool hider_dispatch_passthrough_objc_event(const struct mach_header *mh) {
+	if (atomic_load_explicit(&g_callback_delivery_failed, memory_order_acquire)) {
+		return false;
+	}
+	bool ordered = true;
+	const char *path = mh ? dyld_image_path_containing_address(mh) : NULL;
+	bool hidden = image_path_should_hide(path);
+	hider_objc_callback_registration_t *registration =
+		atomic_load_explicit(&g_objc_callbacks, memory_order_acquire);
+	for (; registration;
+	     registration = atomic_load_explicit(&registration->next, memory_order_acquire)) {
+		unsigned state = atomic_load_explicit(&registration->state, memory_order_acquire);
+		if (state != HIDER_CALLBACK_ACTIVE) {
+			ordered = false;
+			continue;
+		}
+		bool expected = false;
+		if (!atomic_compare_exchange_strong_explicit(&registration->delivering, &expected, true,
+		                                             memory_order_acq_rel, memory_order_acquire)) {
+			ordered = false;
+			continue;
+		}
+		if (registration->from_hidden || !hidden) {
+			atomic_store_explicit(&registration->callback_invoking, true, memory_order_release);
+			registration->func(mh);
+			atomic_store_explicit(&registration->callback_invoking, false, memory_order_release);
+		}
+		if (atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel)) {
+			ordered = false;
+		}
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+	}
+	if (!ordered) hider_callback_fail_stop();
+	return ordered;
+}
+
+static bool hider_dispatch_objc_event_to_registration(hider_objc_callback_registration_t *registration,
+	                                                     hider_objc_event_t *event) {
+	if (!registration || !event || !event->record) {
+		return true;
+	}
+	unsigned state = atomic_load_explicit(&registration->state, memory_order_acquire);
+	if (state != HIDER_CALLBACK_ACTIVE && state != HIDER_CALLBACK_REPLAYING) {
+		return true;
+	}
+	bool expected = false;
+	if (!atomic_compare_exchange_strong_explicit(&registration->delivering, &expected, true,
+	                                             memory_order_acq_rel, memory_order_acquire)) {
+		atomic_store_explicit(&registration->queued_event, true, memory_order_release);
+		if (atomic_load_explicit(&registration->callback_invoking, memory_order_acquire)) {
+			atomic_store_explicit(&registration->recursive_event, true, memory_order_release);
+		}
+		return false;
+	}
+	os_unfair_lock_lock(&g_lock);
+	bool usable = hider_tracking_can_dispatch_locked() && event->record->active;
+	os_unfair_lock_unlock(&g_lock);
+	if (!usable) {
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+		return false;
+	}
+	if (!hider_call_objc_callback(registration, event, true)) {
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+		return false;
+	}
+	bool recursive = atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel);
+	atomic_store_explicit(&registration->delivering, false, memory_order_release);
+	if (recursive) {
+		return false;
+	}
+	return true;
+}
+
+static bool hider_dispatch_objc_event(hider_objc_event_t *event) {
+	hider_objc_callback_registration_t *registration = NULL;
+	for (;;) {
+		os_unfair_lock_lock(&g_lock);
+		registration = registration
+			? atomic_load_explicit(&registration->next, memory_order_acquire)
+			: atomic_load_explicit(&g_objc_callbacks, memory_order_acquire);
+		os_unfair_lock_unlock(&g_lock);
+		if (!registration) {
+			break;
+		}
+		if (!hider_dispatch_objc_event_to_registration(registration, event)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool hider_complete_objc_replay(hider_objc_callback_registration_t *registration) {
+	if (!registration) {
+		return false;
+	}
+	atomic_store_explicit(&registration->delivering, true, memory_order_release);
+	/* This lane is populated only by the real objc runtime relay below.  Do not
+	 * synthesize objc callbacks from dyld add-image notifications. */
+	hider_objc_event_t *event = NULL;
+	for (;;) {
+		os_unfair_lock_lock(&g_lock);
+		event = event ? event->next : g_objc_event_head;
+		if (!event) {
+			os_unfair_lock_unlock(&g_lock);
+			break;
+		}
+		bool active = event->record->active;
+		os_unfair_lock_unlock(&g_lock);
+		if (registration->event_marker && event->sequence > registration->event_marker->sequence) {
+			break;
+		}
+		if (!active) {
+			continue;
+		}
+		if (!hider_call_objc_callback(registration, event, false)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+	}
+	os_unfair_lock_lock(&g_lock);
+	bool dispatchable = hider_tracking_can_dispatch_locked();
+	hider_objc_event_t *tail = g_objc_event_tail;
+	if (dispatchable) {
+		atomic_store_explicit(&registration->state, HIDER_CALLBACK_ACTIVE, memory_order_release);
+	}
+	os_unfair_lock_unlock(&g_lock);
+	if (!dispatchable) {
+		atomic_store_explicit(&registration->delivering, false, memory_order_release);
+		hider_degrade_to_native();
+		return false;
+	}
+	event = registration->event_marker;
+	for (;;) {
+		os_unfair_lock_lock(&g_lock);
+		event = event ? event->next : g_objc_event_head;
+		if (!event) {
+			if (g_objc_event_tail == tail &&
+			    !atomic_load_explicit(&registration->queued_event, memory_order_acquire)) {
+				atomic_store_explicit(&registration->delivering, false, memory_order_release);
+				os_unfair_lock_unlock(&g_lock);
+				return true;
+			}
+			tail = g_objc_event_tail;
+			atomic_store_explicit(&registration->queued_event, false, memory_order_release);
+			os_unfair_lock_unlock(&g_lock);
+			continue;
+		}
+		bool active = event->record->active;
+		os_unfair_lock_unlock(&g_lock);
+		if (!active) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (!hider_call_objc_callback(registration, event, false)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (atomic_exchange_explicit(&registration->recursive_event, false, memory_order_acq_rel)) {
+			atomic_store_explicit(&registration->delivering, false, memory_order_release);
+			hider_degrade_to_native();
+			return false;
+		}
+		if (event == tail) {
+			os_unfair_lock_lock(&g_lock);
+			if (g_objc_event_tail == tail &&
+			    !atomic_load_explicit(&registration->queued_event, memory_order_acquire)) {
+				atomic_store_explicit(&registration->delivering, false, memory_order_release);
+				os_unfair_lock_unlock(&g_lock);
+				return true;
+			}
+			tail = g_objc_event_tail;
+			atomic_store_explicit(&registration->queued_event, false, memory_order_release);
+			os_unfair_lock_unlock(&g_lock);
+		}
+	}
+}
+
+static void on_image_added(const struct mach_header *mh, intptr_t slide) {
+	/* Caller capability ranges outlive filtered catalog tracking. Invalidate
+	 * them for every native event, including permanent pass-through. */
+	rhi_hider_caller_image_added(mh, slide);
+	/* The bootstrap relay is permanent.  Once public image views have fallen
+	 * back to dyld, deliver this exact live event through the same relay rather
+	 * than attempting an unsafe second registration with dyld. */
+	if (atomic_load_explicit(&g_callback_delivery_route, memory_order_acquire) ==
+	    HIDER_DELIVERY_PASSTHROUGH) {
+		(void)hider_dispatch_passthrough_dyld_event(HIDER_DYLD_CALLBACK_ADD, mh, slide);
+		return;
+	}
+	const char *path = dyld_image_path_containing_address(mh);
+	hider_image_record_t *record = catalog_create_record(path, mh, slide);
+	if (!record) {
+		/* No catalog identity can be manufactured after OOM.  Switch public
+		 * views to native, then forward the transition-causing live event before
+		 * this dyld callback returns. */
+		hider_degrade_to_native();
+		(void)hider_dispatch_passthrough_dyld_event(HIDER_DYLD_CALLBACK_ADD, mh, slide);
+		return;
+	}
+
+	os_unfair_lock_lock(&g_lock);
+	bool dispatchable = hider_tracking_can_dispatch_locked() && g_image_identity_sequence != UINT64_MAX;
+	if (dispatchable) {
+		record->identity = ++g_image_identity_sequence;
+		record->active = true;
+		if (g_catalog_tail) {
+			g_catalog_tail->next = record;
+		} else {
+			g_catalog_head = record;
+		}
+		g_catalog_tail = record;
+		dispatchable = catalog_append_event_locked(&record->add_event, record, HIDER_IMAGE_EVENT_ADD);
+		if (dispatchable) g_image_generation++;
+		record->added_generation = g_image_generation;
+	}
+	os_unfair_lock_unlock(&g_lock);
+	if (!dispatchable) {
+		/* The record is intentionally retained if it was already linked; catalog
+		 * identity remains inspectable even while views fall back to native. */
+		if (!record->active) {
+			free(record->path);
+			free(record);
+		}
+		hider_degrade_to_native();
+		(void)hider_dispatch_passthrough_dyld_event(HIDER_DYLD_CALLBACK_ADD, mh, slide);
+		return;
+	}
+	if (!hider_dispatch_dyld_event(&record->add_event)) {
+		/* Some registrations may already have seen the filtered event. A raw
+		 * re-drive would duplicate them, so terminally fail closed instead. */
+		hider_callback_fail_stop();
+	}
 }
 
 static void on_image_removed(const struct mach_header *mh, intptr_t slide) {
+	/* Keep the exact-range cache coherent after filtering has fallen back to
+	 * native dyld; a stale authorized range is not acceptable in pass-through. */
 	rhi_hider_caller_image_removed(mh, slide);
-	os_unfair_lock_lock(&g_lock);
-
-	bool was_in_all = arr_contains_header(&g_all, mh);
-	bool was_visible = arr_contains_header(&g_visible, mh);
-	arr_remove_by_header(&g_all, mh);
-	if (was_visible)
-		arr_remove_by_header(&g_visible, mh);
-	if (was_in_all || was_visible)
-		g_image_generation++;
-
-	uint32_t n = g_rem_cb_n;
-	cb_entry_t *snapshot = n ? malloc(n * sizeof(cb_entry_t)) : NULL;
-	uint32_t snapshot_n = 0;
-	if (snapshot) {
-		memcpy(snapshot, g_rem_cbs, n * sizeof(cb_entry_t));
-		snapshot_n = n;
+	if (atomic_load_explicit(&g_callback_delivery_route, memory_order_acquire) ==
+	    HIDER_DELIVERY_PASSTHROUGH) {
+		(void)hider_dispatch_passthrough_dyld_event(HIDER_DYLD_CALLBACK_REMOVE, mh, slide);
+		return;
 	}
-	bool tracking_degraded = g_image_tracking_degraded;
-
+	os_unfair_lock_lock(&g_lock);
+	hider_image_record_t *record = hider_tracking_can_dispatch_locked()
+		? catalog_find_active_locked(mh, slide) : NULL;
+	bool dispatchable = record != NULL;
+	if (dispatchable) {
+		record->active = false;
+		dispatchable = catalog_append_event_locked(&record->remove_event, record, HIDER_IMAGE_EVENT_REMOVE);
+		if (dispatchable) g_image_generation++;
+	}
 	os_unfair_lock_unlock(&g_lock);
+	if (!dispatchable) {
+		/* A remove header stays valid only in this source callback.  The raw
+		 * permanent relay is therefore invoked synchronously, never queued. */
+		hider_degrade_to_native();
+		(void)hider_dispatch_passthrough_dyld_event(HIDER_DYLD_CALLBACK_REMOVE, mh, slide);
+		return;
+	}
+	if (!hider_dispatch_dyld_event(&record->remove_event)) {
+		hider_callback_fail_stop();
+	}
+}
 
-	if (was_in_all || tracking_degraded) {
-		for (uint32_t i = 0; i < snapshot_n; i++) {
-			if (tracking_degraded || snapshot[i].from_hidden || was_visible)
-				snapshot[i].func(mh, slide);
+static void on_objc_image_loaded(const struct mach_header *mh) {
+	if (atomic_load_explicit(&g_callback_delivery_route, memory_order_acquire) ==
+	    HIDER_DELIVERY_PASSTHROUGH) {
+		(void)hider_dispatch_passthrough_objc_event(mh);
+		return;
+	}
+	/* objc_addLoadImageFunc is a distinct runtime timing lane.  The relay was
+	 * registered with the original API, so every event below has runtime (not
+	 * dyld) ordering. */
+	const char *runtime_path = dyld_image_path_containing_address(mh);
+	os_unfair_lock_lock(&g_lock);
+	hider_image_record_t *record = NULL;
+	uint32_t header_identities = 0;
+	for (hider_image_record_t *candidate = g_catalog_head; candidate; candidate = candidate->next) {
+		if (candidate->header == mh) header_identities++;
+		if (candidate->active && candidate->header == mh) {
+			record = candidate;
 		}
 	}
-	free(snapshot);
+	uint8_t runtime_uuid[16] = {0};
+	bool runtime_uuid_valid = record && catalog_copy_uuid(mh, record->slide, runtime_uuid);
+	bool dispatchable = hider_tracking_can_dispatch_locked() && record &&
+	                    record->identity != 0 && record->added_generation != 0 &&
+	                    header_identities == 1 && !record->objc_event_emitted &&
+	                    runtime_path && record->path && !strcmp(runtime_path, record->path) &&
+	                    record->uuid_valid && runtime_uuid_valid &&
+	                    !memcmp(record->uuid, runtime_uuid, sizeof(runtime_uuid)) &&
+	                    g_objc_event_sequence != UINT64_MAX;
+	if (dispatchable) {
+		hider_objc_event_t *event = &record->objc_event;
+		record->objc_event_emitted = true;
+		event->record = record;
+		event->sequence = ++g_objc_event_sequence;
+		if (g_objc_event_tail) {
+			g_objc_event_tail->next = event;
+		} else {
+			g_objc_event_head = event;
+		}
+		g_objc_event_tail = event;
+	}
+	os_unfair_lock_unlock(&g_lock);
+	if (!dispatchable) {
+		/* This stays on the ObjC runtime's timing lane.  No registration,
+		 * allocation, loader call, or catalog lock is held for raw delivery. */
+		hider_degrade_to_native();
+		(void)hider_dispatch_passthrough_objc_event(mh);
+		return;
+	}
+	if (!hider_dispatch_objc_event(&record->objc_event)) {
+		hider_callback_fail_stop();
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -728,10 +1650,10 @@ static uint32_t h_image_count(void) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
-	bool tracking_degraded = g_image_tracking_degraded;
-	uint32_t c = hidden ? g_all.count : g_visible.count;
+	bool filtered = hider_tracking_is_filtered_locked();
+	uint32_t c = filtered ? catalog_active_count_locked(hidden) : 0;
 	os_unfair_lock_unlock(&g_lock);
-	if (tracking_degraded && orig_dyld_image_count)
+	if (!filtered && orig_dyld_image_count)
 		return orig_dyld_image_count();
 	return c;
 }
@@ -743,11 +1665,11 @@ static const char *h_get_image_name(uint32_t idx) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
-	bool tracking_degraded = g_image_tracking_degraded;
-	const image_array_t *a = hidden ? &g_all : &g_visible;
-	const char *n = (idx < a->count) ? a->items[idx].name : NULL;
+	bool filtered = hider_tracking_is_filtered_locked();
+	hider_image_record_t *record = filtered ? catalog_active_at_index_locked(idx, hidden) : NULL;
+	const char *n = record ? record->path : NULL;
 	os_unfair_lock_unlock(&g_lock);
-	if (tracking_degraded && orig_dyld_get_image_name)
+	if (!filtered && orig_dyld_get_image_name)
 		return orig_dyld_get_image_name(idx);
 	return n;
 }
@@ -759,11 +1681,11 @@ static const struct mach_header *h_get_image_header(uint32_t idx) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
-	bool tracking_degraded = g_image_tracking_degraded;
-	const image_array_t *a = hidden ? &g_all : &g_visible;
-	const struct mach_header *h = (idx < a->count) ? a->items[idx].header : NULL;
+	bool filtered = hider_tracking_is_filtered_locked();
+	hider_image_record_t *record = filtered ? catalog_active_at_index_locked(idx, hidden) : NULL;
+	const struct mach_header *h = record ? record->header : NULL;
 	os_unfair_lock_unlock(&g_lock);
-	if (tracking_degraded && orig_dyld_get_image_header)
+	if (!filtered && orig_dyld_get_image_header)
 		return orig_dyld_get_image_header(idx);
 	return h;
 }
@@ -775,11 +1697,11 @@ static intptr_t h_get_image_vmaddr_slide(uint32_t idx) {
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 	os_unfair_lock_lock(&g_lock);
-	bool tracking_degraded = g_image_tracking_degraded;
-	const image_array_t *a = hidden ? &g_all : &g_visible;
-	intptr_t s = (idx < a->count) ? a->items[idx].slide : 0;
+	bool filtered = hider_tracking_is_filtered_locked();
+	hider_image_record_t *record = filtered ? catalog_active_at_index_locked(idx, hidden) : NULL;
+	intptr_t s = record ? record->slide : 0;
 	os_unfair_lock_unlock(&g_lock);
-	if (tracking_degraded && orig_dyld_get_image_vmaddr_slide)
+	if (!filtered && orig_dyld_get_image_vmaddr_slide)
 		return orig_dyld_get_image_vmaddr_slide(idx);
 	return s;
 }
@@ -795,46 +1717,43 @@ static void h_register_func_for_add_image(void (*func)(const struct mach_header 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 
+	hider_dyld_callback_registration_t *registration = calloc(1, sizeof(*registration));
+	if (!registration) {
+		hider_degrade_to_native();
+		if (orig_dyld_register_func_for_add_image) orig_dyld_register_func_for_add_image(func);
+		return;
+	}
+	registration->func = func;
+	registration->from_hidden = hidden;
+	registration->kind = HIDER_DYLD_CALLBACK_ADD;
+	atomic_init(&registration->state, HIDER_CALLBACK_REPLAYING);
+	/* Set before publication. The permanent source relay sees a fully initialized
+	 * REPLAYING node, never a partially initialized callback. */
+	atomic_init(&registration->delivering, true);
+	atomic_init(&registration->callback_invoking, false);
+	atomic_init(&registration->recursive_event, false);
+	atomic_init(&registration->queued_event, false);
+	atomic_init(&registration->next, NULL);
+
 	os_unfair_lock_lock(&g_lock);
-	if (g_image_tracking_degraded) {
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_dyld_register_func_for_add_image)
-			orig_dyld_register_func_for_add_image(func);
-		return;
+	bool filtered = hider_tracking_is_filtered_locked();
+	if (filtered) {
+		registration->replay_boundary = g_image_event_sequence;
+		registration->event_marker = g_image_event_tail;
+		if (g_dyld_callbacks_tail) {
+			atomic_store_explicit(&g_dyld_callbacks_tail->next, registration, memory_order_release);
+		} else {
+			atomic_store_explicit(&g_dyld_callbacks, registration, memory_order_release);
+		}
+		g_dyld_callbacks_tail = registration;
 	}
-
-	// Capture the replay before committing the registration.  If we cannot
-	// allocate a complete replay snapshot, use dyld's original registration so
-	// the callback still receives the real image set exactly once.
-	const image_array_t *a = hidden ? &g_all : &g_visible;
-	uint32_t n = a->count;
-	image_entry_t *image_snapshot = n ? malloc((size_t)n * sizeof(*image_snapshot)) : NULL;
-	if (n && !image_snapshot) {
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_dyld_register_func_for_add_image)
-			orig_dyld_register_func_for_add_image(func);
-		return;
-	}
-	if (image_snapshot)
-		memcpy(image_snapshot, a->items, (size_t)n * sizeof(*image_snapshot));
-
-	// Store callback with origin flag
-	if (g_add_cb_n == UINT32_MAX ||
-	    !reserve_entries((void **)&g_add_cbs, &g_add_cb_cap, g_add_cb_n + 1, sizeof(*g_add_cbs))) {
-		free(image_snapshot);
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_dyld_register_func_for_add_image)
-			orig_dyld_register_func_for_add_image(func);
-		return;
-	}
-	g_add_cbs[g_add_cb_n++] = (cb_entry_t){.func = func, .from_hidden = hidden};
-
 	os_unfair_lock_unlock(&g_lock);
-
-	// Call outside lock
-	for (uint32_t i = 0; i < n; i++)
-		func(image_snapshot[i].header, image_snapshot[i].slide);
-	free(image_snapshot);
+	if (!filtered) {
+		free(registration);
+		if (orig_dyld_register_func_for_add_image) orig_dyld_register_func_for_add_image(func);
+		return;
+	}
+	(void)hider_complete_dyld_add_replay(registration);
 }
 
 __attribute__((noinline))
@@ -848,16 +1767,37 @@ static void h_register_func_for_remove_image(void (*func)(const struct mach_head
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
 
-	os_unfair_lock_lock(&g_lock);
-	if (g_image_tracking_degraded || g_rem_cb_n == UINT32_MAX ||
-	    !reserve_entries((void **)&g_rem_cbs, &g_rem_cb_cap, g_rem_cb_n + 1, sizeof(*g_rem_cbs))) {
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_dyld_register_func_for_remove_image)
-			orig_dyld_register_func_for_remove_image(func);
+	hider_dyld_callback_registration_t *registration = calloc(1, sizeof(*registration));
+	if (!registration) {
+		hider_degrade_to_native();
+		if (orig_dyld_register_func_for_remove_image) orig_dyld_register_func_for_remove_image(func);
 		return;
 	}
-	g_rem_cbs[g_rem_cb_n++] = (cb_entry_t){.func = func, .from_hidden = hidden};
+	registration->func = func;
+	registration->from_hidden = hidden;
+	registration->kind = HIDER_DYLD_CALLBACK_REMOVE;
+	atomic_init(&registration->state, HIDER_CALLBACK_ACTIVE);
+	atomic_init(&registration->delivering, false);
+	atomic_init(&registration->callback_invoking, false);
+	atomic_init(&registration->recursive_event, false);
+	atomic_init(&registration->queued_event, false);
+	atomic_init(&registration->next, NULL);
+	os_unfair_lock_lock(&g_lock);
+	bool filtered = hider_tracking_is_filtered_locked();
+	if (filtered) {
+		registration->event_marker = g_image_event_tail;
+		if (g_dyld_callbacks_tail) {
+			atomic_store_explicit(&g_dyld_callbacks_tail->next, registration, memory_order_release);
+		} else {
+			atomic_store_explicit(&g_dyld_callbacks, registration, memory_order_release);
+		}
+		g_dyld_callbacks_tail = registration;
+	}
 	os_unfair_lock_unlock(&g_lock);
+	if (!filtered) {
+		free(registration);
+		if (orig_dyld_register_func_for_remove_image) orig_dyld_register_func_for_remove_image(func);
+	}
 }
 
 //------------------------------------------------------------------------------
@@ -959,12 +1899,6 @@ static void discard_task_snapshot_generation(task_snapshot_generation_t *generat
 	if (!generation) {
 		return;
 	}
-	if (generation->image_paths) {
-		for (uint32_t i = 0; i < generation->image_path_capacity; i++) {
-			free(generation->image_paths[i]);
-		}
-	}
-	free(generation->image_paths);
 	free(generation->images);
 	free(generation->uuids);
 	free(generation);
@@ -1007,42 +1941,12 @@ static bool task_snapshot_source_is_current(const task_snapshot_source_t *source
 	return true;
 }
 
-static char *copy_dyld_image_path(const char *path) {
-	if (!path) {
-		return NULL;
-	}
-	size_t length = strnlen(path, PATH_MAX);
-	if (length == PATH_MAX || length == SIZE_MAX) {
-		return NULL;
-	}
-	char *copy = malloc(length + 1);
-	if (!copy) {
-		return NULL;
-	}
-	memcpy(copy, path, length);
-	copy[length] = '\0';
-	return copy;
-}
-
-static bool snapshot_contains_header(const task_snapshot_generation_t *generation,
-	                                  const struct mach_header *header) {
-	if (!generation || !header) {
-		return false;
-	}
-	for (uint32_t i = 0; i < generation->snapshot.infoArrayCount; i++) {
-		if (generation->images[i].imageLoadAddress == header) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static task_snapshot_generation_t *build_task_snapshot(task_snapshot_result_t *result_out) {
 	// Must be called with g_lock held.
 	if (result_out) {
 		*result_out = TASK_SNAPSHOT_TRANSIENT_UNAVAILABLE;
 	}
-	if (g_image_tracking_degraded || !g_real_aii || !g_real_aii->infoArray) {
+	if (!hider_tracking_is_filtered_locked() || !g_real_aii || !g_real_aii->infoArray) {
 		return NULL;
 	}
 	if (g_ti_current && g_ti_current->image_generation == g_image_generation) {
@@ -1057,123 +1961,66 @@ static task_snapshot_generation_t *build_task_snapshot(task_snapshot_result_t *r
 		if (!capture_task_snapshot_source(&source)) {
 			return NULL;
 		}
-		if ((size_t)source.image_count > SIZE_MAX / sizeof(struct dyld_image_info) ||
-		    source.uuid_count > UINT32_MAX ||
-		    source.uuid_count > SIZE_MAX / sizeof(struct dyld_uuid_info)) {
+		uint32_t visible_image_count = catalog_active_count_locked(false);
+		if (visible_image_count == UINT32_MAX ||
+		    (size_t)visible_image_count > SIZE_MAX / sizeof(struct dyld_image_info) ||
+		    (size_t)visible_image_count > SIZE_MAX / sizeof(struct dyld_uuid_info)) {
 			break;
-		}
-
-		struct dyld_image_info *source_images = NULL;
-		struct dyld_uuid_info *source_uuids = NULL;
-		if (source.image_count) {
-			source_images = malloc((size_t)source.image_count * sizeof(*source_images));
-			if (!source_images) {
-				break;
-			}
-			memcpy(source_images, source.images, (size_t)source.image_count * sizeof(*source_images));
-		}
-		if (source.uuid_count) {
-			if (!source.uuids) {
-				free(source_images);
-				break;
-			}
-			source_uuids = malloc((size_t)source.uuid_count * sizeof(*source_uuids));
-			if (!source_uuids) {
-				free(source_images);
-				break;
-			}
-			memcpy(source_uuids, source.uuids, (size_t)source.uuid_count * sizeof(*source_uuids));
-		}
-		if (!task_snapshot_source_is_current(&source)) {
-			free(source_uuids);
-			free(source_images);
-			continue;
 		}
 
 		task_snapshot_generation_t *generation = calloc(1, sizeof(*generation));
 		if (!generation) {
-			free(source_uuids);
-			free(source_images);
 			break;
 		}
-		if (source.image_count) {
-			generation->images = calloc(source.image_count, sizeof(*generation->images));
-			generation->image_paths = calloc(source.image_count, sizeof(*generation->image_paths));
-			generation->image_path_capacity = source.image_count;
-			if (!generation->images || !generation->image_paths) {
+		if (visible_image_count) {
+			generation->images = calloc(visible_image_count, sizeof(*generation->images));
+			generation->uuids = calloc(visible_image_count, sizeof(*generation->uuids));
+			if (!generation->images || !generation->uuids) {
 				discard_task_snapshot_generation(generation);
-				free(source_uuids);
-				free(source_images);
 				break;
 			}
 		}
 
-		uint32_t visible_image_count = 0;
-		bool path_copy_failed = false;
-		for (uint32_t i = 0; i < source.image_count; i++) {
-			const struct dyld_image_info *entry = &source_images[i];
-			if (image_path_should_hide(entry->imageFilePath)) {
+		/* The filtered task view is derived exclusively from catalog identities.
+		 * Paths are catalog-owned and process-lifetime, unlike dyld's pointers. */
+		uint32_t output_image_count = 0;
+		uint32_t output_uuid_count = 0;
+		for (hider_image_record_t *record = g_catalog_head; record; record = record->next) {
+			if (!record->active || record->hidden) {
 				continue;
 			}
-			generation->images[visible_image_count] = *entry;
-			if (entry->imageFilePath) {
-				generation->image_paths[visible_image_count] = copy_dyld_image_path(entry->imageFilePath);
-				if (!generation->image_paths[visible_image_count]) {
-					path_copy_failed = true;
-					break;
-				}
-				generation->images[visible_image_count].imageFilePath =
-					generation->image_paths[visible_image_count];
+			generation->images[output_image_count] = (struct dyld_image_info){
+				.imageLoadAddress = record->header,
+				.imageFilePath = record->path,
+				.imageFileModDate = 0,
+			};
+			if (record->uuid_valid) {
+				generation->uuids[output_uuid_count].imageLoadAddress = record->header;
+				memcpy(generation->uuids[output_uuid_count].imageUUID, record->uuid, 16);
+				output_uuid_count++;
 			}
-			visible_image_count++;
+			output_image_count++;
 		}
-		if (path_copy_failed || !task_snapshot_source_is_current(&source)) {
+		if (output_image_count != visible_image_count || !task_snapshot_source_is_current(&source)) {
 			discard_task_snapshot_generation(generation);
-			free(source_uuids);
-			free(source_images);
-			if (path_copy_failed) {
-				break;
-			}
 			continue;
 		}
 
 		generation->snapshot = source.snapshot;
 		generation->snapshot.infoArray = generation->images;
-		generation->snapshot.infoArrayCount = visible_image_count;
+		generation->snapshot.infoArrayCount = output_image_count;
 		if (generation->snapshot.version >= 8) {
-			if (source.uuid_count) {
-				generation->uuids = calloc((size_t)source.uuid_count, sizeof(*generation->uuids));
-				if (!generation->uuids) {
-					discard_task_snapshot_generation(generation);
-					free(source_uuids);
-					free(source_images);
-					break;
-				}
-				uint32_t visible_uuid_count = 0;
-				for (uintptr_t i = 0; i < source.uuid_count; i++) {
-					if (snapshot_contains_header(generation, source_uuids[i].imageLoadAddress)) {
-						generation->uuids[visible_uuid_count++] = source_uuids[i];
-					}
-				}
-				generation->snapshot.uuidArray = visible_uuid_count ? generation->uuids : NULL;
-				generation->snapshot.uuidArrayCount = visible_uuid_count;
-			} else {
-				generation->snapshot.uuidArray = NULL;
-				generation->snapshot.uuidArrayCount = 0;
-			}
+			generation->snapshot.uuidArray = output_uuid_count ? generation->uuids : NULL;
+			generation->snapshot.uuidArrayCount = output_uuid_count;
 		}
 		if (generation->snapshot.version >= 9) {
 			generation->snapshot.dyldAllImageInfosAddress = &generation->snapshot;
 		}
 		if (!task_snapshot_source_is_current(&source)) {
 			discard_task_snapshot_generation(generation);
-			free(source_uuids);
-			free(source_images);
 			continue;
 		}
 
-		free(source_uuids);
-		free(source_images);
 		generation->image_generation = g_image_generation;
 		generation->previous = g_ti_current;
 		g_ti_current = generation;
@@ -1188,7 +2035,7 @@ static task_snapshot_generation_t *build_task_snapshot(task_snapshot_result_t *r
 	 * count, or a load storm that never stabilizes) cannot coexist with filtered
 	 * enumeration.  Degrade every linked view to dyld's originals atomically.
 	 */
-	g_image_tracking_degraded = true;
+	g_image_tracking_state = HIDER_TRACKING_DEGRADING;
 	if (result_out) {
 		*result_out = TASK_SNAPSHOT_FATAL;
 	}
@@ -1229,8 +2076,15 @@ static kern_return_t h_task_info(task_name_t target, task_flavor_t flavor,
 	task_snapshot_result_t snapshot_result = TASK_SNAPSHOT_TRANSIENT_UNAVAILABLE;
 	task_snapshot_generation_t *generation = build_task_snapshot(&snapshot_result);
 	os_unfair_lock_unlock(&g_lock);
-	if (!generation)
+	if (!generation) {
+		if (snapshot_result == TASK_SNAPSHOT_FATAL) {
+			/* build_task_snapshot marked the handoff state while holding g_lock;
+		 * migration itself must run out of lock because native registration can
+		 * synchronously invoke arbitrary callbacks. */
+			hider_degrade_to_native();
+		}
 		return kr;
+	}
 
 	tdi->all_image_info_addr = (mach_vm_address_t)(uintptr_t)&generation->snapshot;
 	tdi->all_image_info_size = sizeof(generation->snapshot);
@@ -1368,8 +2222,9 @@ static void *h_dlsym(void *handle, const char *symbol) {
 		return NULL;
 	}
 
-	/* A later loader operation supersedes an unconsumed synthetic denial on
-	 * this same thread. This mirrors the TLS lane used by current Shadow. */
+	/* A later application loader operation supersedes an unconsumed synthetic
+	 * denial or virtualized bookkeeping result on this same thread. */
+	hider_loader_error_clear_pending();
 	hider_dlsym_clear_pending_error();
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
@@ -1423,6 +2278,10 @@ __attribute__((noinline))
 static char *h_dlerror(void) {
 	if (!hider_is_ready()) {
 		return orig_dlerror ? orig_dlerror() : NULL;
+	}
+	if (g_loader_error_pending) {
+		g_loader_error_pending = false;
+		return g_loader_error_message;
 	}
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
@@ -1593,43 +2452,40 @@ static void h_objc_addLoadImageFunc(objc_func_loadImage func) {
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	bool hidden = caller_is_hidden(ra);
+	hider_objc_callback_registration_t *registration = calloc(1, sizeof(*registration));
+	if (!registration) {
+		hider_degrade_to_native();
+		if (orig_objc_addLoadImageFunc) orig_objc_addLoadImageFunc(func);
+		return;
+	}
+	registration->func = func;
+	registration->from_hidden = hidden;
+	atomic_init(&registration->state, HIDER_CALLBACK_REPLAYING);
+	/* See dyld add registration: REPLAYING is already delivering when linked. */
+	atomic_init(&registration->delivering, true);
+	atomic_init(&registration->callback_invoking, false);
+	atomic_init(&registration->recursive_event, false);
+	atomic_init(&registration->queued_event, false);
+	atomic_init(&registration->next, NULL);
 
 	os_unfair_lock_lock(&g_lock);
-	if (g_image_tracking_degraded) {
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_objc_addLoadImageFunc)
-			orig_objc_addLoadImageFunc(func);
-		return;
+	bool filtered = hider_tracking_is_filtered_locked();
+	if (filtered) {
+		registration->event_marker = g_objc_event_tail;
+		if (g_objc_callbacks_tail) {
+			atomic_store_explicit(&g_objc_callbacks_tail->next, registration, memory_order_release);
+		} else {
+			atomic_store_explicit(&g_objc_callbacks, registration, memory_order_release);
+		}
+		g_objc_callbacks_tail = registration;
 	}
-
-	const image_array_t *a = hidden ? &g_all : &g_visible;
-	uint32_t n = a->count;
-	const struct mach_header **headers = n ? malloc((size_t)n * sizeof(*headers)) : NULL;
-	if (n && !headers) {
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_objc_addLoadImageFunc)
-			orig_objc_addLoadImageFunc(func);
-		return;
-	}
-	for (uint32_t i = 0; i < n; i++)
-		headers[i] = a->items[i].header;
-
-	if (g_objc_addload_cb_n == UINT32_MAX ||
-	    !reserve_entries((void **)&g_objc_addload_cbs, &g_objc_addload_cb_cap,
-	                     g_objc_addload_cb_n + 1, sizeof(*g_objc_addload_cbs))) {
-		free(headers);
-		os_unfair_lock_unlock(&g_lock);
-		if (orig_objc_addLoadImageFunc)
-			orig_objc_addLoadImageFunc(func);
-		return;
-	}
-	g_objc_addload_cbs[g_objc_addload_cb_n++] = (objc_load_cb_entry_t){ .func = func, .from_hidden = hidden };
-
 	os_unfair_lock_unlock(&g_lock);
-
-	for (uint32_t i = 0; i < n; i++)
-		func(headers[i]);
-	free(headers);
+	if (!filtered) {
+		free(registration);
+		if (orig_objc_addLoadImageFunc) orig_objc_addLoadImageFunc(func);
+		return;
+	}
+	(void)hider_complete_objc_replay(registration);
 }
 
 //------------------------------------------------------------------------------
@@ -1994,6 +2850,9 @@ static char *h_getenv(const char *name) {
 
 __attribute__((noinline))
 static void *h_dlopen(const char *path, int mode) {
+	/* Do not let a callback-local bookkeeping pin leave a virtual error across
+	 * the caller's next explicit loader operation. */
+	hider_loader_error_clear_pending();
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra))
 		return orig_dlopen(path, mode);
@@ -2299,29 +3158,9 @@ void hidden_dylib_hider_init(void)
 		rhi_diag_log("HIDER caller capability unavailable; unclassified callers remain filtered");
 	}
 
-	rhi_diag_log("HIDER init start, _dyld_image_count=%u", _dyld_image_count());
-
-	// 1. Register callbacks with the REAL dyld functions (before hooking).
-	//    dyld will immediately replay all currently-loaded images to our
-	//    callback, populating g_all and g_visible.
-	_dyld_register_func_for_add_image(on_image_added);
-	_dyld_register_func_for_remove_image(on_image_removed);
-
-	rhi_diag_log("HIDER after register callbacks, g_all=%u g_visible=%u", g_all.count, g_visible.count);
-
-	// 2. Cache dyld_all_image_infos for task_info filtering.
-	{
-		task_dyld_info_data_t tdi;
-		mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-		if (task_info(mach_task_self_, TASK_DYLD_INFO, (task_info_t)&tdi, &cnt) == KERN_SUCCESS) {
-			g_real_aii = (struct dyld_all_image_infos *)(uintptr_t)tdi.all_image_info_addr;
-		}
-	}
-
-	rhi_diag_log("HIDER g_real_aii=%p", (void *)g_real_aii);
-
-	// 3. Save original function pointers BEFORE rebinding.
-	//    These point directly into the DSC code which remains intact.
+	/* Save every native callback/loader entry point before registering our first
+	 * permanent relay. Initial dyld/ObjC replays are callback contexts too, so
+	 * the raw-pass-through fallback must already have its saved originals. */
 	orig_dladdr = dladdr;
 	orig_dlsym = dlsym;
 	orig_dlerror = dlerror;
@@ -2338,6 +3177,7 @@ void hidden_dylib_hider_init(void)
 	orig_objc_copyClassNamesForImage = objc_copyClassNamesForImage;
 	orig_objc_addLoadImageFunc = objc_addLoadImageFunc;
 	orig_dlopen = dlopen;
+	orig_dlclose = dlclose;
 	orig_fork = fork;
 	orig_getfsstat = getfsstat;
 	orig_sysctl = sysctl;
@@ -2353,13 +3193,66 @@ void hidden_dylib_hider_init(void)
 	orig_readdir = readdir;
 	orig_closedir = closedir;
 	orig_mach_port_get_refs = mach_port_get_refs;
+	if (pthread_atfork(hider_catalog_atfork_prepare,
+	                   hider_catalog_atfork_parent,
+	                   hider_catalog_atfork_child) != 0) {
+		rhi_diag_log("HIDER atfork barrier unavailable; refusing filtered hooks");
+		os_unfair_lock_lock(&g_lock);
+		g_image_tracking_state = HIDER_TRACKING_NATIVE;
+		os_unfair_lock_unlock(&g_lock);
+		atomic_store_explicit(&g_callback_delivery_route, HIDER_DELIVERY_PASSTHROUGH,
+		                      memory_order_release);
+		atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+		return;
+	}
 
-	// Cache the true main executable for class_getImageName / dladdr
-	// substitution.  Injection can place systemhook before the MH_EXECUTE image.
-	// If dyld exposes no valid MH_EXECUTE image, these stay NULL rather than
-	// borrowing identity from an arbitrary injected dylib.
+	// Cache true executable identity before the ObjC relay validates main-image pins.
 	g_executable_path = rhi_hider_identity_executable_path();
 	g_executable_header = rhi_hider_identity_executable_header();
+
+	rhi_diag_log("HIDER init start, _dyld_image_count=%u", _dyld_image_count());
+
+	// 1. Register callbacks with the REAL dyld functions (before hooking).
+	//    dyld will immediately replay all currently-loaded images to our stable
+	//    catalog before any replacement import slot becomes visible.
+	if (!orig_dyld_register_func_for_add_image || !orig_dyld_register_func_for_remove_image) {
+		rhi_diag_log("HIDER native dyld callback API unavailable; refusing filtered hooks");
+		os_unfair_lock_lock(&g_lock);
+		g_image_tracking_state = HIDER_TRACKING_NATIVE;
+		os_unfair_lock_unlock(&g_lock);
+		atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+		return;
+	}
+	orig_dyld_register_func_for_add_image(on_image_added);
+	orig_dyld_register_func_for_remove_image(on_image_removed);
+
+	os_unfair_lock_lock(&g_lock);
+	uint32_t catalog_all = catalog_active_count_locked(true);
+	uint32_t catalog_visible = catalog_active_count_locked(false);
+	os_unfair_lock_unlock(&g_lock);
+	rhi_diag_log("HIDER after catalog replay, all=%u visible=%u", catalog_all, catalog_visible);
+
+	// 2. Cache dyld_all_image_infos for task_info filtering.
+	{
+		task_dyld_info_data_t tdi;
+		mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+		if (task_info(mach_task_self_, TASK_DYLD_INFO, (task_info_t)&tdi, &cnt) == KERN_SUCCESS) {
+			g_real_aii = (struct dyld_all_image_infos *)(uintptr_t)tdi.all_image_info_addr;
+		}
+	}
+
+	rhi_diag_log("HIDER g_real_aii=%p", (void *)g_real_aii);
+
+	/* Register exactly one relay with the original ObjC runtime before its API
+	 * is rebound.  It records runtime-timed load events; filtered callbacks are
+	 * never synthesized from dyld add-image delivery. */
+	os_unfair_lock_lock(&g_lock);
+	bool register_objc_relay = hider_tracking_is_filtered_locked();
+	os_unfair_lock_unlock(&g_lock);
+	if (register_objc_relay && orig_objc_addLoadImageFunc) {
+		orig_objc_addLoadImageFunc(on_objc_image_loaded);
+	}
+
 	load_hider_profile_from_environment();
 
 	/*
@@ -2396,6 +3289,12 @@ void hidden_dylib_hider_init(void)
 		return;
 	}
 
+	if (atomic_load_explicit(&g_callback_delivery_failed, memory_order_acquire) ||
+	    atomic_load_explicit(&g_init_state, memory_order_acquire) == HIDER_STATE_FAILED) {
+		rhi_diag_log("HIDER callback delivery ambiguity; concealment readiness disabled");
+		atomic_store_explicit(&g_init_state, HIDER_STATE_FAILED, memory_order_release);
+		return;
+	}
 	atomic_store_explicit(&g_init_state, HIDER_STATE_READY, memory_order_release);
 	rhi_diag_log("HIDER init complete — verified core hooks enabled");
 }
