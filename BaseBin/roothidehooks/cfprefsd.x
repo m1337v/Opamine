@@ -1,4 +1,5 @@
 #include <bsm/audit.h>
+#include <dlfcn.h>
 #import <Foundation/Foundation.h>
 #import <substrate.h>
 #include <roothide.h>
@@ -6,8 +7,17 @@
 
 #define PROC_PIDPATHINFO_MAXSIZE        (4*MAXPATHLEN)
 
-extern pid_t xpc_connection_get_pid(xpc_connection_t connection)
-    __attribute__((weak_import));
+typedef pid_t (*xpc_connection_get_pid_func_t)(xpc_connection_t connection);
+
+static pid_t rootHideXPCConnectionGetPID(xpc_connection_t connection)
+{
+    static xpc_connection_get_pid_func_t getPID;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        getPID = (xpc_connection_get_pid_func_t)dlsym(RTLD_DEFAULT, "xpc_connection_get_pid");
+    });
+    return getPID ? getPID(connection) : 0;
+}
 
 pid_t __thread gCurrentClientPid = 0;
 
@@ -210,7 +220,7 @@ void* DISPATCH_orig__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self
 void* new__CFPrefsDaemon_handleMessage_fromPeer_replyHandler__(id self, xpc_object_t message, xpc_connection_t connection, void* replyHandler)
 {
     uid_t clientUid = xpc_connection_get_euid(connection);
-    pid_t clientPid = xpc_connection_get_pid(connection);
+    pid_t clientPid = rootHideXPCConnectionGetPID(connection);
 
 	NSLog(@"CFPrefsDaemon: handleMessage %p/%d pid=%d uid=%d proc=%s", message, xpc_get_type(message)==XPC_TYPE_DICTIONARY, clientPid, clientUid, proc_get_path(clientPid,NULL));
 
