@@ -538,7 +538,11 @@ void roothide_launchd_postinit(bool firstLoad)
 		
 		if (__builtin_available(iOS 16.0, *))
 		{
-			hideDeveloperMode();
+			int hideDeveloperModeResult = hideDeveloperMode();
+			if (hideDeveloperModeResult != 0) {
+				launchd_panic("hideDeveloperMode failed: %d", hideDeveloperModeResult);
+				return;
+			}
 		}
 		
 #ifdef __arm64e__

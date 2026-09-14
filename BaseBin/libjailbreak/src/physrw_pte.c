@@ -1,32 +1,59 @@
+#include "physrw_pte.h"
 #include "primitives.h"
 #include "translation.h"
 #include "kernel.h"
 #include "util.h"
 #include "pte.h"
-#include "info.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 
-#define MAGIC_PT_ADDRESS (L1_BLOCK_SIZE * (L1_BLOCK_COUNT - 1))
-#define gMagicPT ((uint64_t *)MAGIC_PT_ADDRESS) // fake variable
-
-uint8_t *gSwAsid = 0;
+void *gAsid = NULL;
 static pthread_mutex_t gLock;
 
 void flush_tlb(void)
 {
-	uint8_t fakeSwAsid = UINT8_MAX;
-	uint8_t origSwAsid = *gSwAsid;
-	if (origSwAsid != fakeSwAsid) {
-		*gSwAsid = fakeSwAsid;
+	if (__builtin_available(iOS 27.0, *)) {
+		/* Newer kernels do not reliably flush this user controlled ASID. */
+		usleep(80);
+		usleep(80);
 		__asm("dmb sy");
-		usleep(0); // Force context switch
-		*gSwAsid = origSwAsid;
-		__asm("dmb sy");
+		return;
 	}
+
+	if (gAsid && koffsetof(pmap, sw_asid)) {
+		uint8_t *swAsid = (uint8_t *)gAsid;
+		uint8_t fakeAsid = UINT8_MAX;
+		uint8_t origAsid = *swAsid;
+		if (origAsid != fakeAsid) {
+			*swAsid = fakeAsid;
+			__asm("dmb sy");
+			usleep(0);
+			*swAsid = origAsid;
+			__asm("dmb sy");
+			return;
+		}
+	}
+	else if (gAsid && koffsetof(pmap, asid)) {
+		uint16_t *asid = (uint16_t *)gAsid;
+		uint16_t fakeAsid = UINT16_MAX;
+		uint16_t origAsid = *asid;
+		if (origAsid != fakeAsid) {
+			*asid = fakeAsid;
+			__asm("dmb sy");
+			usleep(0);
+			*asid = origAsid;
+			__asm("dmb sy");
+			return;
+		}
+	}
+
+	/* Missing capability data or a reserved ASID: use the conservative path. */
+	usleep(80);
+	usleep(80);
+	__asm("dmb sy");
 }
 
 void acquire_window(uint64_t pa, void (^block)(void *ua))
@@ -101,9 +128,22 @@ int physrw_pte_physwritebuf(uint64_t pa, const void* input, size_t size)
 	return r;
 }
 
-int physrw_pte_handoff(pid_t pid, uint64_t *swAsidPtr)
+int physrw_pte_physaccess_mapped(uint64_t pa, uint64_t size, kernel_map_accessor accessorBlock)
 {
-	if (!pid) return -1;
+	if (!accessorBlock || size == 0 || size > UINT64_MAX - pa ||
+	    (pa & ~vm_real_kernel_page_mask) != ((pa + size - 1) & ~vm_real_kernel_page_mask)) {
+		return -1;
+	}
+
+	acquire_window(pa & ~vm_real_kernel_page_mask, ^(void *ua) {
+		accessorBlock((void *)((uintptr_t)ua + (pa & vm_real_kernel_page_mask)));
+	});
+	return 0;
+}
+
+int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
+{
+	if (!pid || !asidPtr) return -1;
 
 	uint64_t proc = proc_find(pid);
 	if (!proc) return -2;
@@ -120,6 +160,9 @@ int physrw_pte_handoff(pid_t pid, uint64_t *swAsidPtr)
 		if (!pmap) { ret = -5; break; };
 
 		uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
+		if (!ttep) { ret = -9; break; }
+		uint32_t asidOffset = koffsetof(pmap, sw_asid) ?: koffsetof(pmap, asid);
+		if (asidOffset == 0) { ret = -10; break; }
 
 		// Allocate magic page table to our process at last possible location
 		int exp_r = pmap_expand_range(pmap, MAGIC_PT_ADDRESS, L2_BLOCK_SIZE);
@@ -132,12 +175,13 @@ int physrw_pte_handoff(pid_t pid, uint64_t *swAsidPtr)
 		physwrite64(magicPT, magicPT | PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
 
 		// Map in the pmap at MAGIC_PT_ADDRESS+vm_real_kernel_page_size
-		uint64_t sw_asid = pmap + koffsetof(pmap, sw_asid);
-		uint64_t sw_asid_page = sw_asid & ~vm_real_kernel_page_mask;
-		uint64_t sw_asid_page_pa = kvtophys(sw_asid_page);
-		uint64_t sw_asid_pageoff = sw_asid & vm_real_kernel_page_mask;
-		*swAsidPtr = (uint64_t)(MAGIC_PT_ADDRESS + vm_real_kernel_page_size + sw_asid_pageoff);
-		physwrite64(magicPT+8, sw_asid_page_pa | PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
+		uint64_t asid = pmap + asidOffset;
+		uint64_t asid_page = asid & ~vm_real_kernel_page_mask;
+		uint64_t asid_page_pa = kvtophys(asid_page);
+		if (!asid_page_pa) { ret = -11; break; }
+		uint64_t asid_pageoff = asid & vm_real_kernel_page_mask;
+		*asidPtr = (uint64_t)(MAGIC_PT_ADDRESS + vm_real_kernel_page_size + asid_pageoff);
+		physwrite64(magicPT+8, asid_page_pa | PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
 
 		if (getpid() == pid) {
 			flush_tlb();
@@ -153,13 +197,16 @@ int libjailbreak_physrw_pte_init(bool receivedHandoff, uint64_t asidPtr)
 	if (pthread_mutex_init(&gLock, NULL) != 0) return -8;
 
 	if (!receivedHandoff) {
-		physrw_pte_handoff(getpid(), (uint64_t *)&gSwAsid);
+		int r = physrw_pte_handoff(getpid(), (uint64_t *)&gAsid);
+		if (r != 0) return r;
 	}
 	else {
-		gSwAsid = (void *)asidPtr;
+		if (asidPtr == 0) return -9;
+		gAsid = (void *)asidPtr;
 	}
 	gPrimitives.physreadbuf = physrw_pte_physreadbuf;
 	gPrimitives.physwritebuf = physrw_pte_physwritebuf;
+	gPrimitives.physaccess_mapped = physrw_pte_physaccess_mapped;
 	gPrimitives.kreadbuf = NULL;
 	gPrimitives.kwritebuf = NULL;
 

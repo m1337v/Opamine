@@ -14,6 +14,7 @@
 #import "DOUpdateViewController.h"
 #import "DOLogCrashViewController.h"
 #import <pthread.h>
+#import <sys/sysctl.h>
 #import <libjailbreak/libjailbreak.h>
 
 @interface DOMainViewController ()
@@ -211,6 +212,48 @@
     [[DOUIManager sharedInstance] startLogCapture];
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        if ([jailbreaker contiguousMappingWorkaroundNeeded]) {
+            cpu_subtype_t cpuFamily = 0;
+            size_t cpuFamilySize = sizeof(cpuFamily);
+            sysctlbyname("hw.cpufamily", &cpuFamily, &cpuFamilySize, NULL, 0);
+
+            NSString *workaroundMessage = DOLocalizedString(@"Respring_Required_Message");
+            if (cpuFamily == CPUFAMILY_ARM_TYPHOON) {
+                workaroundMessage = [workaroundMessage stringByAppendingFormat:@"\n\n%@", DOLocalizedString(@"Respring_Required_Notice_A8")];
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Respring_Required")
+                                                                                           message:workaroundMessage
+                                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Respring_Cancel")
+                                                                         style:UIAlertActionStyleCancel
+                                                                       handler:nil];
+                UIAlertAction *workaroundAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Apply_Workaround")
+                                                                             style:UIAlertActionStyleDefault
+                                                                           handler:^(UIAlertAction * _Nonnull action) {
+                    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                        NSError *workaroundError = [jailbreaker applyContiguousMappingWorkaround];
+                        if (workaroundError) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                UIAlertController *failureAlert = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Log_Error")
+                                                                                                          message:workaroundError.localizedDescription
+                                                                                                   preferredStyle:UIAlertControllerStyleAlert];
+                                [failureAlert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close")
+                                                                                     style:UIAlertActionStyleDefault
+                                                                                   handler:nil]];
+                                [self presentViewController:failureAlert animated:YES completion:nil];
+                            });
+                        }
+                    });
+                }];
+                [alertController addAction:cancelAction];
+                [alertController addAction:workaroundAction];
+                alertController.preferredAction = workaroundAction;
+                [self presentViewController:alertController animated:YES completion:nil];
+            });
+            return;
+        }
 
         //We need to get the preconfig mutex to start the jailbreak (self.jailbreakBtn.canStartJailbreak)
         [self.jailbreakBtn lockMutex];

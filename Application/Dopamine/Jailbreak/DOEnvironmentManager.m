@@ -13,6 +13,9 @@
 #import <sys/utsname.h>
 #import <sys/stat.h>
 #import <unistd.h>
+#import <errno.h>
+#import <spawn.h>
+#import <stdint.h>
 #import <mach-o/dyld.h>
 #import <libgrabkernel2/libgrabkernel2.h>
 #import <libjailbreak/info.h>
@@ -31,6 +34,7 @@
 #import <CommonCrypto/CommonDigest.h>
 
 int reboot3(uint64_t flags, ...);
+extern char **environ;
 
 NSString * const DORootHideInjectionModeStock = @"stock";
 NSString * const DORootHideInjectionModeBlacklist = @"blacklist";
@@ -46,6 +50,8 @@ static NSString * const DORootHideInjectSystemRelativePath = @"/var/mobile/Libra
 static NSString * const DORootHideInjectWantsBlacklistRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.wantsblacklist.plist";
 static NSString * const DORootHideJetsamAddendRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.jetsam.addend.plist";
 static NSString * const DORootHideUninjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.uninject.plist";
+// v2.4.9.29 is the first RootHide basebin whose jbctl understands --waitfor.
+static NSString * const DORootHelperWaitProtocolMinimumBasebinVersion = @"2.4.9.29";
 
 static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
 {
@@ -105,6 +111,16 @@ static NSString *DOFileMD5AtPath(NSString *path)
         [hash appendFormat:@"%02x", digest[i]];
     }
     return hash;
+}
+
+static BOOL DOBasebinSupportsRootHelperWaitProtocol(NSString *version)
+{
+    NSString *trimmedVersion = [version stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmedVersion.length == 0) {
+        return NO;
+    }
+
+    return [trimmedVersion compare:DORootHelperWaitProtocolMinimumBasebinVersion options:NSNumericSearch] != NSOrderedAscending;
 }
 
 static NSDictionary *DODefaultRootHideSystemInjection(void)
@@ -340,6 +356,30 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     return (cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E;
 }
 
+- (BOOL)isSPTM
+{
+    if (@available(iOS 17.0, *)) {
+        io_registry_entry_t memoryMap = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/chosen/memory-map");
+        if (memoryMap == IO_OBJECT_NULL) {
+            return NO;
+        }
+
+        CFArrayRef keys = (CFArrayRef)IORegistryEntryCreateCFProperty(memoryMap, CFSTR(kIORegistryEntryPropertyKeysKey), kCFAllocatorDefault, 0);
+        IOObjectRelease(memoryMap);
+        if (!keys) {
+            return NO;
+        }
+
+        CFRange range = CFRangeMake(0, CFArrayGetCount(keys));
+        BOOL isSPTM = CFArrayContainsValue(keys, range, CFSTR("SPTM")) &&
+                      CFArrayContainsValue(keys, range, CFSTR("TXM"));
+        CFRelease(keys);
+        return isSPTM;
+    }
+
+    return NO;
+}
+
 - (NSString *)versionSupportString
 {
     if ([self isArm64e]) {
@@ -479,6 +519,181 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     if (ur == 0 && orgUser != 0) seteuid(orgUser);
 }
 
+- (BOOL)installedBasebinSupportsRootHelperWaitProtocol
+{
+    NSString *installedBasebinVersion = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil];
+    return DOBasebinSupportsRootHelperWaitProtocol(installedBasebinVersion);
+}
+
+- (int)resumeSuspendedRootHelperProcess:(pid_t)pid
+{
+    if (pid <= 0) {
+        return EINVAL;
+    }
+
+    __block int resumeResult = kill(pid, SIGCONT);
+    if (resumeResult != 0) {
+        [self runUnsandboxed:^{
+            resumeResult = kill(pid, SIGCONT);
+        }];
+    }
+    if (resumeResult != 0) {
+        // Pre-2.4.9.29 helpers cannot wait for credential cleanup. On older
+        // sandbox configurations that reject a post-drop signal, resume in a
+        // short compatibility block; callers still wait after it has exited.
+        [self runAsRoot:^{
+            [self runUnsandboxed:^{
+                resumeResult = kill(pid, SIGCONT);
+            }];
+        }];
+    }
+    return resumeResult;
+}
+
+- (int)spawnJbctlAsRootWithArgs:(NSArray<NSString *> *)args
+{
+    if (args.count == 0 || args.count > (SIZE_MAX / sizeof(char *)) - 4) {
+        return EINVAL;
+    }
+
+    const char *jbctlPath = JBROOT_PATH("/basebin/jbctl");
+    if (!jbctlPath) {
+        return ENOENT;
+    }
+
+    // Do not pass --waitfor to already-installed jbctl binaries. They predate
+    // this protocol and would execute the requested action immediately.
+    BOOL needsLegacySolution = ![self installedBasebinSupportsRootHelperWaitProtocol];
+
+    size_t argumentSlots = (size_t)args.count + 4;
+    char **argBuf = calloc(argumentSlots, sizeof(*argBuf));
+    if (!argBuf) {
+        return ENOMEM;
+    }
+
+    int result = 0;
+    NSUInteger argCount = 0;
+    __block pid_t pid = -1;
+    __block int spawnResult = EPERM;
+    int waitPipe[2] = { -1, -1 };
+    posix_spawn_file_actions_t actions = NULL;
+    posix_spawnattr_t attributes = NULL;
+    BOOL actionsInitialized = NO;
+    BOOL attributesInitialized = NO;
+
+    argBuf[argCount] = strdup(jbctlPath);
+    if (!argBuf[argCount++]) {
+        result = ENOMEM;
+    }
+
+    for (NSString *arg in args) {
+        if (result != 0) {
+            break;
+        }
+        if (![arg isKindOfClass:[NSString class]]) {
+            result = EINVAL;
+            break;
+        }
+
+        const char *argument = arg.UTF8String;
+        if (!argument) {
+            result = EINVAL;
+            break;
+        }
+
+        argBuf[argCount] = strdup(argument);
+        if (!argBuf[argCount++]) {
+            result = ENOMEM;
+        }
+    }
+
+    if (result == 0 && !needsLegacySolution) {
+        if (pipe(waitPipe) != 0) {
+            result = errno;
+        }
+        else {
+            argBuf[argCount] = strdup("--waitfor");
+            if (!argBuf[argCount++]) {
+                result = ENOMEM;
+            }
+            else {
+                argBuf[argCount] = strdup("3");
+                if (!argBuf[argCount++]) {
+                    result = ENOMEM;
+                }
+            }
+        }
+    }
+
+    if (result == 0) {
+        result = posix_spawn_file_actions_init(&actions);
+        actionsInitialized = result == 0;
+    }
+    if (result == 0 && !needsLegacySolution) {
+        result = posix_spawn_file_actions_adddup2(&actions, waitPipe[0], 3);
+    }
+    if (result == 0 && !needsLegacySolution && waitPipe[0] != 3) {
+        result = posix_spawn_file_actions_addclose(&actions, waitPipe[0]);
+    }
+    if (result == 0 && !needsLegacySolution && waitPipe[1] != 3) {
+        // Do not let the child keep a writer open: if the app exits before
+        // signaling, jbctl must see EOF and fail rather than wait forever.
+        result = posix_spawn_file_actions_addclose(&actions, waitPipe[1]);
+    }
+    if (result == 0) {
+        result = posix_spawnattr_init(&attributes);
+        attributesInitialized = result == 0;
+    }
+    if (result == 0 && needsLegacySolution) {
+        result = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_START_SUSPENDED);
+    }
+    if (result == 0) {
+        [self runAsRoot:^{
+            [self runUnsandboxed:^{
+                spawnResult = posix_spawn(&pid, argBuf[0], &actions, &attributes, argBuf, environ);
+            }];
+            // For the pipe protocol, jbctl remains blocked until this root block
+            // has exited and the app's root credential has been released.
+        }];
+        result = spawnResult;
+    }
+
+    if (result == 0 && needsLegacySolution) {
+        result = [self resumeSuspendedRootHelperProcess:pid];
+    }
+
+    if (attributesInitialized) {
+        posix_spawnattr_destroy(&attributes);
+    }
+    if (actionsInitialized) {
+        posix_spawn_file_actions_destroy(&actions);
+    }
+
+    if (!needsLegacySolution) {
+        if (result == 0) {
+            char signal = 'w';
+            while (write(waitPipe[1], &signal, sizeof(signal)) == -1 && errno == EINTR) {
+            }
+        }
+        if (waitPipe[0] >= 0) {
+            close(waitPipe[0]);
+        }
+        if (waitPipe[1] >= 0) {
+            close(waitPipe[1]);
+        }
+    }
+
+    for (NSUInteger index = 0; index < argCount; index++) {
+        free(argBuf[index]);
+    }
+    free(argBuf);
+
+    if (result != 0) {
+        return result;
+    }
+    return cmd_wait_for_exit(pid);
+}
+
 - (int)runTrollStoreAction:(NSString *)action
 {
     if (![self isInstalledThroughTrollStore]) return -1;
@@ -491,47 +706,38 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (void)respring
 {
-    [self runAsRoot:^{
-        __block int pid = 0;
-        __block int r = 0;
-        [self runUnsandboxed:^{
-            r = exec_cmd_suspended(&pid, JBROOT_PATH("/usr/bin/sbreload"), NULL);
-            if (r == 0) {
-                kill(pid, SIGCONT);
-            }
+    if (![self installedBasebinSupportsRootHelperWaitProtocol]) {
+        // Older RootHide jbctl binaries have no respring subcommand or
+        // --waitfor support. Preserve their existing direct sbreload path.
+        __block pid_t pid = -1;
+        __block int spawnResult = EPERM;
+        [self runAsRoot:^{
+            [self runUnsandboxed:^{
+                spawnResult = exec_cmd_suspended(&pid, JBROOT_PATH("/usr/bin/sbreload"), NULL);
+            }];
         }];
-        if (r == 0) {
-            if (cmd_wait_for_exit(pid) != 0) {
-                // Fallback
+
+        if (spawnResult != 0) {
+            return;
+        }
+
+        int resumeResult = [self resumeSuspendedRootHelperProcess:pid];
+        if (resumeResult == 0 && cmd_wait_for_exit(pid) != 0) {
+            [self runAsRoot:^{
                 [self runUnsandboxed:^{
                     killall("/usr/libexec/backboardd", SIGTERM);
                 }];
-            }
+            }];
         }
-    }];
+        return;
+    }
+
+    [self spawnJbctlAsRootWithArgs:@[@"respring"]];
 }
 
 - (void)rebootUserspace
 {
-    [self runAsRoot:^{
-        __block int pid = 0;
-        __block int r = 0;
-        [self runUnsandboxed:^{
-            r = exec_cmd_suspended(&pid, JBROOT_PATH("/basebin/jbctl"), "reboot_userspace", NULL);
-            if (r == 0) {
-                // the original plan was to have the process continue outside of this block
-                // unfortunately sandbox blocks kill aswell, so it's a bit racy but works
-
-                // we assume we leave this unsandbox block before the userspace reboot starts
-                // to avoid leaking the label, this seems to work in practice
-                // and even if it doesn't work, leaking the label is no big deal
-                kill(pid, SIGCONT);
-            }
-        }];
-        if (r == 0) {
-            cmd_wait_for_exit(pid);
-        }
-    }];
+    [self spawnJbctlAsRootWithArgs:@[@"reboot_userspace"]];
 }
 
 - (void)refreshJailbreakApps
@@ -591,14 +797,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (void)updateJailbreakFromTIPA:(NSString *)tipaPath
 {
-    [self runAsRoot:^{
-        [self runUnsandboxed:^{
-            pid_t pid = 0;
-            if (exec_cmd_suspended(&pid, JBROOT_PATH("/basebin/jbctl"), "update", "tipa", tipaPath.fileSystemRepresentation, NULL) == 0) {
-                kill(pid, SIGCONT);
-            }
-        }];
-    }];
+    [self spawnJbctlAsRootWithArgs:@[@"update", @"tipa", tipaPath]];
 }
 
 - (BOOL)isTweakInjectionEnabled
@@ -881,6 +1080,64 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         }
         return kernelcachePath;
     }
+}
+
+- (NSString *)accessibleSPTMPath
+{
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *sptmInAppPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"sptm.img4"];
+    if ([fileManager fileExistsAtPath:sptmInAppPath]) {
+        return sptmInAppPath;
+    }
+
+    NSString *sptmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sptm.img4"];
+    if ([fileManager fileExistsAtPath:sptmInDocsPath]) {
+        return sptmInDocsPath;
+    }
+
+    sptmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sptm.im4p"];
+    if ([fileManager fileExistsAtPath:sptmInDocsPath]) {
+        return sptmInDocsPath;
+    }
+
+    // The active preboot volume is only accessible from a privileged app context.
+    if ([self isInstalledThroughTrollStore] || getuid() == 0) {
+        NSString *sptmPath = [[self activePrebootPath] stringByAppendingPathComponent:@"usr/standalone/firmware/FUD/Ap,SecurePageTableMonitor.img4"];
+        if ([fileManager fileExistsAtPath:sptmPath]) {
+            return sptmPath;
+        }
+    }
+
+    return nil;
+}
+
+- (NSString *)accessibleTXMPath
+{
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *txmInAppPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"txm.img4"];
+    if ([fileManager fileExistsAtPath:txmInAppPath]) {
+        return txmInAppPath;
+    }
+
+    NSString *txmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/txm.img4"];
+    if ([fileManager fileExistsAtPath:txmInDocsPath]) {
+        return txmInDocsPath;
+    }
+
+    txmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/txm.im4p"];
+    if ([fileManager fileExistsAtPath:txmInDocsPath]) {
+        return txmInDocsPath;
+    }
+
+    // Keep the RootHide preboot resolver authoritative; never infer /var/jb here.
+    if ([self isInstalledThroughTrollStore] || getuid() == 0) {
+        NSString *txmPath = [[self activePrebootPath] stringByAppendingPathComponent:@"usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4"];
+        if ([fileManager fileExistsAtPath:txmPath]) {
+            return txmPath;
+        }
+    }
+
+    return nil;
 }
 
 - (BOOL)isPACBypassRequired

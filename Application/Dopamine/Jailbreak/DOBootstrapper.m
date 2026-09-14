@@ -13,6 +13,7 @@
 #import <libjailbreak/jbclient_xpc.h>
 #import "zstd.h"
 #import <sys/mount.h>
+#import <stdio.h>
 #import <dlfcn.h>
 #import <sys/stat.h>
 #import "NSString+Version.h"
@@ -56,6 +57,10 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 };
 
 #define BUFFER_SIZE 8192
+
+@interface DOEnvironmentManager (DOBootstrapperPrivate)
+- (NSString *)activePrebootPath;
+@end
 
 @implementation DOBootstrapper
 
@@ -135,7 +140,7 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
         fclose(output_file);
         return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedDecompressing userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to initialize ZSTD decompression stream: %s", ZSTD_getErrorName(ret)]}];
     }
-    
+
     // Read and decompress the input file
     size_t total_bytes_read = 0;
     size_t total_bytes_written = 0;
@@ -490,8 +495,52 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     
     if ([[NSFileManager defaultManager] fileExistsAtPath:basebinPath]) {
         if (![[NSFileManager defaultManager] removeItemAtPath:basebinPath error:&error]) {
-            completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed deleting existing basebin file with error: %@", error.localizedDescription]}]);
-            return;
+            BOOL recovered = NO;
+            NSString *corruptedFilePath = JBROOT_PATH(@"/basebin/gen/dyld.old");
+            NSString *jbrootPath = JBROOT_PATH(@"/");
+            NSString *activePrebootPath = [[DOEnvironmentManager sharedManager] activePrebootPath];
+            NSString *activePrebootPrefix = [activePrebootPath stringByAppendingString:@"/"];
+
+            // Keep the recovery inside the active RootHide preboot volume.
+            // /var/jb is only a compatibility symlink and must not be used to
+            // locate either the corrupt file or the orphan destination.
+            if (corruptedFilePath.length > 0
+                && jbrootPath.length > 0
+                && activePrebootPath.length > 0
+                && [jbrootPath hasPrefix:activePrebootPrefix]
+                && [[NSFileManager defaultManager] fileExistsAtPath:corruptedFilePath]
+                && ![[NSFileManager defaultManager] removeItemAtPath:corruptedFilePath error:nil]) {
+                // A failed update can leave dyld.old in a state that cannot be
+                // deleted but can be moved out of basebin, allowing extraction
+                // to rebuild the generated dyld from scratch.
+                NSString *characterSet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                NSString *orphanedPath = nil;
+                for (NSUInteger attempt = 0; attempt < 4; attempt++) {
+                    NSMutableString *randomString = [NSMutableString stringWithCapacity:6];
+                    for (NSUInteger index = 0; index < 6; index++) {
+                        NSUInteger randomIndex = arc4random_uniform((uint32_t)characterSet.length);
+                        [randomString appendFormat:@"%C", [characterSet characterAtIndex:randomIndex]];
+                    }
+
+                    NSString *candidatePath = [activePrebootPath stringByAppendingPathComponent:[NSString stringWithFormat:@"orphaned-%@", randomString]];
+                    if (![[NSFileManager defaultManager] fileExistsAtPath:candidatePath]) {
+                        orphanedPath = candidatePath;
+                        break;
+                    }
+                }
+
+                if (orphanedPath
+                    && [[NSFileManager defaultManager] moveItemAtPath:corruptedFilePath toPath:orphanedPath error:nil]
+                    && [[NSFileManager defaultManager] removeItemAtPath:basebinPath error:&error]) {
+                    recovered = YES;
+                    error = nil;
+                }
+            }
+
+            if (!recovered) {
+                completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed deleting existing basebin file with error: %@", error.localizedDescription]}]);
+                return;
+            }
         }
     }
     error = [self extractTar:[[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.tar"] toPath:JBROOT_PATH(@"/")];
@@ -764,8 +813,9 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 ////////////////////////
 uint64_t jbrand_new();
 uint64_t jbrand_current();
-int is_jbroot_name(char* name);
+int is_jbroot_name(const char *name);
 NSString* find_jbroot(BOOL force);
+static void RootHideSetCachedJailbreakRoot(NSString *primaryPath);
 ////////////////////////////////////////
 NSString* jbrootPrefix(NSString *path);
 NSString* rootfsPrefix(NSString* path);
@@ -787,7 +837,284 @@ int is_jbrand_value(uint64_t value)
 #define JB_ROOT_PREFIX ".jbroot-"
 #define JB_RAND_LENGTH  (sizeof(uint64_t)*sizeof(char)*2)
 
-int is_jbroot_name(char* name)
+static NSString * const RootHidePrimaryJailbreakRootDirectory = @"/var/containers/Bundle/Application";
+static NSString * const RootHideSecondaryJailbreakRootDirectory = @"/var/mobile/Containers/Shared/AppGroup";
+static NSString * const RootHideLegacyBundleIdentifier = @"com.opa334.Dopamine-roothide";
+
+typedef NS_ENUM(NSUInteger, RootHideJailbreakRootState) {
+    // The entry has the randomized-root spelling but makes no claim to be ours.
+    RootHideJailbreakRootStateUnowned,
+    // A foreign RootHide bootstrap, or an install marker tied to another app.
+    RootHideJailbreakRootStateForeign,
+    // An owned root whose paired-root links point somewhere unexpected.
+    RootHideJailbreakRootStateInvalid,
+    RootHideJailbreakRootStateRepairable,
+    RootHideJailbreakRootStateReady,
+};
+
+typedef NS_ENUM(NSUInteger, RootHideLinkState) {
+    RootHideLinkStateMissing,
+    RootHideLinkStateExpected,
+    RootHideLinkStateUnexpected,
+};
+
+static NSString *gRootHideCachedJailbreakRoot = nil;
+
+static BOOL RootHidePathNodeExists(NSString *path)
+{
+    struct stat st = {0};
+    return path.length > 0 && lstat(path.fileSystemRepresentation, &st) == 0;
+}
+
+static BOOL RootHideDirectoryExists(NSString *path)
+{
+    BOOL isDirectory = NO;
+    return path.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory] && isDirectory;
+}
+
+static BOOL RootHideRegularFileExists(NSString *path)
+{
+    struct stat st = {0};
+    return path.length > 0 && lstat(path.fileSystemRepresentation, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static NSString *RootHideSecondaryJailbreakRootForPrimary(NSString *primaryPath)
+{
+    return [RootHideSecondaryJailbreakRootDirectory stringByAppendingPathComponent:primaryPath.lastPathComponent];
+}
+
+static RootHideLinkState RootHideLinkStateAtPath(NSString *path, NSString *expectedDestination)
+{
+    NSError *error = nil;
+    NSString *destination = [[NSFileManager defaultManager] destinationOfSymbolicLinkAtPath:path error:&error];
+    if (!destination) {
+        return RootHidePathNodeExists(path) ? RootHideLinkStateUnexpected : RootHideLinkStateMissing;
+    }
+    return [destination isEqualToString:expectedDestination] ? RootHideLinkStateExpected : RootHideLinkStateUnexpected;
+}
+
+static BOOL RootHideOwnsBundleIdentifier(NSString *identifier)
+{
+    NSString *trimmedIdentifier = [identifier stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *currentIdentifier = NSBundle.mainBundle.bundleIdentifier;
+    if (trimmedIdentifier.length == 0) {
+        return NO;
+    }
+    return [trimmedIdentifier isEqualToString:currentIdentifier] || [trimmedIdentifier isEqualToString:RootHideLegacyBundleIdentifier];
+}
+
+static RootHideJailbreakRootState RootHideJailbreakRootStateForPrimaryPath(NSString *primaryPath)
+{
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *installMarker = [primaryPath stringByAppendingPathComponent:@".installed_dopamine"];
+    NSString *foreignBootstrapMarker = [primaryPath stringByAppendingPathComponent:@".bootstrapped"];
+    NSString *foreignTheBootstrapMarker = [primaryPath stringByAppendingPathComponent:@".thebootstrapped"];
+
+    if ([fileManager fileExistsAtPath:foreignBootstrapMarker] || [fileManager fileExistsAtPath:foreignTheBootstrapMarker]) {
+        return RootHideJailbreakRootStateForeign;
+    }
+    if (!RootHideRegularFileExists(installMarker)) {
+        return RootHideJailbreakRootStateUnowned;
+    }
+
+    NSString *identityPath = [primaryPath stringByAppendingPathComponent:@"basebin/.AppIdentifier"];
+    if (RootHidePathNodeExists(identityPath)) {
+        if (!RootHideRegularFileExists(identityPath)) {
+            return RootHideJailbreakRootStateInvalid;
+        }
+        NSString *storedIdentifier = [NSString stringWithContentsOfFile:identityPath encoding:NSUTF8StringEncoding error:nil];
+        if (!RootHideOwnsBundleIdentifier(storedIdentifier)) {
+            return RootHideJailbreakRootStateForeign;
+        }
+    }
+    // Older RootHide installs did not persist an app identifier. The exact
+    // paired-root contract below is required before treating that legacy marker
+    // as ours, and the current identifier is written on the next update.
+
+    NSString *secondaryPath = RootHideSecondaryJailbreakRootForPrimary(primaryPath);
+    NSString *secondaryVarPath = [secondaryPath stringByAppendingPathComponent:@"var"];
+    if (!RootHideDirectoryExists(primaryPath) || !RootHideDirectoryExists(secondaryPath) || !RootHideDirectoryExists(secondaryVarPath)) {
+        return RootHideJailbreakRootStateInvalid;
+    }
+
+    RootHideLinkState primaryVarLink = RootHideLinkStateAtPath([primaryPath stringByAppendingPathComponent:@"var"], @"private/var");
+    RootHideLinkState primaryPrivateVarLink = RootHideLinkStateAtPath([primaryPath stringByAppendingPathComponent:@"private/var"], secondaryVarPath);
+    RootHideLinkState secondaryRootLink = RootHideLinkStateAtPath([secondaryPath stringByAppendingPathComponent:@".jbroot"], primaryPath);
+    if (primaryVarLink == RootHideLinkStateUnexpected || primaryPrivateVarLink == RootHideLinkStateUnexpected || secondaryRootLink == RootHideLinkStateUnexpected) {
+        return RootHideJailbreakRootStateInvalid;
+    }
+    if (primaryVarLink == RootHideLinkStateMissing || primaryPrivateVarLink == RootHideLinkStateMissing || secondaryRootLink == RootHideLinkStateMissing) {
+        return RootHideJailbreakRootStateRepairable;
+    }
+    return RootHideJailbreakRootStateReady;
+}
+
+static NSError *RootHideRootError(NSString *description)
+{
+    return [NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : description}];
+}
+
+static NSString *RootHideFindOwnedJailbreakRoot(BOOL allowRepairable, NSError **errorOut)
+{
+    if (errorOut) {
+        *errorOut = nil;
+    }
+
+    NSError *directoryError = nil;
+    NSArray<NSString *> *subItems = [NSFileManager.defaultManager contentsOfDirectoryAtPath:RootHidePrimaryJailbreakRootDirectory error:&directoryError];
+    if (!subItems) {
+        if (errorOut) {
+            *errorOut = directoryError ?: RootHideRootError(@"Unable to enumerate randomized RootHide roots.");
+        }
+        return nil;
+    }
+    NSString *selectedPath = nil;
+    for (NSString *subItem in subItems) {
+        if (!is_jbroot_name(subItem.UTF8String)) {
+            continue;
+        }
+
+        NSString *candidatePath = [RootHidePrimaryJailbreakRootDirectory stringByAppendingPathComponent:subItem];
+        RootHideJailbreakRootState state = RootHideJailbreakRootStateForPrimaryPath(candidatePath);
+        if (state == RootHideJailbreakRootStateUnowned) {
+            continue;
+        }
+        if (state == RootHideJailbreakRootStateForeign || state == RootHideJailbreakRootStateInvalid || (state == RootHideJailbreakRootStateRepairable && !allowRepairable)) {
+            if (errorOut) {
+                *errorOut = RootHideRootError([NSString stringWithFormat:@"Refusing to select randomized root %@ because its ownership or paired-root contract is invalid.", candidatePath]);
+            }
+            return nil;
+        }
+        if (selectedPath) {
+            if (errorOut) {
+                *errorOut = RootHideRootError(@"Multiple owned RootHide/Opamine randomized roots were found; refusing to select or modify either one.");
+            }
+            return nil;
+        }
+        selectedPath = candidatePath;
+    }
+    return selectedPath;
+}
+
+static BOOL RootHideRepairPairedRootLinks(NSString *primaryPath, NSError **errorOut)
+{
+    if (errorOut) {
+        *errorOut = nil;
+    }
+    if (RootHideJailbreakRootStateForPrimaryPath(primaryPath) != RootHideJailbreakRootStateRepairable) {
+        if (errorOut) {
+            *errorOut = RootHideRootError(@"Refusing paired-root recovery because the root is not an unambiguous, repairable RootHide/Opamine install.");
+        }
+        return NO;
+    }
+
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *secondaryPath = RootHideSecondaryJailbreakRootForPrimary(primaryPath);
+    NSArray<NSDictionary<NSString *, NSString *> *> *links = @[
+        @{ @"path" : [primaryPath stringByAppendingPathComponent:@"var"], @"destination" : @"private/var" },
+        @{ @"path" : [primaryPath stringByAppendingPathComponent:@"private/var"], @"destination" : [secondaryPath stringByAppendingPathComponent:@"var"] },
+        @{ @"path" : [secondaryPath stringByAppendingPathComponent:@".jbroot"], @"destination" : primaryPath },
+    ];
+
+    for (NSDictionary<NSString *, NSString *> *link in links) {
+        NSString *path = link[@"path"];
+        NSString *destination = link[@"destination"];
+        RootHideLinkState state = RootHideLinkStateAtPath(path, destination);
+        if (state == RootHideLinkStateUnexpected) {
+            if (errorOut) {
+                *errorOut = RootHideRootError([NSString stringWithFormat:@"Refusing paired-root recovery because %@ points somewhere unexpected.", path]);
+            }
+            return NO;
+        }
+        if (state == RootHideLinkStateMissing && ![fileManager createSymbolicLinkAtPath:path withDestinationPath:destination error:errorOut]) {
+            return NO;
+        }
+    }
+
+    if (RootHideJailbreakRootStateForPrimaryPath(primaryPath) != RootHideJailbreakRootStateReady) {
+        if (errorOut) {
+            *errorOut = RootHideRootError(@"Paired-root recovery did not restore the expected RootHide randomized-root contract.");
+        }
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL RootHideReplaceExpectedSymlink(NSString *path, NSString *expectedDestination, NSString *replacementDestination, NSError **errorOut)
+{
+    if (RootHideLinkStateAtPath(path, expectedDestination) != RootHideLinkStateExpected) {
+        if (errorOut) {
+            *errorOut = RootHideRootError([NSString stringWithFormat:@"Refusing to replace unexpected randomized-root link %@.", path]);
+        }
+        return NO;
+    }
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *temporaryPath = [path stringByAppendingFormat:@".opamine-link-%@", NSUUID.UUID.UUIDString];
+    if (![fileManager createSymbolicLinkAtPath:temporaryPath withDestinationPath:replacementDestination error:errorOut]) {
+        return NO;
+    }
+    if (rename(temporaryPath.fileSystemRepresentation, path.fileSystemRepresentation) != 0) {
+        int renameError = errno;
+        [fileManager removeItemAtPath:temporaryPath error:nil];
+        if (errorOut) {
+            *errorOut = [NSError errorWithDomain:NSPOSIXErrorDomain code:renameError userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed atomically replacing randomized-root link %@: %s", path, strerror(renameError)]}];
+        }
+        return NO;
+    }
+    return YES;
+}
+
+static NSString *RootHideDiscoverAndRecoverOwnedJailbreakRoot(NSError **errorOut)
+{
+    NSError *discoveryError = nil;
+    NSString *primaryPath = RootHideFindOwnedJailbreakRoot(YES, &discoveryError);
+    if (discoveryError) {
+        if (errorOut) {
+            *errorOut = discoveryError;
+        }
+        return nil;
+    }
+    if (!primaryPath || RootHideJailbreakRootStateForPrimaryPath(primaryPath) == RootHideJailbreakRootStateReady) {
+        if (errorOut) {
+            *errorOut = nil;
+        }
+        return primaryPath;
+    }
+
+    NSError *recoveryError = nil;
+    if (!RootHideRepairPairedRootLinks(primaryPath, &recoveryError)) {
+        if (errorOut) {
+            *errorOut = recoveryError ?: RootHideRootError(@"RootHide paired-root recovery failed.");
+        }
+        return nil;
+    }
+    RootHideSetCachedJailbreakRoot(primaryPath);
+    if (!find_jbroot(YES)) {
+        if (errorOut) {
+            *errorOut = RootHideRootError(@"Recovered RootHide root did not pass ownership validation.");
+        }
+        return nil;
+    }
+    if (errorOut) {
+        *errorOut = nil;
+    }
+    return primaryPath;
+}
+
+static NSError *RootHideWriteCurrentAppIdentifier(NSString *primaryPath)
+{
+    NSString *identifier = NSBundle.mainBundle.bundleIdentifier;
+    if (identifier.length == 0) {
+        return RootHideRootError(@"Cannot persist an empty Opamine application identifier.");
+    }
+    NSString *identityPath = [primaryPath stringByAppendingPathComponent:@"basebin/.AppIdentifier"];
+    if (![identifier writeToFile:identityPath atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+        return RootHideRootError([NSString stringWithFormat:@"Failed to persist the Opamine application identifier at %@.", identityPath]);
+    }
+    return nil;
+}
+
+int is_jbroot_name(const char *name)
 {
     if(strlen(name) != (sizeof(JB_ROOT_PREFIX)-1+JB_RAND_LENGTH))
         return 0;
@@ -806,7 +1133,7 @@ int is_jbroot_name(char* name)
     return 1;
 }
 
-uint64_t resolve_jbrand_value(const char* name)
+uint64_t resolve_jbrand_value(const char *name)
 {
     if(strlen(name) != (sizeof(JB_ROOT_PREFIX)-1+JB_RAND_LENGTH))
         return 0;
@@ -827,26 +1154,26 @@ uint64_t resolve_jbrand_value(const char* name)
 
 NSString* find_jbroot(BOOL force)
 {
-    static NSString* cached_jbroot = nil;
-    if(!force && cached_jbroot) {
-        return cached_jbroot;
+    if(!force && gRootHideCachedJailbreakRoot) {
+        return gRootHideCachedJailbreakRoot;
     }
     @synchronized(@"find_jbroot_lock")
     {
-        //jbroot path may change when re-randomize it
-        NSString * jbroot = nil;
-        NSArray *subItems = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application/" error:nil];
-        for (NSString *subItem in subItems) {
-            if (is_jbroot_name(subItem.UTF8String))
-            {
-                NSString* path = [@"/var/containers/Bundle/Application/" stringByAppendingPathComponent:subItem];
-                jbroot = path;
-                break;
-            }
-        }
-        cached_jbroot = jbroot;
+        // A randomized name and checksum are not ownership proof. Discovery
+        // accepts exactly one complete, self-consistent RootHide/Opamine pair.
+        // In-progress installs explicitly seed this cache with their newly
+        // created path instead of broadening discovery to arbitrary roots.
+        gRootHideCachedJailbreakRoot = RootHideFindOwnedJailbreakRoot(NO, nil);
     }
-    return cached_jbroot;
+    return gRootHideCachedJailbreakRoot;
+}
+
+static void RootHideSetCachedJailbreakRoot(NSString *primaryPath)
+{
+    @synchronized(@"find_jbroot_lock")
+    {
+        gRootHideCachedJailbreakRoot = [primaryPath copy];
+    }
 }
 ////////////////////////////////////////////
 uint64_t jbrand_current()
@@ -952,6 +1279,7 @@ int getCFMajorVersion(void)
 
 #define STRAPLOG(...)   [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@__VA_ARGS__] debug:YES];
 #define ASSERT(...)     do{if(!(__VA_ARGS__)) {completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"ABORT: %s (%d): %s", __FILE_NAME__, __LINE__, #__VA_ARGS__]}]);return -1;}} while(0)
+#define ROOT_HIDE_INSTALL_ASSERT(...) do{if(!(__VA_ARGS__)) {RootHideSetCachedJailbreakRoot(nil); completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"ABORT: %s (%d): %s", __FILE_NAME__, __LINE__, #__VA_ARGS__]}]);return -1;}} while(0)
 
 - (NSString *)bootstrapVersion
 {
@@ -987,59 +1315,66 @@ int getCFMajorVersion(void)
     NSFileManager* fm = NSFileManager.defaultManager;
     
     NSString* jbroot_path = installPath;
+    RootHideSetCachedJailbreakRoot(nil);
     
     ASSERT(mkdir(jbroot_path.fileSystemRepresentation, 0755) == 0);
     ASSERT(chown(jbroot_path.fileSystemRepresentation, 0, 0) == 0);
-
-    find_jbroot(YES); //refresh
-    
-    //jbrootPrefix() and jbrand_current() available now
     
     NSString* bootstrapZstFile = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:
                                   [NSString stringWithFormat:@"bootstrap_%d.tar.zst", getCFMajorVersion()]];
 
-    ASSERT([fm fileExistsAtPath:bootstrapZstFile]);
+    ROOT_HIDE_INSTALL_ASSERT([fm fileExistsAtPath:bootstrapZstFile]);
     
     NSString* bootstrapTarFile = [NSTemporaryDirectory() stringByAppendingPathComponent:@"bootstrap.tar"];
     if([fm fileExistsAtPath:bootstrapTarFile])
-        ASSERT([fm removeItemAtPath:bootstrapTarFile error:nil]);
+        ROOT_HIDE_INSTALL_ASSERT([fm removeItemAtPath:bootstrapTarFile error:nil]);
     
     NSError* error = [self decompressZstd:bootstrapZstFile toTar:bootstrapTarFile];
     if(error) {
+        RootHideSetCachedJailbreakRoot(nil);
         completion(error);
         return -1;
     }
     
     NSError* decompressionError = [self extractTar:bootstrapTarFile toPath:jbroot_path];
     if (decompressionError) {
+        RootHideSetCachedJailbreakRoot(nil);
         completion(decompressionError);
         return -1;
     }
+
+    // The newly extracted root is not finalized and deliberately has no
+    // ownership marker yet. Only now, after extraction succeeded, may this
+    // invocation seed the cache for its own paired-root setup.
+    RootHideSetCachedJailbreakRoot(jbroot_path);
+
+    // jbrootPrefix() and jbrand_current() are available for this known path.
     
     NSString* jbroot_secondary = [NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", jbrand_current()];
-    ASSERT(mkdir(jbroot_secondary.fileSystemRepresentation, 0755) == 0);
-    ASSERT(chown(jbroot_secondary.fileSystemRepresentation, 0, 0) == 0);
+    ROOT_HIDE_INSTALL_ASSERT(mkdir(jbroot_secondary.fileSystemRepresentation, 0755) == 0);
+    ROOT_HIDE_INSTALL_ASSERT(chown(jbroot_secondary.fileSystemRepresentation, 0, 0) == 0);
     
-    ASSERT([fm moveItemAtPath:jbrootPrefix(@"/var") toPath:[jbroot_secondary stringByAppendingPathComponent:@"/var"] error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:jbrootPrefix(@"/var") withDestinationPath:@"private/var" error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm moveItemAtPath:jbrootPrefix(@"/var") toPath:[jbroot_secondary stringByAppendingPathComponent:@"/var"] error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm createSymbolicLinkAtPath:jbrootPrefix(@"/var") withDestinationPath:@"private/var" error:nil]);
     
-    ASSERT([fm removeItemAtPath:jbrootPrefix(@"/private/var") error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:jbrootPrefix(@"/private/var") withDestinationPath:[jbroot_secondary stringByAppendingPathComponent:@"/var"] error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm removeItemAtPath:jbrootPrefix(@"/private/var") error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm createSymbolicLinkAtPath:jbrootPrefix(@"/private/var") withDestinationPath:[jbroot_secondary stringByAppendingPathComponent:@"/var"] error:nil]);
     
-    ASSERT([fm removeItemAtPath:[jbroot_secondary stringByAppendingPathComponent:@"/var/tmp"] error:nil]);
-    ASSERT([fm moveItemAtPath:jbrootPrefix(@"/tmp") toPath:[jbroot_secondary stringByAppendingPathComponent:@"/var/tmp"] error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:jbrootPrefix(@"/tmp") withDestinationPath:@"var/tmp" error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm removeItemAtPath:[jbroot_secondary stringByAppendingPathComponent:@"/var/tmp"] error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm moveItemAtPath:jbrootPrefix(@"/tmp") toPath:[jbroot_secondary stringByAppendingPathComponent:@"/var/tmp"] error:nil]);
+    ROOT_HIDE_INSTALL_ASSERT([fm createSymbolicLinkAtPath:jbrootPrefix(@"/tmp") withDestinationPath:@"var/tmp" error:nil]);
     
-    ASSERT([fm createSymbolicLinkAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"]
+    ROOT_HIDE_INSTALL_ASSERT([fm createSymbolicLinkAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"]
                     withDestinationPath:jbroot_path error:nil]);
 
     if(![fm fileExistsAtPath:jbrootPrefix(@"/var/mobile/Library/Preferences")])
     {
         NSDictionary* attr = @{NSFilePosixPermissions:@(0755), NSFileOwnerAccountID:@(501), NSFileGroupOwnerAccountID:@(501)};
-        ASSERT([fm createDirectoryAtPath:jbrootPrefix(@"/var/mobile/Library/Preferences") withIntermediateDirectories:YES attributes:attr error:nil]);
+        ROOT_HIDE_INSTALL_ASSERT([fm createDirectoryAtPath:jbrootPrefix(@"/var/mobile/Library/Preferences") withIntermediateDirectories:YES attributes:attr error:nil]);
     }
     
     if([self buildPackageSources:completion] != 0) {
+        RootHideSetCachedJailbreakRoot(nil);
         return -1;
     }
     
@@ -1051,85 +1386,134 @@ int getCFMajorVersion(void)
 -(int) ReRandomizeBootstrap:(void (^)(NSError *))completion
 {
     [[DOUIManager sharedInstance] sendLog:@"ReRandomizing Bootstrap" debug:NO];
-    
-    uint64_t new_jbrand = jbrand_new();
-    uint64_t prev_jbrand = jbrand_current();
 
-    //jbrootPrefix() and jbrand_current() unavailable
-    
-    NSFileManager* fm = NSFileManager.defaultManager;
-    
-    ASSERT( [fm moveItemAtPath:[NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", prev_jbrand]
-                        toPath:[NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", new_jbrand] error:nil] );
-    
-    ASSERT([fm moveItemAtPath:[NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", prev_jbrand]
-                       toPath:[NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", new_jbrand] error:nil]);
-    
-    
-    NSString* jbroot_path = [NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", new_jbrand];
-    NSString* jbroot_secondary = [NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX", new_jbrand];
-    
-    ASSERT([fm removeItemAtPath:[jbroot_path stringByAppendingPathComponent:@"/private/var"] error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:[jbroot_path stringByAppendingPathComponent:@"/private/var"]
-                    withDestinationPath:[jbroot_secondary stringByAppendingPathComponent:@"/var"] error:nil]);
-    
-    ASSERT([fm removeItemAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"] error:nil]);
-    ASSERT([fm createSymbolicLinkAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"]
-                    withDestinationPath:jbroot_path error:nil]);
-    
-    find_jbroot(YES); //refresh
-    
-    //jbrootPrefix() and jbrand_current() available now
+    NSString *oldPrimaryPath = find_jbroot(NO);
+    if (!oldPrimaryPath || RootHideJailbreakRootStateForPrimaryPath(oldPrimaryPath) != RootHideJailbreakRootStateReady) {
+        completion(RootHideRootError(@"Refusing to re-randomize an invalid RootHide randomized-root pair."));
+        return -1;
+    }
+    NSString *oldSecondaryPath = RootHideSecondaryJailbreakRootForPrimary(oldPrimaryPath);
+    NSString *newPrimaryPath = nil;
+    NSString *newSecondaryPath = nil;
+    for (NSUInteger attempt = 0; attempt < 16; attempt++) {
+        NSString *candidateName = [NSString stringWithFormat:@".jbroot-%016llX", jbrand_new()];
+        NSString *primaryCandidate = [RootHidePrimaryJailbreakRootDirectory stringByAppendingPathComponent:candidateName];
+        NSString *secondaryCandidate = [RootHideSecondaryJailbreakRootDirectory stringByAppendingPathComponent:candidateName];
+        if (!RootHidePathNodeExists(primaryCandidate) && !RootHidePathNodeExists(secondaryCandidate)) {
+            newPrimaryPath = primaryCandidate;
+            newSecondaryPath = secondaryCandidate;
+            break;
+        }
+    }
+    if (!newPrimaryPath) {
+        completion(RootHideRootError(@"Could not allocate an unused RootHide randomized-root name for re-randomization."));
+        return -1;
+    }
 
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSError *operationError = nil;
+    BOOL movedPrimary = NO;
+    BOOL movedSecondary = NO;
+    BOOL rewrotePrimaryPrivateVar = NO;
+    BOOL rewroteSecondaryRoot = NO;
+
+    if (![fileManager moveItemAtPath:oldPrimaryPath toPath:newPrimaryPath error:&operationError]) {
+        completion(operationError);
+        return -1;
+    }
+    movedPrimary = YES;
+
+    if (![fileManager moveItemAtPath:oldSecondaryPath toPath:newSecondaryPath error:&operationError]) {
+        goto rollback;
+    }
+    movedSecondary = YES;
+
+    if (!RootHideReplaceExpectedSymlink([newPrimaryPath stringByAppendingPathComponent:@"private/var"],
+                                        [oldSecondaryPath stringByAppendingPathComponent:@"var"],
+                                        [newSecondaryPath stringByAppendingPathComponent:@"var"],
+                                        &operationError)) {
+        goto rollback;
+    }
+    rewrotePrimaryPrivateVar = YES;
+
+    if (!RootHideReplaceExpectedSymlink([newSecondaryPath stringByAppendingPathComponent:@".jbroot"], oldPrimaryPath, newPrimaryPath, &operationError)) {
+        goto rollback;
+    }
+    rewroteSecondaryRoot = YES;
+
+    RootHideSetCachedJailbreakRoot(newPrimaryPath);
+    if (!find_jbroot(YES)) {
+        operationError = RootHideRootError(@"Re-randomized RootHide root failed paired-root validation.");
+        goto rollback;
+    }
+
+    // jbrootPrefix() and jbrand_current() are available again.
     return 0;
+
+rollback:
+    // Restore the old link destinations before moving either root back. Every
+    // replacement is guarded by its expected destination, so rollback cannot
+    // overwrite a path that changed outside this transaction.
+    if (rewroteSecondaryRoot) {
+        NSError *rollbackLinkError = nil;
+        if (!RootHideReplaceExpectedSymlink([newSecondaryPath stringByAppendingPathComponent:@".jbroot"], newPrimaryPath, oldPrimaryPath, &rollbackLinkError) && !operationError) {
+            operationError = rollbackLinkError;
+        }
+    }
+    if (rewrotePrimaryPrivateVar) {
+        NSError *rollbackLinkError = nil;
+        if (!RootHideReplaceExpectedSymlink([newPrimaryPath stringByAppendingPathComponent:@"private/var"],
+                                            [newSecondaryPath stringByAppendingPathComponent:@"var"],
+                                            [oldSecondaryPath stringByAppendingPathComponent:@"var"],
+                                            &rollbackLinkError) && !operationError) {
+            operationError = rollbackLinkError;
+        }
+    }
+    if (movedSecondary) {
+        NSError *rollbackMoveError = nil;
+        if (![fileManager moveItemAtPath:newSecondaryPath toPath:oldSecondaryPath error:&rollbackMoveError] && !operationError) {
+            operationError = rollbackMoveError;
+        }
+    }
+    if (movedPrimary) {
+        NSError *rollbackMoveError = nil;
+        if (![fileManager moveItemAtPath:newPrimaryPath toPath:oldPrimaryPath error:&rollbackMoveError] && !operationError) {
+            operationError = rollbackMoveError;
+        }
+    }
+    RootHideSetCachedJailbreakRoot(oldPrimaryPath);
+    if (!find_jbroot(YES) || RootHideJailbreakRootStateForPrimaryPath(oldPrimaryPath) != RootHideJailbreakRootStateReady) {
+        completion(RootHideRootError(@"RootHide re-randomization failed and rollback could not restore a valid randomized-root pair."));
+        return -1;
+    }
+    completion(operationError ?: RootHideRootError(@"RootHide re-randomization failed; the original randomized-root pair was restored."));
+    return -1;
 }
 
 -(int) doBootstrap:(void (^)(NSError *))completion {
-    
-    NSFileManager* fm = NSFileManager.defaultManager;
-    
-    int installedCount=0;
-    NSString* dirpath = @"/var/containers/Bundle/Application/";
-    NSArray *subItems = [fm contentsOfDirectoryAtPath:dirpath error:nil];
-    for (NSString *subItem in subItems)
-    {
-        if (!is_jbroot_name(subItem.UTF8String)) continue;
-        
-        NSString* jbroot_path = [dirpath stringByAppendingPathComponent:subItem];
-        
-        if([fm fileExistsAtPath:[jbroot_path stringByAppendingPathComponent:@"/.bootstrapped"]]
-           || [fm fileExistsAtPath:[jbroot_path stringByAppendingPathComponent:@"/.thebootstrapped"]]) {
-            completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : @"\n\n\n\nYour device has been bootstrapped through the roothide Bootstrap app, please uninject for all apps in the AppList of Bootstrap and unisntall it in the Settings of Bootstrap before jailbreaking with Dopamine.\n\n\n"}]);
-            return -1;
-        }
-
-        if([fm fileExistsAtPath:[jbroot_path stringByAppendingPathComponent:@"/.installed_dopamine"]]) {
-            installedCount++;
-            continue;
-        }
-
-
-        STRAPLOG("remove unknown/unfinished jbroot %@", subItem);
-
-        NSString* jbroot_secondary = [NSString stringWithFormat:@"/var/mobile/Containers/Shared/AppGroup/%@", subItem];
-        if([fm fileExistsAtPath:jbroot_secondary]) {
-            ASSERT([fm removeItemAtPath:jbroot_secondary error:nil]);
-        }
-        
-        ASSERT([fm removeItemAtPath:jbroot_path error:nil]);
-    }
-
-    if(installedCount > 1) {
-        completion([NSError errorWithDomain:bootstrapErrorDomain code:BootstrapErrorCodeFailedExtracting userInfo:@{NSLocalizedDescriptionKey : @"\n\nThere are multi jbroot in /var/containers/Bundle/Applicaton/\n\n\n"}]);
+    NSError *rootDiscoveryError = nil;
+    NSString *jbroot_path = RootHideDiscoverAndRecoverOwnedJailbreakRoot(&rootDiscoveryError);
+    if (rootDiscoveryError) {
+        completion(rootDiscoveryError);
         return -1;
     }
     
-    NSString* jbroot_path = find_jbroot(YES);
-    
     if(!jbroot_path) {
         STRAPLOG("device is not strapped...");
-        
-        jbroot_path = [NSString stringWithFormat:@"/var/containers/Bundle/Application/.jbroot-%016llX", jbrand_new()];
+
+        for (NSUInteger attempt = 0; attempt < 16; attempt++) {
+            NSString *candidateName = [NSString stringWithFormat:@".jbroot-%016llX", jbrand_new()];
+            NSString *primaryCandidate = [RootHidePrimaryJailbreakRootDirectory stringByAppendingPathComponent:candidateName];
+            NSString *secondaryCandidate = [RootHideSecondaryJailbreakRootDirectory stringByAppendingPathComponent:candidateName];
+            if (!RootHidePathNodeExists(primaryCandidate) && !RootHidePathNodeExists(secondaryCandidate)) {
+                jbroot_path = primaryCandidate;
+                break;
+            }
+        }
+        if (!jbroot_path) {
+            completion(RootHideRootError(@"Could not allocate an unused randomized RootHide root name."));
+            return -1;
+        }
         
         STRAPLOG("bootstrap @ %@", jbroot_path);
         
@@ -1139,8 +1523,6 @@ int getCFMajorVersion(void)
         
     } else {
         STRAPLOG("device is strapped: %@", jbroot_path);
-        
-        ASSERT([fm fileExistsAtPath:jbrootPrefix(@"/.installed_dopamine")]);
         
         STRAPLOG("Status: Rerandomize jbroot");
         
@@ -1254,7 +1636,11 @@ int getCFMajorVersion(void)
         [self patchBasebinDaemonPlists];
         [[NSFileManager defaultManager] removeItemAtPath:jbrootPrefix(@"/basebin/basebin.tc") error:nil];
 
-        [NSBundle.mainBundle.bundleIdentifier writeToFile:jbrootPrefix(@"/basebin/.AppIdentifier") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSError *identityError = RootHideWriteCurrentAppIdentifier(jbrootPrefix(@"/"));
+        if (identityError) {
+            completion(identityError);
+            return;
+        }
         
         JBFixMobilePermissions();
         
@@ -1425,31 +1811,34 @@ int getCFMajorVersion(void)
 
 - (NSError *)deleteBootstrap
 {
-    //jbrootPrefix() and jbrand_current() unavailable now
-    
-    NSError* error=nil;
-    NSFileManager* fm = NSFileManager.defaultManager;
-    
-    NSString* dirpath = @"/var/containers/Bundle/Application/";
-    for(NSString* item in [fm directoryContentsAtPath:dirpath])
-    {
-        if(is_jbroot_name(item.UTF8String)) {
-            STRAPLOG("remove %@ @ %@", item, dirpath);
-            if(![fm removeItemAtPath:[dirpath stringByAppendingPathComponent:item] error:&error])
-                return error;
-        }
+    // Never remove a directory just because it has a valid randomized-root
+    // spelling. Select exactly one owned pair, then remove only that pair.
+    NSError *discoveryError = nil;
+    NSString *primaryPath = RootHideFindOwnedJailbreakRoot(YES, &discoveryError);
+    if (discoveryError) {
+        return discoveryError;
     }
-    
-    dirpath = @"/var/mobile/Containers/Shared/AppGroup/";
-    for(NSString* item in [fm directoryContentsAtPath:dirpath])
-    {
-        if(is_jbroot_name(item.UTF8String)) {
-            STRAPLOG("remove %@ @ %@", item, dirpath);
-            if(![fm removeItemAtPath:[dirpath stringByAppendingPathComponent:item] error:&error])
-                return error;
-        }
+    if (!primaryPath) {
+        return nil;
     }
-    
+    if (RootHideJailbreakRootStateForPrimaryPath(primaryPath) == RootHideJailbreakRootStateRepairable) {
+        return RootHideRootError(@"Refusing to remove an owned RootHide root until its paired-root links are recovered and verified.");
+    }
+    if (RootHideJailbreakRootStateForPrimaryPath(primaryPath) != RootHideJailbreakRootStateReady) {
+        return RootHideRootError(@"Refusing to remove a RootHide root whose ownership contract is invalid.");
+    }
+
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSString *secondaryPath = RootHideSecondaryJailbreakRootForPrimary(primaryPath);
+    NSError *error = nil;
+    STRAPLOG("remove owned RootHide pair %@ and %@", primaryPath, secondaryPath);
+    if (![fileManager removeItemAtPath:primaryPath error:&error]) {
+        return error;
+    }
+    if (![fileManager removeItemAtPath:secondaryPath error:&error]) {
+        return error;
+    }
+    RootHideSetCachedJailbreakRoot(nil);
     return nil;
 }
 
@@ -1460,9 +1849,15 @@ int getCFMajorVersion(void)
 @implementation DOEnvironmentManager(roothide)
 - (void)locateJailbreakRoot
 {
-    if(gSystemInfo.jailbreakInfo.rootPath) free(gSystemInfo.jailbreakInfo.rootPath);
+    if(gSystemInfo.jailbreakInfo.rootPath) {
+        free(gSystemInfo.jailbreakInfo.rootPath);
+        gSystemInfo.jailbreakInfo.rootPath = NULL;
+    }
     
-    NSString* jbroot_path = find_jbroot(YES);
+    // A brand-new bootstrap is deliberately not marked installed until
+    // finalization. Its path is cached only by InstallBootstrap; normal process
+    // startup has no cache and therefore still requires complete ownership.
+    NSString *jbroot_path = find_jbroot(NO) ?: find_jbroot(YES);
     if(jbroot_path) {
         gSystemInfo.jailbreakInfo.rootPath = strdup(jbroot_path.fileSystemRepresentation);
         gSystemInfo.jailbreakInfo.jbrand = jbrand_current();

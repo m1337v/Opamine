@@ -6,6 +6,7 @@
 #include "primitives_IOSurface.h"
 #include "info.h"
 #include "translation.h"
+#include "util.h"
 #include "kcall_Fugu14.h"
 #include "kcall_arm64.h"
 #include <xpc/xpc.h>
@@ -20,25 +21,30 @@ int jbclient_initialize_primitives_internal(bool physrwPTE)
 		xpc_release(xSystemInfo);
 		uint64_t asidPtr = 0;
 		if (jbclient_root_get_physrw(physrwPTE, &asidPtr) == 0) {
+			int initResult = 0;
 			if (physrwPTE) {
-				libjailbreak_physrw_pte_init(true, asidPtr);
+				initResult = libjailbreak_physrw_pte_init(true, asidPtr);
 			}
 			else {
-				libjailbreak_physrw_init(true);
+				initResult = libjailbreak_physrw_init(true);
 			}
+			if (initResult != 0) return initResult;
 			libjailbreak_translation_init();
 			libjailbreak_IOSurface_primitives_init();
+			/* RootHide still has external boomerang/launchdhook users of this
+			 * compatibility primitive.  Retire it only with those callers. */
 			if (__builtin_available(iOS 16.0, *)) {
 				libjailbreak_kalloc_pt_init();
 			}
 			if (gPrimitives.kalloc_local) {
-#ifdef __arm64e__
-				if (jbinfo(usesPACBypass)) {
-					jbclient_get_fugu14_kcall();
+				if (host_is_arm64e()) {
+					if (jbinfo(usesPACBypass)) {
+						jbclient_get_fugu14_kcall();
+					}
 				}
-#else
-				arm64_kcall_init();
-#endif
+				else {
+					arm64_kcall_init();
+				}
 			}
 
 			return 0;

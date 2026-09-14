@@ -310,7 +310,7 @@
                 [specifiers addObject:removeJailbreakSwitchSpecifier];
             }
             
-            if (envManager.isJailbroken || (envManager.isInstalledThroughTrollStore && envManager.isBootstrapped)) {
+            if (envManager.isBootstrapped) {
                 PSSpecifier *actionsGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
                 actionsGroupSpecifier.name = DOLocalizedString(@"Section_Actions");
                 [specifiers addObject:actionsGroupSpecifier];
@@ -343,7 +343,11 @@
                     [reinstallPackageManagersSpecifier setProperty:@"reinstallPackageManagersPressed" forKey:@"action"];
                     [specifiers addObject:reinstallPackageManagersSpecifier];
                 }
-                if ((envManager.isJailbroken || envManager.isInstalledThroughTrollStore) && envManager.isBootstrapped) {
+                // A live jailbreak must be removed by the reboot/rejailbreak flow.
+                // Direct deletion is only supported for a TrollStore install while
+                // the environment is inactive; exposing it while jailbroken can
+                // leave a half-removed randomized RootHide root behind.
+                if (!envManager.isJailbroken && envManager.isInstalledThroughTrollStore && envManager.isBootstrapped) {
 /*
                     PSSpecifier *hideUnhideJailbreakSpecifier = [PSSpecifier preferenceSpecifierNamed:@"" target:self set:defSetter get:defGetter detail:nil cell:PSStaticTextCell edit:nil];
                     [hideUnhideJailbreakSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];

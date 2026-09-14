@@ -13,6 +13,7 @@
 #include <mach-o/dyld.h>
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
+#include <string.h>
 
 #include "../libjailbreak.h"
 #include "../codesign.h"
@@ -599,98 +600,384 @@ struct sysctl_oid {
 	int             oid_refcnt;
 };
 
-void oid_remove(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+static const size_t kRootHideMaximumSysctlOIDEntries = 4096;
+
+static bool oid_parent_contains(uint64_t parent, uint64_t target)
 {
+    if (!parent || !target) return false;
+
+    uint64_t pnext = UNSIGN_PTR(parent);
+    if (!pnext) return false;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
+        uint64_t current = kread64(pnext);
+        if (!current) return false;
+        if (current == target) return true;
+
+        if (current > UINT64_MAX - offsetof(struct sysctl_oid, oid_link.sle_next)) return false;
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+    return false;
+}
+
+static int oid_parent_occurrence_count(uint64_t parent, uint64_t target, size_t *countOut)
+{
+    if (!parent || !target || !countOut) return -1;
+
+    uint64_t pnext = UNSIGN_PTR(parent);
+    if (!pnext) return -1;
+    size_t count = 0;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
+        uint64_t current = kread64(pnext);
+        if (!current) {
+            *countOut = count;
+            return 0;
+        }
+        if (current == target) {
+            count++;
+        }
+        if (current > UINT64_MAX - offsetof(struct sysctl_oid, oid_link.sle_next)) return -2;
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+    return -3;
+}
+
+static int oid_remove(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    if (!oid_parent || !oid) return -1;
+
     JBLogDebug("oid_remove: %p %p \n", oid_parent, oid);
     uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
-    while(true) {
+    if (!pnext) return -1;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
         uint64_t current = kread64(pnext);
-        if(!current) break;
+        if (!current) return -2;
 
         struct sysctl_oid current_oid = {0};
-        kreadbuf(current, &current_oid, sizeof(current_oid));
+        if (kreadbuf(current, &current_oid, sizeof(current_oid)) != 0) return -3;
 
         char name[64]={0};
-        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        if (current_oid.oid_name) {
+            kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name) - 1);
+        }
         JBLogDebug("oid_remove: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
         
         if(current == (uint64_t)oid) {
             uint64_t next = (uint64_t)current_oid.oid_link.sle_next;
             JBLogDebug("oid_remove: found@%p remove %p next->%p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide, next-gSystemInfo.kernelConstant.slide);
-            kwrite64(pnext, next);
-            break;
+            return kwrite64(pnext, next);
         }
 
+        if (current > UINT64_MAX - offsetof(struct sysctl_oid, oid_link.sle_next)) return -4;
         pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
     }
+    return -5;
 }
-void oid_insert(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+
+// Remove every occurrence without changing the target record itself. Rollback
+// needs this stronger form because an earlier successful insert may have put a
+// record at a position selected by its temporarily swapped oid_number.
+static int oid_parent_remove_all(struct sysctl_oid_list *oid_parent, struct sysctl_oid *oid)
 {
+    if (!oid_parent || !oid) return -1;
+
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    if (!pnext) return -1;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
+        uint64_t current = kread64(pnext);
+        if (!current) return 0;
+
+        struct sysctl_oid currentOID = {0};
+        if (kreadbuf(current, &currentOID, sizeof(currentOID)) != 0) return -2;
+        if (current == (uint64_t)oid) {
+            int result = kwrite64(pnext, (uint64_t)currentOID.oid_link.sle_next);
+            if (result != 0) return result;
+            // pnext now points at the replacement entry, so do not advance.
+            continue;
+        }
+
+        if (current > UINT64_MAX - offsetof(struct sysctl_oid, oid_link.sle_next)) return -3;
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+    return -4;
+}
+
+static int oid_insert(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    if (!oid_parent || !oid) return -1;
+
     JBLogDebug("oid_insert: %p %p \n", oid_parent, oid);
 
     struct sysctl_oid insert_oid = {0};
-    kreadbuf((uint64_t)oid, &insert_oid, sizeof(insert_oid));
+    if (kreadbuf((uint64_t)oid, &insert_oid, sizeof(insert_oid)) != 0) return -2;
 
     uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
-    while(true) {
+    if (!pnext) return -3;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
         uint64_t current = kread64(pnext);
         if(!current) {
             JBLogDebug("oid_insert: insert at end %p\n", pnext-gSystemInfo.kernelConstant.slide);
-            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), 0);
-            kwrite64(pnext, (uint64_t)oid);
-            break;
+            int result = kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), 0);
+            if (result != 0) return result;
+            return kwrite64(pnext, (uint64_t)oid);
         }
 
         struct sysctl_oid current_oid = {0};
-        kreadbuf(current, &current_oid, sizeof(current_oid));
+        if (kreadbuf(current, &current_oid, sizeof(current_oid)) != 0) return -4;
 
         char name[64]={0};
-        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        if (current_oid.oid_name) {
+            kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name) - 1);
+        }
         JBLogDebug("oid_insert: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
         
         if(insert_oid.oid_number < current_oid.oid_number) {
             JBLogDebug("oid_insert: insert@%p before %p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide);
-            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), current);
-            kwrite64(pnext, (uint64_t)oid);
-            break;
+            int result = kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), current);
+            if (result != 0) return result;
+            return kwrite64(pnext, (uint64_t)oid);
         }
 
+        if (current > UINT64_MAX - offsetof(struct sysctl_oid, oid_link.sle_next)) return -5;
         pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
     }
+    return -6;
 }
 
-void hideDeveloperMode()
+static int oid_rollback_records(struct sysctl_oid_list *oid_parent,
+                                uint64_t developerModeStatusAddress,
+                                const struct sysctl_oid *developerModeStatusSnapshot,
+                                uint64_t launchEnvLoggingAddress,
+                                const struct sysctl_oid *launchEnvLoggingSnapshot)
 {
-    uint64_t developer_mode_status_oidp = ksymbol(developer_mode_status)-offsetof(struct sysctl_oid,oid_name);
-    uint64_t launch_env_logging_oidp = ksymbol(launch_env_logging)-offsetof(struct sysctl_oid,oid_name);
+    int rollbackResult = 0;
+    int result = oid_parent_remove_all(oid_parent, (struct sysctl_oid *)developerModeStatusAddress);
+    if (result != 0) rollbackResult = result;
+    result = oid_parent_remove_all(oid_parent, (struct sysctl_oid *)launchEnvLoggingAddress);
+    if (result != 0 && rollbackResult == 0) rollbackResult = result;
+
+    // A failed clear leaves record linkage unknown. Do not overwrite a live
+    // record's link field in that condition; launchd will fail closed instead.
+    if (rollbackResult != 0) return rollbackResult;
+
+    // Restore the whole snapshots only while neither record is linked, then
+    // reinsert by their original oid_numbers to recover the original order.
+    result = kwritebuf(developerModeStatusAddress, developerModeStatusSnapshot, sizeof(*developerModeStatusSnapshot));
+    if (result != 0) rollbackResult = result;
+    result = kwritebuf(launchEnvLoggingAddress, launchEnvLoggingSnapshot, sizeof(*launchEnvLoggingSnapshot));
+    if (result != 0 && rollbackResult == 0) rollbackResult = result;
+
+    // Do not use a partially restored record to repair list membership.
+    if (rollbackResult != 0) return rollbackResult;
+
+    result = oid_insert(oid_parent, (struct sysctl_oid *)developerModeStatusAddress);
+    if (result != 0) rollbackResult = result;
+    result = oid_insert(oid_parent, (struct sysctl_oid *)launchEnvLoggingAddress);
+    if (result != 0 && rollbackResult == 0) rollbackResult = result;
+
+    size_t developerCount = 0, launchCount = 0;
+    result = oid_parent_occurrence_count((uint64_t)oid_parent, developerModeStatusAddress, &developerCount);
+    if (result != 0 && rollbackResult == 0) rollbackResult = result;
+    result = oid_parent_occurrence_count((uint64_t)oid_parent, launchEnvLoggingAddress, &launchCount);
+    if (result != 0 && rollbackResult == 0) rollbackResult = result;
+    if ((developerCount != 1 || launchCount != 1) && rollbackResult == 0) rollbackResult = -1;
+
+    return rollbackResult;
+}
+
+static bool oid_record_has_expected_name(const struct sysctl_oid *record, const char *expectedName)
+{
+    if (!record || !record->oid_name || !expectedName) return false;
+
+    char actualName[64] = { 0 };
+    return kreadbuf((uint64_t)record->oid_name, actualName, sizeof(actualName) - 1) == 0 &&
+           strcmp(actualName, expectedName) == 0;
+}
+
+static bool oid_record_is_sane(const struct sysctl_oid *record)
+{
+    return record && record->oid_parent && record->oid_number > 0 &&
+           record->oid_kind != 0 && (record->oid_kind & 0xf) != 0 &&
+           record->oid_name && record->oid_handler && record->oid_fmt && record->oid_descr;
+}
+
+static int oid_parent_read_verified_node(uint64_t parentAddress, uint64_t nodeAddress, struct sysctl_oid *nodeOut)
+{
+    if (!parentAddress || !nodeAddress || !nodeOut) return -1;
+    if (kreadbuf(nodeAddress, nodeOut, sizeof(*nodeOut)) != 0) return -2;
+    if (UNSIGN_PTR((uint64_t)nodeOut->oid_parent) != parentAddress) return -3;
+    return 0;
+}
+
+static int oid_parent_verify_no_cycle(uint64_t parentAddress)
+{
+    if (!parentAddress) return -1;
+
+    uint64_t slow = kread64(parentAddress);
+    uint64_t fast = slow;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
+        if (!slow || !fast) return 0;
+
+        struct sysctl_oid slowOID = {0};
+        int result = oid_parent_read_verified_node(parentAddress, slow, &slowOID);
+        if (result != 0) return result;
+        slow = (uint64_t)slowOID.oid_link.sle_next;
+
+        struct sysctl_oid fastOID = {0};
+        result = oid_parent_read_verified_node(parentAddress, fast, &fastOID);
+        if (result != 0) return result;
+        fast = (uint64_t)fastOID.oid_link.sle_next;
+        if (!fast) return 0;
+
+        result = oid_parent_read_verified_node(parentAddress, fast, &fastOID);
+        if (result != 0) return result;
+        fast = (uint64_t)fastOID.oid_link.sle_next;
+        if (slow && slow == fast) return -4;
+    }
+
+    // A repeated node in a singly linked list is a cycle. Reaching the strict
+    // bound without a terminator is therefore also unsafe.
+    return -5;
+}
+
+// This is deliberately read-only. It is the post-commit guard for the two
+// AMFI OIDs: exact-one target membership, sorted order, parent/link integrity,
+// and a bounded cycle check must all hold before hideDeveloperMode succeeds.
+static int oid_parent_verify_integrity(struct sysctl_oid_list *oidParent,
+                                       uint64_t developerModeStatusAddress,
+                                       uint64_t launchEnvLoggingAddress)
+{
+    if (!oidParent || !developerModeStatusAddress || !launchEnvLoggingAddress ||
+        developerModeStatusAddress == launchEnvLoggingAddress) return -1;
+
+    uint64_t parentAddress = UNSIGN_PTR((uint64_t)oidParent);
+    if (!parentAddress) return -1;
+
+    int result = oid_parent_verify_no_cycle(parentAddress);
+    if (result != 0) return result;
+
+    uint64_t current = kread64(parentAddress);
+    int previousNumber = 0;
+    bool hasPreviousNumber = false;
+    size_t developerCount = 0;
+    size_t launchCount = 0;
+    for (size_t index = 0; index < kRootHideMaximumSysctlOIDEntries; index++) {
+        if (!current) {
+            return developerCount == 1 && launchCount == 1 ? 0 : -6;
+        }
+
+        struct sysctl_oid currentOID = {0};
+        result = oid_parent_read_verified_node(parentAddress, current, &currentOID);
+        if (result != 0) return result;
+        if (hasPreviousNumber && currentOID.oid_number < previousNumber) return -7;
+        previousNumber = currentOID.oid_number;
+        hasPreviousNumber = true;
+
+        if (current == developerModeStatusAddress) {
+            if (++developerCount > 1) return -8;
+        }
+        else if (current == launchEnvLoggingAddress) {
+            if (++launchCount > 1) return -8;
+        }
+
+        current = (uint64_t)currentOID.oid_link.sle_next;
+    }
+
+    return -9;
+}
+
+int hideDeveloperMode(void)
+{
+    const uint64_t oidNameOffset = offsetof(struct sysctl_oid, oid_name);
+    const uint64_t developerModeStatusNameField = ksymbol(developer_mode_status);
+    const uint64_t launchEnvLoggingNameField = ksymbol(launch_env_logging);
+    if (developerModeStatusNameField <= oidNameOffset ||
+        launchEnvLoggingNameField <= oidNameOffset ||
+        developerModeStatusNameField == launchEnvLoggingNameField) {
+        return -1;
+    }
+
+    uint64_t developer_mode_status_oidp = developerModeStatusNameField - oidNameOffset;
+    uint64_t launch_env_logging_oidp = launchEnvLoggingNameField - oidNameOffset;
+    if (!developer_mode_status_oidp || !launch_env_logging_oidp ||
+        developer_mode_status_oidp == launch_env_logging_oidp) {
+        return -1;
+    }
 
     struct sysctl_oid developer_mode_status={0};
-    kreadbuf(developer_mode_status_oidp, &developer_mode_status, sizeof(developer_mode_status));
+    if (kreadbuf(developer_mode_status_oidp, &developer_mode_status, sizeof(developer_mode_status)) != 0) {
+        return -2;
+    }
 
     struct sysctl_oid launch_env_logging={0};
-    kreadbuf(launch_env_logging_oidp, &launch_env_logging, sizeof(launch_env_logging));
+    if (kreadbuf(launch_env_logging_oidp, &launch_env_logging, sizeof(launch_env_logging)) != 0) {
+        return -2;
+    }
 
-    //detach
-    oid_remove(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
-    oid_remove(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
+    uint64_t developerParent = UNSIGN_PTR((uint64_t)developer_mode_status.oid_parent);
+    uint64_t launchParent = UNSIGN_PTR((uint64_t)launch_env_logging.oid_parent);
+    if (!oid_record_is_sane(&developer_mode_status) ||
+        !oid_record_is_sane(&launch_env_logging) ||
+        developerParent == 0 || developerParent != launchParent ||
+        developer_mode_status.oid_number == launch_env_logging.oid_number ||
+        !oid_record_has_expected_name(&developer_mode_status, "developer_mode_status") ||
+        !oid_record_has_expected_name(&launch_env_logging, "launch_env_logging") ||
+        !oid_parent_contains(developerParent, developer_mode_status_oidp) ||
+        !oid_parent_contains(developerParent, launch_env_logging_oidp)) {
+        // Every check above is read-only. Never alter the sysctl list when the
+        // XPF AMFI contract does not describe the exact record pair in memory.
+        return -3;
+    }
+
+    size_t developerModeStatusCount = 0;
+    size_t launchEnvLoggingCount = 0;
+    if (oid_parent_occurrence_count(developerParent, developer_mode_status_oidp, &developerModeStatusCount) != 0 ||
+        oid_parent_occurrence_count(developerParent, launch_env_logging_oidp, &launchEnvLoggingCount) != 0 ||
+        developerModeStatusCount != 1 || launchEnvLoggingCount != 1) {
+        return -3;
+    }
+
+    struct sysctl_oid_list *oidParent = (struct sysctl_oid_list *)developerParent;
+    int result = oid_remove(oidParent, (struct sysctl_oid*)developer_mode_status_oidp);
+    if (result != 0) goto rollback;
+    result = oid_remove(oidParent, (struct sysctl_oid*)launch_env_logging_oidp);
+    if (result != 0) goto rollback;
 
     //reorder
-    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)launch_env_logging.oid_number);
-    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)developer_mode_status.oid_number);
+    if ((result = kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)launch_env_logging.oid_number)) != 0) goto rollback;
+    if ((result = kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)developer_mode_status.oid_number)) != 0) goto rollback;
 
     //exchange data
-    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)launch_env_logging.oid_name);
-    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)developer_mode_status.oid_name);
+    if ((result = kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)launch_env_logging.oid_name)) != 0) goto rollback;
+    if ((result = kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)developer_mode_status.oid_name)) != 0) goto rollback;
 
-    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)launch_env_logging.oid_descr);
-    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)developer_mode_status.oid_descr);
+    if ((result = kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)launch_env_logging.oid_descr)) != 0) goto rollback;
+    if ((result = kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)developer_mode_status.oid_descr)) != 0) goto rollback;
 
-    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)launch_env_logging.oid_kind);
-    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)developer_mode_status.oid_kind);
+    if ((result = kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)launch_env_logging.oid_kind)) != 0) goto rollback;
+    if ((result = kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)developer_mode_status.oid_kind)) != 0) goto rollback;
 
     //attach
-    oid_insert(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
-    oid_insert(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
+    result = oid_insert(oidParent, (struct sysctl_oid*)developer_mode_status_oidp);
+    if (result != 0) goto rollback;
+    result = oid_insert(oidParent, (struct sysctl_oid*)launch_env_logging_oidp);
+    if (result != 0) goto rollback;
+    result = oid_parent_verify_integrity(oidParent, developer_mode_status_oidp, launch_env_logging_oidp);
+    if (result != 0) goto rollback;
+    return 0;
+
+rollback:
+    {
+        int rollbackResult = oid_rollback_records(oidParent,
+                                                  developer_mode_status_oidp, &developer_mode_status,
+                                                  launch_env_logging_oidp, &launch_env_logging);
+        if (rollbackResult != 0) {
+            JBLogError("hideDeveloperMode failed: %d; rollback also failed: %d", result, rollbackResult);
+        }
+        else {
+            JBLogError("hideDeveloperMode failed: %d; restored original AMFI OID records", result);
+        }
+    }
+    return result;
 }
 
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath)

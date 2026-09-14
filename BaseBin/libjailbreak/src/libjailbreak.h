@@ -3,7 +3,10 @@
 #include "kernel.h"
 #include "util.h"
 #include "translation.h"
+#include "signatures.h"
 #include "trustcache.h"
+#include "trustcache_fs.h"
+#include "txm.h"
 #include "jbclient_xpc.h"
 
 #include "roothider.h"

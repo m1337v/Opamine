@@ -5,10 +5,45 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreServices/LSApplicationProxy.h>
+#import <errno.h>
+#import <limits.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <unistd.h>
 
 int reboot3(uint64_t flags, ...);
 #define RB2_USERREBOOT (0x2000000000000000llu)
 extern char **environ;
+
+static int wait_for_root_cleanup_if_requested(int argc, char *argv[], int *commandArgc)
+{
+	*commandArgc = argc;
+	if (argc < 4 || strcmp(argv[argc - 2], "--waitfor") != 0) {
+		return 0;
+	}
+
+	char *end = NULL;
+	errno = 0;
+	long parsedFD = strtol(argv[argc - 1], &end, 10);
+	if (errno != 0 || !end || *end != '\0' || parsedFD < 3 || parsedFD > INT_MAX) {
+		return EINVAL;
+	}
+
+	char signal = 0;
+	ssize_t bytesRead;
+	do {
+		bytesRead = read((int)parsedFD, &signal, sizeof(signal));
+	} while (bytesRead == -1 && errno == EINTR);
+	close((int)parsedFD);
+
+	if (bytesRead != sizeof(signal)) {
+		return bytesRead == 0 ? EPIPE : errno;
+	}
+
+	// Keep the private synchronization arguments out of the command parser.
+	*commandArgc -= 2;
+	return 0;
+}
 
 void print_usage(void)
 {
@@ -47,6 +82,13 @@ int main(int argc, char* argv[])
 		// When jailbroken the Dopamine app cannot have uid 0 because it can't drop it anymore without loosing it
 		// So in some cases (e.g. for spawning dpkg) we need to use jbctl to get it
 		setuid(0);
+	}
+
+	int commandArgc = argc;
+	int waitResult = wait_for_root_cleanup_if_requested(argc, argv, &commandArgc);
+	if (waitResult != 0) {
+		fprintf(stderr, "jbctl: root-helper synchronization failed: %d\n", waitResult);
+		return waitResult;
 	}
 
 	const char *rootPath = jbclient_get_jbroot();
@@ -143,11 +185,14 @@ int main(int argc, char* argv[])
 			
 		}
 	}
+	else if (!strcmp(cmd, "respring")) {
+		return exec_cmd(JBROOT_PATH("/usr/bin/sbreload"), NULL);
+	}
 	else if (!strcmp(cmd, "reboot_userspace")) {
 		return reboot3(RB2_USERREBOOT);
 	}
 	else if (!strcmp(cmd, "update")) {
-		if (argc < 4) {
+		if (commandArgc < 4) {
 			print_usage();
 			return 2;
 		}
@@ -200,10 +245,10 @@ int main(int argc, char* argv[])
 	}
 	else if (!strcmp(cmd, "internal")) {
 		if (getuid() != 0) return 41;
-		if (argc < 3) return 42;
+		if (commandArgc < 3) return 42;
 
 		const char *internalCmd = argv[2];
-		return jbctl_handle_internal(internalCmd, argc-2, &argv[2]);
+		return jbctl_handle_internal(internalCmd, commandArgc - 2, &argv[2]);
 	}
 
 	return 0;

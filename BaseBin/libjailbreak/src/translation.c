@@ -4,36 +4,106 @@
 #include "info.h"
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-struct tt_level {
-	uint64_t offMask;
-	uint64_t shift;
-	uint64_t indexMask;
-	uint64_t validMask;
-	uint64_t typeMask;
-	uint64_t typeBlock;
-};
 struct tt_level arm_tt_level[4];
 
 // Address translation physical <-> virtual
 
-#define PTOV_TABLE_SIZE 8
-uint64_t phystokv(uint64_t pa)
+uint64_t sptm_phystokv(uint64_t pa)
 {
-	struct ptov_table_entry {
-		uint64_t pa;
-		uint64_t va;
-		uint64_t len;
-	} ptov_table[PTOV_TABLE_SIZE];
-	kreadbuf(ksymbol(ptov_table), &ptov_table[0], sizeof(ptov_table));
+	if (!jbinfo_sptm_runtime_ready() || !ksymbol(libsptm_papt_ranges) ||
+	    !ksymbol(libsptm_n_papt_ranges)) {
+		errno = ENOTSUP;
+		return 0;
+	}
 
-	for (uint64_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
-		if ((pa >= ptov_table[i].pa) && (pa < (ptov_table[i].pa + ptov_table[i].len))) {
-			return pa - ptov_table[i].pa + ptov_table[i].va;
+	uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
+	uint64_t papt_table_n_ptr = kread64(ksymbol(libsptm_n_papt_ranges));
+	if (!papt_table || !papt_table_n_ptr) {
+		errno = EIO;
+		return 0;
+	}
+	uint32_t papt_table_n = kread32(papt_table_n_ptr);
+	/* Kernel-controlled metadata must never turn into an unbounded VLA. */
+	if (papt_table_n == 0 || papt_table_n > 4096) {
+		errno = EOVERFLOW;
+		return 0;
+	}
+
+	struct sptm_papt_entry {
+		uint64_t paddr_start;
+		uint64_t papt_start;
+		uint64_t num_mappings;
+	};
+	struct sptm_papt_entry *sptm_papt_table = calloc(papt_table_n, sizeof(*sptm_papt_table));
+	if (!sptm_papt_table) {
+		errno = ENOMEM;
+		return 0;
+	}
+
+	if (kreadbuf(papt_table, sptm_papt_table, papt_table_n * sizeof(*sptm_papt_table)) != 0) {
+		free(sptm_papt_table);
+		errno = EIO;
+		return 0;
+	}
+
+	if (vm_real_kernel_page_size == 0) {
+		free(sptm_papt_table);
+		errno = ENOTSUP;
+		return 0;
+	}
+	for (uint64_t i = 0; i < papt_table_n; i++) {
+		struct sptm_papt_entry *curEntry = &sptm_papt_table[i];
+
+		if (curEntry->num_mappings > UINT64_MAX / vm_real_kernel_page_size) continue;
+		uint64_t len = curEntry->num_mappings * vm_real_kernel_page_size;
+		if (len != 0 && curEntry->paddr_start <= UINT64_MAX - len &&
+		    pa >= curEntry->paddr_start && pa < curEntry->paddr_start + len) {
+			uint64_t result = pa - curEntry->paddr_start + curEntry->papt_start;
+			free(sptm_papt_table);
+			return result;
 		}
 	}
 
-	return pa - kconstant(physBase) + kconstant(virtBase);
+	free(sptm_papt_table);
+	errno = ENXIO;
+	return 0;
+}
+
+#define PTOV_TABLE_SIZE 8
+uint64_t phystokv(uint64_t pa)
+{
+	if (ksymbol(ptov_table)) {
+		struct ptov_table_entry {
+			uint64_t pa;
+			uint64_t va;
+			uint64_t len;
+		} ptov_table[PTOV_TABLE_SIZE];
+		if (kreadbuf(ksymbol(ptov_table), &ptov_table[0], sizeof(ptov_table)) != 0) {
+			errno = EIO;
+			return 0;
+		}
+
+		for (uint64_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
+			if ((pa >= ptov_table[i].pa) && (pa < (ptov_table[i].pa + ptov_table[i].len))) {
+				return pa - ptov_table[i].pa + ptov_table[i].va;
+			}
+		}
+
+		if (kconstant(physSize) == 0 || pa < kconstant(physBase) ||
+		    pa - kconstant(physBase) >= kconstant(physSize)) {
+			errno = ENXIO;
+			return 0;
+		}
+		return pa - kconstant(physBase) + kconstant(virtBase);
+	}
+	else if (jbinfo_sptm_runtime_ready() && ksymbol(libsptm_papt_ranges)) {
+		return sptm_phystokv(pa);
+	}
+
+	errno = ENOTSUP;
+	return 0;
 }
 
 uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint64_t *leaf_tte_ttep)

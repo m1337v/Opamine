@@ -12,6 +12,7 @@
 #include <libjailbreak/primitives.h>
 #include <libjailbreak/codesign.h>
 
+#include <errno.h>
 #include <signal.h>
 #include <libjailbreak/roothider.h>
 
@@ -99,51 +100,218 @@ static int systemwide_get_boot_uuid(char **bootUUIDOut)
 	return 0;
 }
 
-CS_SuperBlob *siginfo_resolve_superblob(struct siginfo *siginfo, int pid, int fd)
+/*
+ * The signature transaction comes from Dopamine 3, but these checks and the
+ * jbrand rewrite are RootHide policy.  Keep them at the launchdhook boundary:
+ * trust_signatures deliberately knows nothing about a randomized root or the
+ * removable-app allowlist.
+ */
+static bool systemwide_root_hide_allows_trust_path(const char *path)
 {
-	if (!siginfo) return NULL;
-	if (siginfo->signature.fs_blob_size == 0) return NULL;
+	if (!path || path[0] == '\0') return false;
+	if (string_has_prefix(path, "/private/preboot/Cryptexes/")) {
+		JBLogDebug("Skipping Cryptexes file: %s", path);
+		return false;
+	}
+	if (isRemovableBundlePath(path) && !hasTrollstoreLiteMarker(path)) {
+		JBLogDebug("Ignoring adhoc-signed removable app: %s", path);
+		return false;
+	}
+	return true;
+}
 
-	size_t superblobSize = siginfo->signature.fs_blob_size;
-	CS_SuperBlob *superblob = malloc(superblobSize);
-	if (!superblob) return NULL;
-
-	bool success = false;
-
-	switch (siginfo->source) {
-		case SIGNATURE_SOURCE_FILE: {
-			uintptr_t superblobStart = siginfo->signature.fs_file_start + (uintptr_t)siginfo->signature.fs_blob_start;
-			uintptr_t superblobEnd   = superblobStart + superblobSize;
-			struct stat st = {};
-
-        	if (fstat(fd, &st) != 0) break;
-			if (superblobEnd > st.st_size) break;
-			if (lseek(fd, superblobStart, SEEK_SET) != superblobStart) break;
-			if (read(fd, superblob, superblobSize) != superblobSize) break;
-
-			success = true;
+static void systemwide_free_local_signatures(struct siginfo *sigInfos, uint32_t sigInfoCount)
+{
+	if (!sigInfos) return;
+	for (uint32_t i = 0; i < sigInfoCount; i++) {
+		if (sigInfos[i].source == SIGNATURE_SOURCE_ALLOCATION) {
+			free(sigInfos[i].signature.fs_blob_start);
 		}
-		case SIGNATURE_SOURCE_PROC: {
-			uint64_t proc = proc_find(pid);
+	}
+	free(sigInfos);
+}
 
-			if (!proc) break;
-			if (proc_vreadbuf(proc, siginfo->signature.fs_blob_start, superblob, superblobSize) != 0) break;
+static bool systemwide_siginfo_cdhash(const struct siginfo *siginfo, int pid, int fd, cdhash_t cdhashOut)
+{
+	CS_SuperBlob *superblob = siginfo_resolve_superblob(siginfo, pid, fd);
+	if (!superblob) return false;
+	bool result = code_signature_calculate_adhoc_cdhash(superblob, cdhashOut);
+	free(superblob);
+	return result;
+}
 
-			success = true;
+struct systemwide_root_hide_signature_candidate {
+	uint64_t fileStart;
+	cdhash_t cdhash;
+};
+
+/*
+ * Re-read signatures after RootHide has changed a slice's first section and
+ * CodeDirectory page hash.  Passing these local copies to trust_signatures is
+ * essential on SPTM devices: it may need to rewrite the CodeDirectory and
+ * F_ADDSIGS cannot safely mutate a FILE/PROC siginfo supplied by another
+ * process.  Matching both offset and final cdhash prevents an unrelated fat
+ * slice from entering the transaction.
+ */
+static int systemwide_collect_updated_signatures(
+	int fd,
+	const struct systemwide_root_hide_signature_candidate *candidates,
+	uint32_t candidateCount,
+	struct siginfo **sigInfosOut,
+	uint32_t *sigInfoCountOut)
+{
+	if (!sigInfosOut || !sigInfoCountOut || !candidates || candidateCount == 0) return -EINVAL;
+	*sigInfosOut = NULL;
+	*sigInfoCountOut = 0;
+	if ((size_t)candidateCount > SIZE_MAX / sizeof(struct siginfo)) return -EOVERFLOW;
+
+	struct siginfo *collected = NULL;
+	uint32_t collectedCount = 0;
+	file_collect_signatures(fd, &collected, &collectedCount);
+	if (!collected || collectedCount == 0) {
+		systemwide_free_local_signatures(collected, collectedCount);
+		return -EIO;
+	}
+
+	struct siginfo *selected = calloc(candidateCount, sizeof(*selected));
+	bool *matched = calloc(candidateCount, sizeof(*matched));
+	if (!selected || !matched) {
+		free(selected);
+		free(matched);
+		systemwide_free_local_signatures(collected, collectedCount);
+		return -ENOMEM;
+	}
+
+	for (uint32_t i = 0; i < collectedCount; i++) {
+		if (collected[i].source != SIGNATURE_SOURCE_ALLOCATION) continue;
+		for (uint32_t j = 0; j < candidateCount; j++) {
+			if (matched[j] || collected[i].signature.fs_file_start != candidates[j].fileStart) continue;
+			cdhash_t cdhash;
+			if (!systemwide_siginfo_cdhash(&collected[i], 1, fd, cdhash) ||
+				memcmp(cdhash, candidates[j].cdhash, sizeof(cdhash_t)) != 0) {
+				continue;
+			}
+			selected[j] = collected[i];
+			/* Ownership moves into selected[j]. */
+			collected[i].signature.fs_blob_start = NULL;
+			collected[i].signature.fs_blob_size = 0;
+			matched[j] = true;
+			break;
 		}
 	}
 
-	if (!success) {
-		free(superblob);
-		superblob = NULL;
+	int result = 0;
+	for (uint32_t i = 0; i < candidateCount; i++) {
+		if (!matched[i]) {
+			result = -EIO;
+			break;
+		}
+	}
+	free(matched);
+	systemwide_free_local_signatures(collected, collectedCount);
+	if (result != 0) {
+		systemwide_free_local_signatures(selected, candidateCount);
+		return result;
 	}
 
-	return superblob;
+	*sigInfosOut = selected;
+	*sigInfoCountOut = candidateCount;
+	return 0;
+}
+
+/* Preserve RootHide's no-siginfo flow: every mappable adhoc slice is jbrand
+ * randomized before its final cdhash is checked, then only those exact slices
+ * enter the Dopamine 3 signature transaction. */
+static int systemwide_prepare_root_hide_file_signatures(
+	int fd,
+	const char *path,
+	struct siginfo **sigInfosOut,
+	uint32_t *sigInfoCountOut)
+{
+	if (!path || !sigInfosOut || !sigInfoCountOut) return -EINVAL;
+	*sigInfosOut = NULL;
+	*sigInfoCountOut = 0;
+
+	struct siginfo *initial = NULL;
+	uint32_t initialCount = 0;
+	file_collect_signatures(fd, &initial, &initialCount);
+	if (initialCount == 0) {
+		systemwide_free_local_signatures(initial, initialCount);
+		return 0;
+	}
+	if (!initial || (size_t)initialCount > SIZE_MAX / sizeof(struct systemwide_root_hide_signature_candidate)) {
+		systemwide_free_local_signatures(initial, initialCount);
+		return -EIO;
+	}
+
+	struct systemwide_root_hide_signature_candidate *candidates = calloc(initialCount, sizeof(*candidates));
+	if (!candidates) {
+		systemwide_free_local_signatures(initial, initialCount);
+		return -ENOMEM;
+	}
+
+	uint32_t candidateCount = 0;
+	int result = 0;
+	for (uint32_t i = 0; i < initialCount; i++) {
+		cdhash_t initialCdhash;
+		if (!systemwide_siginfo_cdhash(&initial[i], 1, fd, initialCdhash)) continue;
+
+		cdhash_t randomizedCdhash;
+		if (ensure_randomized_cdhash_for_slice(path, initial[i].signature.fs_file_start, randomizedCdhash) != 0) {
+			JBLogError("Failed to ensure randomized cdhash for %s", path);
+			result = -EIO;
+			break;
+		}
+		if (is_cdhash_trustcached(randomizedCdhash)) continue;
+
+		candidates[candidateCount].fileStart = initial[i].signature.fs_file_start;
+		memcpy(candidates[candidateCount].cdhash, randomizedCdhash, sizeof(cdhash_t));
+		candidateCount++;
+	}
+	systemwide_free_local_signatures(initial, initialCount);
+	if (result == 0 && candidateCount > 0) {
+		result = systemwide_collect_updated_signatures(fd, candidates, candidateCount, sigInfosOut, sigInfoCountOut);
+	}
+	free(candidates);
+	return result;
+}
+
+/* A Mach siginfo has FILE/PROC storage owned by its sender.  Keep the old
+ * exact-slice policy, but turn the post-jbrand file signature into a local
+ * allocation so TXM fixes can attach it transactionally. */
+static int systemwide_prepare_root_hide_siginfo(
+	int pid,
+	int fd,
+	const char *path,
+	const struct siginfo *siginfo,
+	struct siginfo **sigInfosOut,
+	uint32_t *sigInfoCountOut)
+{
+	if (!path || !siginfo || !sigInfosOut || !sigInfoCountOut) return -EINVAL;
+	*sigInfosOut = NULL;
+	*sigInfoCountOut = 0;
+	if (siginfo->source != SIGNATURE_SOURCE_FILE && siginfo->source != SIGNATURE_SOURCE_PROC) return -EPERM;
+
+	cdhash_t initialCdhash;
+	if (!systemwide_siginfo_cdhash(siginfo, pid, fd, initialCdhash)) return 0;
+	/* This is intentionally before jbrand randomization to preserve the old
+	 * siginfo path's per-slice duplicate behaviour. */
+	if (is_cdhash_trustcached(initialCdhash)) return 0;
+
+	struct systemwide_root_hide_signature_candidate candidate = {
+		.fileStart = siginfo->signature.fs_file_start,
+	};
+	if (ensure_randomized_cdhash_for_slice(path, candidate.fileStart, candidate.cdhash) != 0) {
+		JBLogError("Failed to ensure randomized cdhash for %s", path);
+		return -EIO;
+	}
+	if (is_cdhash_trustcached(candidate.cdhash)) return 0;
+	return systemwide_collect_updated_signatures(fd, &candidate, 1, sigInfosOut, sigInfoCountOut);
 }
 
 int systemwide_trust_file(audit_token_t *processToken, int rfd, struct siginfo *siginfo, size_t siginfoSize)
 {
-	if (siginfo && siginfoSize != sizeof(struct siginfo)) return -1;
+	if (siginfo && siginfoSize != sizeof(struct siginfo)) return -EINVAL;
 
 	pid_t pid = -1;
 	int fd = -1;
@@ -160,7 +328,7 @@ int systemwide_trust_file(audit_token_t *processToken, int rfd, struct siginfo *
 		}
 	}
 
-	if (fd < 0) return -1;
+	if (fd < 0) return errno ? -errno : -EIO;
 
 	struct statfs fsb;
 	int fsr = fstatfs(fd, &fsb);
@@ -172,68 +340,40 @@ int systemwide_trust_file(audit_token_t *processToken, int rfd, struct siginfo *
 		}
 	}
 
-	cdhash_t *cdhashes = NULL;
-	uint32_t cdhashesCount = 0;
-
-	if (siginfo) {
-		// If we were passed a siginfo, get the cdhash of the superblob from the siginfo
-		CS_SuperBlob *superblob = siginfo_resolve_superblob(siginfo, pid, fd);
-		if (superblob) {
-			cdhash_t cdhash;
-			if (code_signature_calculate_adhoc_cdhash(superblob, cdhash)) {
-				if (!is_cdhash_trustcached(cdhash)) {
-
-
-/******************************************* roothide specfic ****************************************/
-do {
 	char filepath[PATH_MAX] = {0};
-	if(fcntl(fd, F_GETPATH, filepath) != 0) {
+	if (fcntl(fd, F_GETPATH, filepath) != 0) {
+		int result = errno ? -errno : -EIO;
 		JBLogError("Failed to get file path for fd %d", fd);
-		break;
+		close(fd);
+		return result;
 	}
-	if(string_has_prefix(filepath, "/private/preboot/Cryptexes/")) {
-		JBLogDebug("Skipping Cryptexes file: %s", filepath);
-		break;
-	}
-	if(isRemovableBundlePath(filepath) && !hasTrollstoreLiteMarker(filepath)) {
-		// ignore adhoc signed apps(removable system apps or other stuffs) which is not installed via tslite
-		JBLogDebug("ignoring addhoc signed app: %s\n", filepath);
-		break;
-	}
-	if(ensure_randomized_cdhash_for_slice(filepath, siginfo->signature.fs_file_start, cdhash) != 0) {
-		JBLogError("Failed to ensure randomized cdhash for %s", filepath);
-		break;
-	}
-/******************************************* roothide specfic ****************************************/
-
-
-					cdhashes = malloc(sizeof(cdhash_t));
-					cdhashesCount = 1;
-					memcpy(&cdhashes[0], &cdhash, sizeof(cdhash_t));
-
-
-/**********/
-} while(0);
-/********/
-
-
-				}
-			}
-			free(superblob);
-		}
-	}
-	else {
-		// If we weren't passed a siginfo, get cdhashes of all slices
-		file_collect_untrusted_cdhashes(fd, &cdhashes, &cdhashesCount);
-	}
-	
-	if (cdhashes && cdhashesCount > 0) {
-		jb_trustcache_add_cdhashes(cdhashes, cdhashesCount);
-		free(cdhashes);
+	if (!systemwide_root_hide_allows_trust_path(filepath)) {
+		close(fd);
+		return 0;
 	}
 
+	/* Never jbrand-mutate a file before discovering that the required SPTM/TXM
+	 * metadata was omitted by an old basebin/XPF startup. */
+	if (jbinfo_has_sptm_metadata() && !jbinfo_sptm_runtime_ready()) {
+		JBLogError("Refusing signature transaction with incomplete SPTM/TXM metadata");
+		close(fd);
+		return -ENOTSUP;
+	}
+
+	struct siginfo *sigInfos = NULL;
+	uint32_t sigInfoCount = 0;
+	int result = siginfo
+		? systemwide_prepare_root_hide_siginfo(pid, fd, filepath, siginfo, &sigInfos, &sigInfoCount)
+		: systemwide_prepare_root_hide_file_signatures(fd, filepath, &sigInfos, &sigInfoCount);
+	if (result == 0 && sigInfoCount > 0) {
+		/* trust_signatures attaches any TXM-rewritten local signatures before
+		 * publishing its final cdhashes, and deduplicates both the transaction
+		 * and the existing RootHide trust cache. */
+		result = trust_signatures(pid, fd, sigInfos, sigInfoCount);
+	}
+	systemwide_free_local_signatures(sigInfos, sigInfoCount);
 	close(fd);
-	return 0;
+	return result;
 }
 
 int systemwide_trust_file_by_path(const char *path)
@@ -426,26 +566,26 @@ int systemwide_fork_fix(audit_token_t *parentToken, uint64_t childPid)
 
 			uint64_t parentHeader   = parentVmMap + koffsetof(vm_map, hdr);
 			uint32_t parentNentries = kread32(parentHeader + koffsetof(vm_map_header, nentries));
-			uint64_t parentEntry    = kread_ptr(parentHeader + koffsetof(vm_map_header, links) + koffsetof(vm_map_links, next));
+			uint64_t parentEntry    = kread_ptr(parentHeader + koffsetof(vm_map_header, first));
 
 			uint64_t childHeader   = childVmMap + koffsetof(vm_map, hdr);
-			uint32_t childNentries = kread32(parentHeader + koffsetof(vm_map_header, nentries));
-			uint64_t childEntry    = kread_ptr(childHeader + koffsetof(vm_map_header, links) + koffsetof(vm_map_links, next));
+			uint32_t childNentries = kread32(childHeader + koffsetof(vm_map_header, nentries));
+			uint64_t childEntry    = kread_ptr(childHeader + koffsetof(vm_map_header, first));
 
 			uint64_t childFirstEntry = childEntry, parentFirstEntry = parentEntry;
 			uint32_t childIdx = 0, parentIdx = 0;
 			do {
-				uint64_t childStart  = kread_ptr(childEntry  + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, min));
-				uint64_t childEnd    = kread_ptr(childEntry  + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, max));
-				uint64_t parentStart = kread_ptr(parentEntry + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, min));
-				uint64_t parentEnd   = kread_ptr(parentEntry + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, max));
+				uint64_t childStart  = kread_ptr(childEntry  + koffsetof(vm_map_entry, start));
+				uint64_t childEnd    = kread_ptr(childEntry  + koffsetof(vm_map_entry, end));
+				uint64_t parentStart = kread_ptr(parentEntry + koffsetof(vm_map_entry, start));
+				uint64_t parentEnd   = kread_ptr(parentEntry + koffsetof(vm_map_entry, end));
 
 				if (parentStart < childStart) {
-					parentEntry = kread_ptr(parentEntry + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, next));
+					parentEntry = kread_ptr(parentEntry + koffsetof(vm_map_entry, next));
 					parentIdx++;
 				}
 				else if (parentStart > childStart) {
-					childEntry = kread_ptr(childEntry + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, next));
+					childEntry = kread_ptr(childEntry + koffsetof(vm_map_entry, next));
 					childIdx++;
 				}
 				else {
@@ -461,9 +601,9 @@ int systemwide_fork_fix(audit_token_t *parentToken, uint64_t childPid)
 						kwrite64(childEntry + koffsetof(vm_map_entry, flags), childFlags);
 					}
 
-					parentEntry = kread_ptr(parentEntry + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, next));
+					parentEntry = kread_ptr(parentEntry + koffsetof(vm_map_entry, next));
 					parentIdx++;
-					childEntry  = kread_ptr(childEntry  + koffsetof(vm_map_entry, links) + koffsetof(vm_map_links, next));
+					childEntry  = kread_ptr(childEntry  + koffsetof(vm_map_entry, next));
 					childIdx++;
 				}
 			} while (parentEntry != 0 && childEntry != 0 && parentEntry != parentFirstEntry && childEntry != childFirstEntry && parentIdx < parentNentries && childIdx < childNentries);

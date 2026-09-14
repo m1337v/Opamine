@@ -41,8 +41,12 @@ FOUNDATION_EXPORT NSString * const DORootHideInjectionModeBlacklistAllowlist;
 
 - (BOOL)isSupported;
 - (BOOL)isArm64e;
+- (BOOL)isSPTM;
 - (NSString *)versionSupportString;
+- (NSString *)activePrebootPath;
 - (NSString *)accessibleKernelPath;
+- (NSString *)accessibleSPTMPath;
+- (NSString *)accessibleTXMPath;
 - (void)locateJailbreakRoot;
 - (NSError *)ensureJailbreakRootExists;
 

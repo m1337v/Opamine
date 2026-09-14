@@ -19,6 +19,12 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)runWithError:(NSError **)errOut didRemoveJailbreak:(BOOL*)didRemove showLogs:(BOOL *)showLogs;
 - (void)finalize;
 
+// Some exploits require a PurpleGfxMem mapping before they can start. The
+// caller must apply the workaround before beginning exploitation when this is
+// true; a non-nil error means no surface port was preserved.
+- (BOOL)contiguousMappingWorkaroundNeeded;
+- (NSError * _Nullable)applyContiguousMappingWorkaround;
+
 @end
 
 NS_ASSUME_NONNULL_END

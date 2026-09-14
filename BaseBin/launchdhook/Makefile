@@ -12,3 +12,8 @@ $(TARGET): $(wildcard src/*.m src/*.c src/jbserver/*.c ../systemhook/src/common.
 
 clean:
 	@rm -f $(TARGET)
+
+test:
+	@PYTHONDONTWRITEBYTECODE=1 python3 tests/systemwide_trust_adapter_contract.py
+
+.PHONY: clean test

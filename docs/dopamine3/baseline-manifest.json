@@ -1,0 +1,353 @@
+{
+  "schema": "opamine.dopamine3.baseline.v1",
+  "captured_on": "2026-09-14",
+  "scope": "WP0 preservation baseline for the RootHide Opamine rhinject tree",
+  "target": {
+    "repository": "Resources/Opamine-rh-refresh",
+    "branch": "rhinject",
+    "head": "1b40dbdb17ff60e106d91ce87c0da249923aa31f",
+    "origin": "https://github.com/m1337v/Opamine.git",
+    "upstream": "https://github.com/roothide/Dopamine2-roothide.git",
+    "root_hide_baseline_ref": "upstream/v2.4.9.x",
+    "root_hide_merge_ref": "4b2902a",
+    "canonical_dopamine_release": "3.0.9",
+    "worktree_policy": "HEAD is the reproducible reference; unrelated in-progress worktree edits are reported but are not reverted"
+  },
+  "submodules": [
+    {
+      "path": "BaseBin/ChOma",
+      "url": "https://github.com/opa334/ChOma",
+      "gitlink": "b1a4f2debf2aff70edc2825c5cfbd05926d7fc18",
+      "checkout": "b1a4f2debf2aff70edc2825c5cfbd05926d7fc18"
+    },
+    {
+      "path": "BaseBin/XPF",
+      "url": "https://github.com/roothide/XPF",
+      "gitlink": "3fb4bb31a0900abfe6e8d88fc5b2df3b726b6722",
+      "checkout": "3fb4bb31a0900abfe6e8d88fc5b2df3b726b6722"
+    },
+    {
+      "path": "BaseBin/XPF/external/ChOma",
+      "url": "https://github.com/opa334/ChOma",
+      "gitlink": "b1a4f2debf2aff70edc2825c5cfbd05926d7fc18",
+      "checkout": "b1a4f2debf2aff70edc2825c5cfbd05926d7fc18"
+    },
+    {
+      "path": "BaseBin/_external/modules/litehook",
+      "url": "https://github.com/opa334/litehook",
+      "gitlink": "95863e1eb254cdf2e092c545e982f5c762c2a3e",
+      "checkout": "95863e1eb254cdf2e092c545e982f5c762c2a3e8"
+    },
+    {
+      "path": "BaseBin/opainject",
+      "url": "https://github.com/opa334/opainject",
+      "gitlink": "849bb296ea8bc0643a2966485ea3c3c96ebdcd5b",
+      "checkout": "849bb296ea8bc0643a2966485ea3c3c96ebdcd5b"
+    },
+    {
+      "path": "Application/Dopamine/Dopamine/Exploits/kfd/kfd",
+      "url": "https://github.com/opa334/kfd",
+      "state": "declared in .gitmodules but no gitlink exists at target HEAD; not an expected WP0 checkout"
+    }
+  ],
+  "host_toolchain": {
+    "host": "Darwin 24.6.0 arm64",
+    "xcode_select": "/Applications/Xcode.app/Contents/Developer",
+    "xcode": "16.4",
+    "xcode_build": "16F6",
+    "iphoneos_sdk": {
+      "version": "18.5",
+      "path": "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.5.sdk"
+    },
+    "macosx_sdk": {
+      "version": "15.5",
+      "path": "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk"
+    },
+    "clang": "Apple clang version 17.0.0 (clang-1700.0.13.5)",
+    "swift": "Apple Swift version 6.1.2 (swiftlang-6.1.2.1.2 clang-1700.0.13.5)",
+    "git": "2.39.5",
+    "make": "GNU Make 4.4.1",
+    "dpkg_deb": "1.23.7",
+    "zstd": "1.5.7",
+    "ldid": "2.1.5-procursus7"
+  },
+  "swiftpm_pins": [
+    {
+      "manifest": "Application/Dopamine.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+      "identity": "zstd",
+      "location": "https://github.com/facebook/zstd.git",
+      "branch": "dev",
+      "revision": "d79e72359582d2326c63e9669fe05c2f6580fec5"
+    },
+    {
+      "manifest": "BaseBin/MachOMerger/Package.resolved",
+      "identity": "patchfinderutils",
+      "location": "https://github.com/pinauten/PatchfinderUtils",
+      "branch": "master",
+      "revision": "83647509e12001e8f42b2a5dc46b40977e12098b"
+    },
+    {
+      "manifest": "BaseBin/MachOMerger/Package.resolved",
+      "identity": "swiftmacho",
+      "location": "https://github.com/pinauten/SwiftMachO",
+      "branch": "master",
+      "revision": "cbfb1886c14bfb28c54034b43e49807ab7c17f11"
+    },
+    {
+      "manifest": "BaseBin/MachOMerger/Package.resolved",
+      "identity": "swiftutils",
+      "location": "https://github.com/pinauten/SwiftUtils",
+      "branch": "master",
+      "revision": "1d37faabb4c58b3152394c9b6e1c1a68507646b9"
+    },
+    {
+      "manifest": "BaseBin/idownloadd/src/idownloadd.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+      "identity": "idownload",
+      "location": "https://github.com/pinauten/iDownload",
+      "branch": "master",
+      "revision": "62920e864f06af4b0a50a0aa9b6e0a7c7bd83a6f"
+    },
+    {
+      "manifest": "BaseBin/idownloadd/src/idownloadd.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+      "identity": "swiftutils",
+      "location": "https://github.com/pinauten/SwiftUtils",
+      "branch": "master",
+      "revision": "1d37faabb4c58b3152394c9b6e1c1a68507646b9"
+    }
+  ],
+  "packages": [
+    {
+      "package": "org.coolstar.sileo",
+      "architecture": "iphoneos-arm64e",
+      "source_version": "2.5.1-13",
+      "fork_version": "2.5.1-13+opamine1",
+      "source_url": "https://roothide.github.io/debfiles/org.coolstar.sileo_2.5.1-13_iphoneos-arm64e.deb",
+      "source_sha256": "b23e51371938bb6257ba82abdcdae9a6519755556b874b06672868c64843a0f6",
+      "embedded_path": "Application/Dopamine/Resources/sileo.deb",
+      "embedded_sha256": "a26532c514eec10f4cf002d602c7ddc9b2c7ca9ab14963d0296e5c6f89f85db6"
+    },
+    {
+      "package": "roothide",
+      "architecture": "iphoneos-arm64e",
+      "source_version": "0.1.0",
+      "fork_version": "0.1.0-0+opamine1",
+      "source_url": "https://roothide.github.io/procursus/pool/main/iphoneos-arm64e/1900/roothide/roothide_0.1.0_iphoneos-arm64e.deb",
+      "source_sha256": "06adc371ec37e7356762c875ca682bfb2f9b33a1100fb14168653b7e571ca670",
+      "embedded_path": "Application/Dopamine/Resources/roothide.deb",
+      "embedded_sha256": "6c2c521d33a668829e719f489676817b74d0c19e5f79065f6c9cf81b623810c1"
+    },
+    {
+      "package": "com.roothide.manager",
+      "architecture": "iphoneos-arm64e",
+      "version": "1.3.9",
+      "embedded_path": "Application/Dopamine/Resources/roothideapp.deb",
+      "embedded_sha256": "b8f075e1844709845962900b22fe71136a66369a2c35bb1201087f2fd9476b7d"
+    },
+    {
+      "package": "xyz.willy.zebra",
+      "architecture": "iphoneos-arm64e",
+      "version": "1.1.36-2-1+debug",
+      "embedded_path": "Application/Dopamine/Resources/zebra.deb",
+      "embedded_sha256": "ca82c18256e19ff78af3e53308d53f047a2d429cb7e025c892377abe4d2e7825"
+    },
+    {
+      "package": "dopamine-basebin-link",
+      "architecture": "iphoneos-arm64e",
+      "version": "1.0.0",
+      "control_path": "Packages/basebin-link/control",
+      "embedded_path": "Packages/basebin-link/basebin-link.deb",
+      "embedded_sha256": "4896375c095b333001db22f6f30990231b0f3c3c525720700ae29f592da953c4"
+    },
+    {
+      "package": "libkrw0-dopamine",
+      "architecture": "iphoneos-arm64e",
+      "version": "2.0.4",
+      "control_path": "Packages/libkrw-provider/control",
+      "embedded_path": "Packages/libkrw-provider/libkrw-dopamine.deb",
+      "embedded_sha256": "be52d798e24c65dc3d42631de1e4498ef77ce5750806e2fc60694aa74bc60f48"
+    },
+    {
+      "package": "libroot-dopamine",
+      "architecture": "iphoneos-arm64",
+      "version": "1.0.1",
+      "control_path": "Packages/libroot/control",
+      "embedded_path": "Packages/libroot/libroot.deb",
+      "embedded_sha256": "10dcaf46f39c3810c4f77e81d1f558be414b58d7aa5ec2b60865057d44e6a72f"
+    },
+    {
+      "package": "com.opa334.opainject",
+      "architecture": "iphoneos-arm",
+      "version": "1.0.6",
+      "control_path": "BaseBin/opainject/control"
+    },
+    {
+      "package": "com.roothide.dopamine.roothidehooks",
+      "architecture": "iphoneos-arm64e",
+      "version": "0.0.1",
+      "control_path": "BaseBin/roothidehooks/control"
+    }
+  ],
+  "app_metadata": {
+    "bundle_identifier": "com.opa334.Dopamine-roothide",
+    "marketing_version": "2.4.9",
+    "deployment_target": "15.0",
+    "entitlements_path": "Application/Dopamine/Dopamine.entitlements",
+    "entitlements_sha256": "b0659505fdece869b803c67dd734dd74e1ebb6256871e07f100136d03558027f",
+    "entitlements": {
+      "platform-application": true,
+      "proc_info-allow": true,
+      "com.apple.private.persona-mgmt": true,
+      "com.apple.private.security.no-sandbox": true,
+      "com.apple.private.security.storage-exempt.heritable": true,
+      "com.apple.private.security.storage.AppBundles": true,
+      "com.apple.security.network.client": true,
+      "com.apple.springboard.CFUserNotification": true,
+      "com.apple.springboard.launchapplications": true,
+      "com.apple.developer.kernel.extended-virtual-addressing": true,
+      "com.apple.developer.kernel.increased-memory-limit": true,
+      "com.apple.private.tcc.allow": ["kTCCServiceSystemPolicyAllFiles"],
+      "com.apple.private.mobileinstall.allowedSPI": ["InstallForLaunchServices", "Install", "UninstallForLaunchServices", "Uninstall", "UpdatePlaceholderMetadata"],
+      "com.apple.security.exception.iokit-user-client-class": ["AGXDevice", "AGXDeviceUserClient", "AGXSharedUserClient", "AGXGLContext", "AGXCommandQueue", "IOSurfaceRoot", "IOSurfaceRootUserClient", "AppleJPEGDriverUserClient", "H11ANEInDirectPathClient"]
+    }
+  },
+  "sileo_url_scheme_check": {
+    "package_path": "Application/Dopamine/Resources/sileo.deb",
+    "plist_in_archive": "Applications/Sileo.app/Info.plist",
+    "absent_keys": ["CFBundleURLTypes", "CFBundleURLSchemes"],
+    "allowed_query_scheme_observed": ["filza"],
+    "evidence": "dpkg-deb --fsys-tarfile ... | tar -xOf - ./Applications/Sileo.app/Info.plist | plutil -p - contains neither URL-registration key"
+  },
+  "invariants": {
+    "randomized_roots": {
+      "primary_template": "/var/containers/Bundle/Application/.jbroot-%016llX",
+      "secondary_template": "/var/mobile/Containers/Shared/AppGroup/.jbroot-%016llX",
+      "prefix": ".jbroot-",
+      "random_hex_digits": 16,
+      "checksum": "low byte equals XOR of bytes 1 through 7 of the uint64 value",
+      "primary_secondary_contract": "primary/private/var points to secondary/var; secondary/.jbroot points to primary; /var/jb is only a compatibility symlink",
+      "symbols": ["jbrand_new", "is_jbrand_value", "is_jbroot_name", "resolve_jbrand_value", "find_jbroot", "jbrand_current", "jbrootPrefix", "rootfsPrefix", "ReRandomizeBootstrap"]
+    },
+    "trustcache": {
+      "basebin_path_function": "randomizeAndLoadBasebinTrustcache",
+      "basebin_source": "JBROOT_PATH(\"/basebin/\")",
+      "uuid_constants": ["BASEBIN_TRUSTCACHE_UUID", "DYLD_TRUSTCACHE_UUID"],
+      "upload_function": "trustcache_file_upload_with_uuid",
+      "allocation_limit": "0x4000",
+      "packed_file_header_bytes": 24,
+      "packed_entry_bytes": 22,
+      "current_ignored_artifact": {
+        "path": "BaseBin/basebin.tc",
+        "version": 1,
+        "entry_count": 29,
+        "size_bytes": 662,
+        "sha256": "8b6b86c76f96c328bb739a66ecaebb1b5b75a0194eca5f5a45bd846e3c93eb53"
+      },
+      "known_wp1_delta": "The target HEAD has the historical same-size write expression; WP1 changes it to tcSize - ksizeof(trustcache) and must retain the 0x4000 allocation bound."
+    },
+    "policy": {
+      "mode_source": "BaseBin/libjailbreak/src/roothider/blacklist.m and BaseBin/systemhook/src/common.c",
+      "modes_in_order": ["stock", "blacklist", "whitelist", "hiddenwhitelist", "blacklistallowlist"],
+      "mode_plist": "/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist",
+      "lists": ["/var/mobile/Library/RootHide/pro.m1337.inject.plist", "/var/mobile/Library/RootHide/pro.m1337.inject.system.plist", "/var/mobile/Library/RootHide/pro.m1337.inject.wantsblacklist.plist", "/var/mobile/Library/RootHide/pro.m1337.uninject.plist"],
+      "coherence": "blacklist/allowlist, hidden injection, selected tweaks, caller-sensitive hiding, and launchd/systemhook mode handoff remain one policy"
+    },
+    "path_seams": ["/var/jb is compatibility-only", "internal paths use JBROOT_PATH", "RootHide Core and Sileo fork versions sort above repository versions", "arm64 and arm64e are declared by the RootHide Theos makefiles"]
+  },
+  "owned_paths": {
+    "RootHide_compatibility": [
+      "BaseBin/libjailbreak/src/jbroot.h",
+      "BaseBin/libjailbreak/src/jbclient_roothide.c",
+      "BaseBin/libjailbreak/src/roothider/**",
+      "BaseBin/launchdhook/src/roothider.m",
+      "BaseBin/launchdhook/src/jbserver/jbdomain_roothide.c",
+      "BaseBin/launchdhook/src/jbserver/jbdomain_watchdog.c",
+      "BaseBin/launchdhook/src/ipc_hook.c",
+      "BaseBin/roothidehooks/**",
+      "BaseBin/dyldhook/src/roothider.c",
+      "BaseBin/dyldhook/src/dyld_jbinfo.h",
+      "BaseBin/dyldhook/src/main.c",
+      "BaseBin/systemhook/src/common.c",
+      "BaseBin/systemhook/src/common.h",
+      "BaseBin/systemhook/src/roothider.h",
+      "BaseBin/systemhook/src/roothider_common.c",
+      "BaseBin/systemhook/src/roothider_main.c",
+      "BaseBin/systemhook/src/hidden_dylib_hider.c",
+      "BaseBin/systemhook/src/hider_*.c",
+      "BaseBin/systemhook/src/hider_*.h",
+      "BaseBin/systemhook/src/rhi_rebind.c",
+      "BaseBin/systemhook/src/rhi_rebind.h",
+      "BaseBin/forkfix/src/main.c",
+      "BaseBin/boomerang/src/main.c",
+      "BaseBin/boomerang/entitlements.plist",
+      "BaseBin/jailbreakd/src/main.m",
+      "BaseBin/jailbreakd/src/server.m",
+      "BaseBin/jbctl/src/main.m",
+      "BaseBin/jbctl/src/internal.m",
+      "BaseBin/bootstrapper/src/main.m",
+      "BaseBin/Makefile",
+      "BaseBin/systemhook/Makefile",
+      "BaseBin/launchdhook/Makefile",
+      "BaseBin/roothidehooks/Makefile",
+      "BaseBin/libjailbreak/Makefile",
+      "BaseBin/dyldhook/Makefile"
+    ],
+    "Opamine_product_and_pins": [
+      "Application/Dopamine/Jailbreak/DOBootstrapper.m",
+      "Application/Dopamine/Jailbreak/DOEnvironmentManager.m",
+      "Application/Dopamine/Jailbreak/DOJailbreaker.m",
+      "Application/Dopamine/Dopamine.entitlements",
+      "Application/Dopamine/Info.plist",
+      "Application/Dopamine.xcodeproj/project.pbxproj",
+      "Application/Makefile",
+      "Application/Dopamine/Resources/roothide.deb",
+      "Application/Dopamine/Resources/roothideapp.deb",
+      "Application/Dopamine/Resources/sileo.deb",
+      "Application/Dopamine/Resources/zebra.deb",
+      "Packages/**/control",
+      "Scripts/build-fork-packages.sh",
+      "FORK_PACKAGES.md"
+    ],
+    "characterization_inputs": [
+      "BaseBin/systemhook/tests/ownership.json",
+      "BaseBin/systemhook/tests/characterize.py",
+      "BaseBin/systemhook/tests/Makefile",
+      "BaseBin/libjailbreak/tests/characterize.py"
+    ]
+  },
+  "owned_symbols": [
+    {"name": "jbrand_new", "file": "Application/Dopamine/Jailbreak/DOBootstrapper.m", "role": "randomized-root generator"},
+    {"name": "is_jbrand_value", "file": "Application/Dopamine/Jailbreak/DOBootstrapper.m", "role": "checksum validator"},
+    {"name": "is_jbroot_name", "file": "Application/Dopamine/Jailbreak/DOBootstrapper.m", "role": "primary-root name validator"},
+    {"name": "find_jbroot", "file": "Application/Dopamine/Jailbreak/DOBootstrapper.m", "role": "primary-root discovery"},
+    {"name": "jbrootPrefix", "file": "Application/Dopamine/Jailbreak/DOBootstrapper.m", "role": "RootHide path translation"},
+    {"name": "ReRandomizeBootstrap", "file": "Application/Dopamine/Jailbreak/DOBootstrapper.m", "role": "paired primary/secondary root migration"},
+    {"name": "randomizeAndLoadBasebinTrustcache", "file": "BaseBin/libjailbreak/src/roothider/common.m", "role": "dynamic basebin cdhash randomization and trustcache upload"},
+    {"name": "ensure_randomized_cdhash", "file": "BaseBin/libjailbreak/src/roothider/recdhash.m", "role": "cdhash randomization"},
+    {"name": "trustcache_file_upload", "file": "BaseBin/libjailbreak/src/trustcache.c", "role": "bounded trustcache replacement/append"},
+    {"name": "trustcache_file_upload_with_uuid", "file": "BaseBin/libjailbreak/src/trustcache.c", "role": "stable RootHide trustcache identity"},
+    {"name": "root_hide_injection_mode", "file": "BaseBin/libjailbreak/src/roothider/blacklist.m", "role": "five-mode policy resolution"},
+    {"name": "isBlacklistedPath", "file": "BaseBin/libjailbreak/src/roothider/blacklist.m", "role": "caller/process hiding policy"},
+    {"name": "root_hide_injection_mode_is_hidden_whitelist", "file": "BaseBin/systemhook/src/common.c", "role": "hidden-whitelist mode bridge"},
+    {"name": "root_hide_injection_mode_is_blacklist_allowlist", "file": "BaseBin/systemhook/src/common.c", "role": "blacklist/allowlist mode bridge"},
+    {"name": "roothide_launchd___posix_spawn_prehook", "file": "BaseBin/launchdhook/src/roothider.m", "role": "launchd policy handoff"},
+    {"name": "roothide_launchd___posix_spawn_posthook", "file": "BaseBin/launchdhook/src/roothider.m", "role": "launchd post-spawn policy handoff"},
+    {"name": "roothide_launchd_trust_executable", "file": "BaseBin/launchdhook/src/roothider.m", "role": "RootHide executable trust"},
+    {"name": "__posix_spawn_hook", "file": "BaseBin/systemhook/src/main.c", "role": "systemhook child policy"},
+    {"name": "__execve_hook", "file": "BaseBin/systemhook/src/main.c", "role": "systemhook exec policy"},
+    {"name": "hidden_dylib_hider_init", "file": "BaseBin/systemhook/src/hidden_dylib_hider.c", "role": "hidden image and detector hider"},
+    {"name": "rhi_hider_identity_executable_ranges", "file": "BaseBin/systemhook/src/hider_identity.c", "role": "validated executable identity"},
+    {"name": "rhi_hider_caller_can_read_hidden", "file": "BaseBin/systemhook/src/hider_caller_policy.c", "role": "exact caller capability"},
+    {"name": "roothide_hidden_tweak_prepare_for_loader", "file": "BaseBin/systemhook/src/roothider_main.c", "role": "selected-tweak preparation"},
+    {"name": "roothide_hidden_tweak_load_selected", "file": "BaseBin/systemhook/src/roothider_main.c", "role": "selected-tweak loading"},
+    {"name": "dyldhook_init_roothide", "file": "BaseBin/dyldhook/src/roothider.c", "role": "RootHide dyld path setup"},
+    {"name": "jbclient_blacklist_check_pid", "file": "BaseBin/libjailbreak/src/jbclient_roothide.c", "role": "RootHide jbserver policy query"}
+  ],
+  "verification": {
+    "script": "Scripts/verify_dopamine3_baseline.sh",
+    "read_only": true,
+    "allowed_temporary_state": "mktemp files outside the repository; no checkout, submodule, package, or production-source mutation",
+    "existing_host_lane": "make -C BaseBin/systemhook/tests test",
+    "known_host_gap": "systemhook ownership lane reports dlsym caller-relative handle semantics as a medium production gap; no device support is claimed",
+    "device_gates_remaining": true
+  }
+}
