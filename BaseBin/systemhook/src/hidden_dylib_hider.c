@@ -876,6 +876,7 @@ bool hidden_dylib_hider_catalog_snapshot(rhi_hider_catalog_snapshot_t *snapshot_
 		image->identity = record->identity;
 		image->uuid_valid = record->uuid_valid;
 		image->main_executable = record->header == g_executable_header;
+		image->hidden = record->hidden;
 		memcpy(image->uuid, record->uuid, sizeof(image->uuid));
 		if (record->path) {
 			size_t length = strlen(record->path);
@@ -2214,6 +2215,317 @@ static void hider_dlsym_set_hidden_result_error(const char *symbol) {
 	g_dlsym_error_pending = true;
 }
 
+/* RTLD_SELF and RTLD_NEXT are specified relative to the caller of dlsym.
+ * Calling libdyld with either pseudo-handle from h_dlsym instead makes this
+ * wrapper the caller, which can both choose the wrong provider and leak a
+ * hidden image.  Resolve those two cases from the catalog's complete load
+ * order instead.  The catalog snapshot owns only opaque image identities:
+ * every loader operation below first pins and then revalidates that identity.
+ */
+#define RHI_DLSYM_RELATIVE_LOOKUP_ATTEMPTS 3U
+
+typedef enum {
+	HIDER_DLSYM_RELATIVE_UNAVAILABLE = 0,
+	HIDER_DLSYM_RELATIVE_UNAVAILABLE_CALLER_NAMESPACE,
+	HIDER_DLSYM_RELATIVE_UNAVAILABLE_RETRY_LIMIT,
+	HIDER_DLSYM_RELATIVE_FOUND,
+	HIDER_DLSYM_RELATIVE_NOT_FOUND,
+} hider_dlsym_relative_status_t;
+
+typedef struct {
+	hider_dlsym_relative_status_t status;
+	void                          *address;
+	bool                           hidden_provider;
+} hider_dlsym_relative_result_t;
+
+typedef enum {
+	HIDER_DLSYM_PIN_ACQUIRED = 0,
+	HIDER_DLSYM_PIN_RETRY,
+	HIDER_DLSYM_PIN_UNAVAILABLE,
+} hider_dlsym_pin_result_t;
+
+typedef enum {
+	HIDER_DLSYM_PROBE_FOUND = 0,
+	HIDER_DLSYM_PROBE_NOT_FOUND,
+	HIDER_DLSYM_PROBE_UNAVAILABLE,
+} hider_dlsym_probe_result_t;
+
+/* The snapshot is only a copied identity.  Do not dereference its header;
+ * compare every identity field under g_lock before and after each saved
+ * original loader call.  A removed/reloaded image at the same address cannot
+ * satisfy this check. */
+static bool hider_catalog_snapshot_image_is_current(
+	const rhi_hider_catalog_image_t *image, uint64_t generation) {
+	if (!image) {
+		return false;
+	}
+
+	os_unfair_lock_lock(&g_lock);
+	hider_image_record_t *record = hider_tracking_is_filtered_locked() &&
+		g_image_generation == generation
+		? catalog_find_active_locked(image->header, image->slide)
+		: NULL;
+	bool paths_match = record &&
+		((record->path == NULL && image->path == NULL) ||
+		 (record->path != NULL && image->path != NULL && strcmp(record->path, image->path) == 0));
+	bool current = record && record->identity == image->identity &&
+		paths_match &&
+		record->hidden == image->hidden &&
+		record->uuid_valid == image->uuid_valid &&
+		(record->header == g_executable_header) == image->main_executable &&
+		(!image->uuid_valid || memcmp(record->uuid, image->uuid, sizeof(image->uuid)) == 0);
+	os_unfair_lock_unlock(&g_lock);
+	return current;
+}
+
+static void hider_dlsym_drain_internal_loader_error(void) {
+	/* Each probe below is our bookkeeping, not an application-visible lookup.
+	 * Consume its libdyld error before returning to the caller. */
+	if (orig_dlerror) {
+		(void)orig_dlerror();
+	}
+}
+
+/* This helper intentionally has no g_lock held at either call site. */
+static hider_dlsym_pin_result_t hider_dlsym_pin_catalog_image(
+	const rhi_hider_catalog_image_t *image, uint64_t generation, void **handle_out) {
+	if (handle_out) {
+		*handle_out = NULL;
+	}
+	if (!image || !handle_out || !orig_dlopen || !orig_dlclose ||
+	    (!image->main_executable && (!image->path || !image->path[0]))) {
+		return HIDER_DLSYM_PIN_UNAVAILABLE;
+	}
+	if (!hider_catalog_snapshot_image_is_current(image, generation)) {
+		return HIDER_DLSYM_PIN_RETRY;
+	}
+
+#if !defined(RTLD_FIRST)
+	/* Do not guess the ABI flag.  Without RTLD_FIRST a per-image dlsym can walk
+	 * dependencies and violate RTLD_NEXT/SELF's first-provider semantics. */
+	return HIDER_DLSYM_PIN_UNAVAILABLE;
+#else
+	int mode = RTLD_LAZY | RTLD_FIRST;
+	if (!image->main_executable) {
+		mode |= RTLD_NOLOAD;
+	}
+	/* NULL is the only valid main-executable pin.  A non-main path is owned by
+	 * the snapshot and RTLD_NOLOAD guarantees that this cannot load a new image. */
+	void *handle = orig_dlopen(image->main_executable ? NULL : image->path, mode);
+	if (!handle) {
+		hider_dlsym_drain_internal_loader_error();
+		return HIDER_DLSYM_PIN_UNAVAILABLE;
+	}
+	if (!hider_catalog_snapshot_image_is_current(image, generation)) {
+		if (orig_dlclose(handle) != 0) {
+			hider_dlsym_drain_internal_loader_error();
+		}
+		return HIDER_DLSYM_PIN_RETRY;
+	}
+	*handle_out = handle;
+	return HIDER_DLSYM_PIN_ACQUIRED;
+#endif
+}
+
+static bool hider_dlsym_unpin_catalog_image(void *handle) {
+	if (!handle || !orig_dlclose) {
+		return false;
+	}
+	if (orig_dlclose(handle) != 0) {
+		hider_dlsym_drain_internal_loader_error();
+		return false;
+	}
+	return true;
+}
+
+/* A NULL dlsym result is not automatically an error: after first consuming
+ * the pre-probe state, dlerror()==NULL means a provider legitimately exported
+ * a NULL-valued symbol.  Keep that distinct from no provider and from an
+ * unavailable original-error API. */
+static hider_dlsym_probe_result_t hider_dlsym_probe_catalog_image(
+	void *handle, const char *symbol, void **address_out) {
+	if (address_out) {
+		*address_out = NULL;
+	}
+	if (!handle || !symbol || !orig_dlsym || !orig_dlerror || !address_out) {
+		return HIDER_DLSYM_PROBE_UNAVAILABLE;
+	}
+	hider_dlsym_drain_internal_loader_error();
+	void *address = orig_dlsym(handle, symbol);
+	char *error = orig_dlerror();
+	if (error) {
+		return HIDER_DLSYM_PROBE_NOT_FOUND;
+	}
+	*address_out = address;
+	return HIDER_DLSYM_PROBE_FOUND;
+}
+
+static int32_t hider_dlsym_find_caller_catalog_index(
+	const rhi_hider_catalog_snapshot_t *snapshot, const void *caller_return_address,
+	const struct mach_header **caller_header_out) {
+	if (caller_header_out) {
+		*caller_header_out = NULL;
+	}
+	if (!snapshot || !snapshot->images || !caller_return_address || !orig_dladdr) {
+		return -1;
+	}
+	Dl_info caller_info = {0};
+	if (orig_dladdr(caller_return_address, &caller_info) == 0 || !caller_info.dli_fbase) {
+		return -1;
+	}
+	const struct mach_header *caller_header =
+		(const struct mach_header *)caller_info.dli_fbase;
+	for (uint32_t index = 0; index < snapshot->count; index++) {
+		if (snapshot->images[index].header == caller_header) {
+			if (caller_header_out) {
+				*caller_header_out = caller_header;
+			}
+			return (int32_t)index;
+		}
+	}
+	return -1;
+}
+
+/* The catalog's linear walk is only equivalent to the loader's lookup order
+ * for a verified flat-namespace caller. A two-level Mach-O resolves imports
+ * through its dependency/static-linker graph, which the catalog deliberately
+ * does not reconstruct. Verify the mapped header before reading flags; an
+ * unprovable caller must remain on the explicit native-fallback path. */
+static bool hider_dlsym_caller_is_verified_flat(
+	const rhi_hider_catalog_snapshot_t *snapshot, int32_t caller_index,
+	const struct mach_header *caller_header) {
+	if (!snapshot || caller_index < 0 || (uint32_t)caller_index >= snapshot->count ||
+		!caller_header || snapshot->images[caller_index].header != caller_header ||
+		!hider_catalog_snapshot_image_is_current(&snapshot->images[caller_index],
+		                                          snapshot->generation)) {
+		return false;
+	}
+	uintptr_t text_start = 0;
+	uintptr_t text_end = 0;
+	if (!rhi_hider_identity_image_text_range(caller_header,
+	                                         snapshot->images[caller_index].slide,
+	                                         &text_start, &text_end)) {
+		return false;
+	}
+	const struct mach_header_64 *header64 = (const struct mach_header_64 *)caller_header;
+	return (header64->flags & MH_TWOLEVEL) == 0;
+}
+
+/* A public image can legally re-export a symbol whose address belongs to a
+ * hidden provider. The candidate's catalog bit alone is insufficient: use the
+ * saved original dladdr, never our filtered wrapper, to classify the returned
+ * non-NULL address. */
+static bool hider_dlsym_result_address_is_hidden(void *address) {
+	if (!address || !orig_dladdr) {
+		return false;
+	}
+	Dl_info owner_info = {0};
+	return orig_dladdr(address, &owner_info) != 0 && owner_info.dli_fname &&
+		image_path_should_hide(owner_info.dli_fname);
+}
+
+static hider_dlsym_relative_result_t hider_dlsym_resolve_caller_relative(
+	void *handle, const char *symbol, const void *caller_return_address) {
+	hider_dlsym_relative_result_t result = {
+		.status = HIDER_DLSYM_RELATIVE_UNAVAILABLE,
+		.address = NULL,
+		.hidden_provider = false,
+	};
+	if (!symbol || !orig_dlsym || !orig_dlerror || !orig_dlopen || !orig_dlclose) {
+		return result;
+	}
+
+	for (uint32_t attempt = 0; attempt < RHI_DLSYM_RELATIVE_LOOKUP_ATTEMPTS; attempt++) {
+		rhi_hider_catalog_snapshot_t snapshot = {0};
+		if (!hidden_dylib_hider_catalog_snapshot(&snapshot)) {
+			return result;
+		}
+
+		const struct mach_header *caller_header = NULL;
+		int32_t caller_index = hider_dlsym_find_caller_catalog_index(
+			&snapshot, caller_return_address, &caller_header);
+		if (!hider_dlsym_caller_is_verified_flat(&snapshot, caller_index, caller_header)) {
+			hidden_dylib_hider_catalog_snapshot_dispose(&snapshot);
+			result.status = HIDER_DLSYM_RELATIVE_UNAVAILABLE_CALLER_NAMESPACE;
+			return result;
+		}
+		uint32_t start = (uint32_t)caller_index;
+		if (handle == RTLD_NEXT) {
+			if (start == UINT32_MAX || ++start >= snapshot.count) {
+				if (hidden_dylib_hider_catalog_generation_is_current(snapshot.generation)) {
+					result.status = HIDER_DLSYM_RELATIVE_NOT_FOUND;
+				}
+				hidden_dylib_hider_catalog_snapshot_dispose(&snapshot);
+				return result;
+			}
+		}
+
+		bool retry = false;
+		for (uint32_t index = start; index < snapshot.count; index++) {
+			const rhi_hider_catalog_image_t *image = &snapshot.images[index];
+			void *pin = NULL;
+			hider_dlsym_pin_result_t pin_result = hider_dlsym_pin_catalog_image(
+				image, snapshot.generation, &pin);
+			if (pin_result == HIDER_DLSYM_PIN_RETRY) {
+				retry = true;
+				break;
+			}
+			if (pin_result != HIDER_DLSYM_PIN_ACQUIRED) {
+				hidden_dylib_hider_catalog_snapshot_dispose(&snapshot);
+				return result; /* Never skip a provider whose pin failed. */
+			}
+
+			void *address = NULL;
+			hider_dlsym_probe_result_t probe_result =
+				hider_dlsym_probe_catalog_image(pin, symbol, &address);
+			bool released = hider_dlsym_unpin_catalog_image(pin);
+			if (!released || !hider_catalog_snapshot_image_is_current(image, snapshot.generation)) {
+				retry = true;
+				break;
+			}
+			if (probe_result == HIDER_DLSYM_PROBE_UNAVAILABLE) {
+				hidden_dylib_hider_catalog_snapshot_dispose(&snapshot);
+				return result;
+			}
+			if (probe_result == HIDER_DLSYM_PROBE_FOUND) {
+				result.status = HIDER_DLSYM_RELATIVE_FOUND;
+				result.address = address;
+				result.hidden_provider = image->hidden ||
+					hider_dlsym_result_address_is_hidden(address);
+				hidden_dylib_hider_catalog_snapshot_dispose(&snapshot);
+				return result;
+			}
+		}
+
+		bool generation_current = hidden_dylib_hider_catalog_generation_is_current(snapshot.generation);
+		hidden_dylib_hider_catalog_snapshot_dispose(&snapshot);
+		if (!retry && generation_current) {
+			result.status = HIDER_DLSYM_RELATIVE_NOT_FOUND;
+			return result;
+		}
+	}
+	/* This is deliberately unavailable, not a claim that the wrapper-frame
+	 * native fallback preserves caller-relative semantics after a load storm. */
+	result.status = HIDER_DLSYM_RELATIVE_UNAVAILABLE_RETRY_LIMIT;
+	return result;
+}
+
+static void *hider_dlsym_fallback_with_external_filter(
+	void *handle, const char *symbol, bool caller_can_read_hidden) {
+	void *result = orig_dlsym(handle, symbol);
+	if (!caller_can_read_hidden && result) {
+		const char *path = dyld_image_path_containing_address(result);
+		if (path && image_path_should_hide(path)) {
+			if (orig_dlerror) {
+				(void)orig_dlerror();
+			}
+			hider_dlsym_set_hidden_result_error(symbol);
+			return NULL;
+		}
+	}
+	return result;
+}
+
 __attribute__((noinline))
 static void *h_dlsym(void *handle, const char *symbol) {
 	if (!hider_is_ready())
@@ -2227,9 +2539,10 @@ static void *h_dlsym(void *handle, const char *symbol) {
 	hider_loader_error_clear_pending();
 	hider_dlsym_clear_pending_error();
 
-	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
-	if (caller_is_hidden(ra))
-		return orig_dlsym(handle, symbol);  // tweak caller → full access
+	/* Capture the true dlsym caller before any helper frame exists. */
+	const void *caller_return_address =
+		__builtin_extract_return_addr(__builtin_return_address(0));
+	bool caller_can_read_hidden = caller_is_hidden(caller_return_address);
 
 	/* Do not manufacture an error or dereference a NULL symbol. libdyld owns
 	 * the exact invalid-input semantics for this uncommon caller misuse. */
@@ -2237,41 +2550,46 @@ static void *h_dlsym(void *handle, const char *symbol) {
 		return orig_dlsym(handle, symbol);
 	}
 
-	void *result = orig_dlsym(handle, symbol);
-
-	// App caller: remap our GOT-hooked functions so dlsym returns
-	// our hook pointer, not the raw DSC address (which would bypass
-	// our GOT hooks if the app caches the pointer).
-	void *remapped = hidden_dylib_hider_dlsym_remap(symbol);
-	if (remapped) {
+	/* App callers receive active hook remaps before any special-handle resolver.
+	 * In particular this never opens a catalog image just to resolve a symbol
+	 * whose policy replacement is already authoritative. */
+	if (!caller_can_read_hidden) {
+		void *remapped = hidden_dylib_hider_dlsym_remap(symbol);
+		if (remapped) {
 		/* The original lookup may have failed for a particular handle even
 		 * though the active policy remap succeeds. A successful dlsym must not
-		 * leave that stale libdyld error visible through dlerror. */
-		if (orig_dlerror) {
-			(void)orig_dlerror();
+		 * leave a stale libdyld error visible through dlerror. */
+			if (orig_dlerror) {
+				(void)orig_dlerror();
+			}
+			return remapped;
 		}
-		return remapped;
 	}
 
-	// App caller: if the resolved address lives in a hidden image,
-	// return NULL.  This catches MSHookFunction, ellekit symbols, etc.
-	// without needing a symbol-name blocklist.
-	if (result) {
-		const char *path = dyld_image_path_containing_address(result);
-		if (path && image_path_should_hide(path)) {
-			/* Replace, rather than stack on, libdyld's prior per-thread error.
-			 * After our one-shot denial is consumed, a second dlerror must be NULL. */
-			if (orig_dlerror) (void)orig_dlerror();
+	if (handle == RTLD_SELF || handle == RTLD_NEXT) {
+		hider_dlsym_relative_result_t relative = hider_dlsym_resolve_caller_relative(
+			handle, symbol, caller_return_address);
+		if (relative.status == HIDER_DLSYM_RELATIVE_FOUND) {
+			if (!caller_can_read_hidden && relative.hidden_provider) {
+				hider_dlsym_set_hidden_result_error(symbol);
+				return NULL;
+			}
+			return relative.address; /* May be a legitimate NULL-valued export. */
+		}
+		if (relative.status == HIDER_DLSYM_RELATIVE_NOT_FOUND) {
 			hider_dlsym_set_hidden_result_error(symbol);
 			return NULL;
 		}
+		/* Two-level/unverifiable callers and catalog instability deliberately
+		 * remain unavailable: native fallback executes from this wrapper frame,
+		 * so RTLD_SELF/NEXT may be wrapper-relative. Preserve availability and
+		 * external post-filtering, but do not advertise selection equivalence. */
+		return hider_dlsym_fallback_with_external_filter(handle, symbol,
+		                                                caller_can_read_hidden);
 	}
 
-	/* RTLD_NEXT/RTLD_SELF are delegated to libdyld from this wrapper frame.
-	 * That preserves the platform's normal lookup/error handling as far as
-	 * possible, but is not a caller-relative emulation; do not advertise a
-	 * stronger guarantee until a safe per-image resolver is implemented. */
-	return result;
+	return hider_dlsym_fallback_with_external_filter(handle, symbol,
+	                                                caller_can_read_hidden);
 }
 
 __attribute__((noinline))
@@ -2283,15 +2601,17 @@ static char *h_dlerror(void) {
 		g_loader_error_pending = false;
 		return g_loader_error_message;
 	}
+	/* A dlsym denial may be consumed through a helper/trampoline whose own
+	 * return address is trusted. Error ownership belongs to the probing thread,
+	 * not to the frame that happens to call dlerror. */
+	if (g_dlsym_error_pending) {
+		g_dlsym_error_pending = false;
+		return g_dlsym_error_message;
+	}
 
 	const void *ra = __builtin_extract_return_addr(__builtin_return_address(0));
 	if (caller_is_hidden(ra)) {
 		return orig_dlerror ? orig_dlerror() : NULL;
-	}
-
-	if (g_dlsym_error_pending) {
-		g_dlsym_error_pending = false;
-		return g_dlsym_error_message;
 	}
 	return orig_dlerror ? orig_dlerror() : NULL;
 }

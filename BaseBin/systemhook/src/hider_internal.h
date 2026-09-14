@@ -36,6 +36,10 @@ typedef struct {
 	uint64_t                  identity;
 	bool                      uuid_valid;
 	bool                      main_executable;
+	/* This snapshot deliberately includes both views.  A caller-relative
+	 * resolver must walk the real load order, then decide whether a matching
+	 * provider may be exposed to its caller. */
+	bool                      hidden;
 } rhi_hider_catalog_image_t;
 
 typedef struct {

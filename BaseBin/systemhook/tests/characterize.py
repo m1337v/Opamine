@@ -249,6 +249,135 @@ class DlsymDouble:
         return result
 
 
+@dataclass
+class RelativeImageDouble:
+    """One catalog identity in the caller-relative dlsym model."""
+
+    name: str
+    identity: int
+    hidden: bool
+    symbols: dict[str, str | None]
+    main: bool = False
+    two_level: bool = False
+
+
+class CallerRelativeDlsymDouble:
+    """Model RTLD_SELF/NEXT with exact catalog identities and short pins.
+
+    This is deliberately stricter than a simple name-to-address lookup: a pin
+    failure cannot skip a preceding provider, a generation/address-reuse race
+    restarts the whole walk, and an image that exports a legitimate NULL stays
+    distinguishable from one with no symbol.
+    """
+
+    RETRIES = 3
+
+    def __init__(self) -> None:
+        self.images = [
+            RelativeImageDouble("main", 1, False, {"main": "main-symbol"}, main=True),
+            RelativeImageDouble("caller", 2, False, {"self": "caller-symbol", "nil": None}),
+            RelativeImageDouble("hidden", 3, True, {"shared": "hidden-symbol"}),
+            RelativeImageDouble("public", 4, False, {
+                "shared": "public-symbol",
+                "next": "next-symbol",
+                "reexport": "hidden-owned-symbol",
+            }),
+        ]
+        self.hidden_owned_addresses = {"hidden-owned-symbol"}
+        self.generation = 1
+        self.opens: list[tuple[str, bool]] = []
+        self.closes: list[str] = []
+        self.fallback_calls = 0
+        self.pin_fail_identity: int | None = None
+        self.mutate_once = False
+        self._mutated = False
+        self._error: str | None = None
+
+    def dlerror(self) -> str | None:
+        result = self._error
+        self._error = None
+        return result
+
+    def _pin(self, image: RelativeImageDouble) -> bool:
+        self.opens.append((image.name, image.main))
+        return image.identity != self.pin_fail_identity
+
+    def _close(self, image: RelativeImageDouble) -> None:
+        self.closes.append(image.name)
+
+    def _replace_at_same_address(self) -> None:
+        # The header/name slot is deliberately retained while the identity
+        # changes: this models dlclose/reload address reuse.
+        self.images[2] = RelativeImageDouble(
+            "hidden", 30, True, {"shared": "replacement-hidden"}
+        )
+        self.generation += 1
+
+    def _fallback(self, symbol: str, external: bool) -> str | None:
+        self.fallback_calls += 1
+        # Model a wrapper-frame native fallback that happened to find a hidden
+        # provider. External post-filtering must still deny it.
+        if symbol == "fallback-hidden":
+            if external:
+                self._error = f"symbol not found: {symbol}"
+                return None
+            return "hidden-fallback-symbol"
+        self._error = f"symbol not found: {symbol}"
+        return None
+
+    def relative(
+        self,
+        kind: str,
+        caller_name: str,
+        symbol: str,
+        *,
+        external: bool,
+        remaps: dict[str, str] | None = None,
+    ) -> str | None:
+        self._error = None
+        if external and remaps and symbol in remaps:
+            return remaps[symbol]
+
+        for _attempt in range(self.RETRIES):
+            generation = self.generation
+            snapshot = list(self.images)
+            try:
+                caller_index = next(i for i, image in enumerate(snapshot) if image.name == caller_name)
+            except StopIteration:
+                return self._fallback(symbol, external)
+            # The catalog's linear order is only a sound model for a verified
+            # flat caller. A two-level image follows its own dependency/static
+            # linker graph and must retain the explicit native fallback gap.
+            if snapshot[caller_index].two_level:
+                return self._fallback(symbol, external)
+            start = caller_index if kind == "SELF" else caller_index + 1
+            retry = False
+            for image in snapshot[start:]:
+                if not self._pin(image):
+                    # A failed pin means the real first provider is unknown;
+                    # continuing to a later image would change RTLD semantics.
+                    return self._fallback(symbol, external)
+                if self.mutate_once and not self._mutated:
+                    self._mutated = True
+                    self._replace_at_same_address()
+                if generation != self.generation or image not in self.images:
+                    self._close(image)
+                    retry = True
+                    break
+                found = symbol in image.symbols
+                result = image.symbols.get(symbol)
+                self._close(image)
+                if found:
+                    if external and (image.hidden or result in self.hidden_owned_addresses):
+                        self._error = f"symbol not found: {symbol}"
+                        return None
+                    return result
+            if not retry and generation == self.generation:
+                self._error = f"symbol not found: {symbol}"
+                return None
+        return self._fallback(symbol, external)
+
+
 class SysctlDouble:
     """Model stock two-pass sysctlbyname behavior for a hidden string."""
 
@@ -1101,6 +1230,108 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
 
     check("dlsym_handle_next_dlerror_fixture", check_dlsym_fixture)
 
+    def check_dlsym_caller_relative_fixture() -> None:
+        dlsym = CallerRelativeDlsymDouble()
+
+        # SELF begins at the caller. NEXT begins strictly after it in the
+        # complete load order, which includes otherwise-hidden images.
+        require(
+            dlsym.relative("SELF", "caller", "self", external=True) == "caller-symbol",
+            "RTLD_SELF must begin with the true caller image",
+        )
+        require(
+            dlsym.relative("NEXT", "caller", "next", external=True) == "next-symbol",
+            "RTLD_NEXT must exclude every image at or before the caller",
+        )
+        require(
+            dlsym.opens[:3] == [("caller", False), ("hidden", False), ("public", False)],
+            "SELF/NEXT must use saved-original per-image pins in catalog order",
+        )
+        require(dlsym.closes == [name for name, _main in dlsym.opens],
+                "every successfully acquired caller-relative pin must be closed")
+
+        # Main must use NULL (represented by main=True), non-main images use
+        # no-load pins. No image is silently skipped when its pin fails.
+        main = CallerRelativeDlsymDouble()
+        require(main.relative("SELF", "main", "main", external=True) == "main-symbol",
+                "main executable provider lookup failed")
+        require(main.opens == [("main", True)] and main.closes == ["main"],
+                "main must use a NULL-style pin and release it")
+
+        # Linear catalog order is restricted to a verified flat namespace.
+        # A two-level caller must make no internal pins and use the explicit
+        # native fallback, whose wrapper-relative semantics remain a gap.
+        two_level = CallerRelativeDlsymDouble()
+        two_level.images[1].two_level = True
+        require(two_level.relative("NEXT", "caller", "fallback-hidden", external=True) is None,
+                "two-level caller must retain native fallback availability")
+        require(two_level.fallback_calls == 1 and not two_level.opens and not two_level.closes,
+                "two-level caller must not use the flat catalog resolver")
+        require(two_level.dlerror() == "symbol not found: fallback-hidden",
+                "two-level fallback must preserve external hidden-result filtering")
+
+        failed_pin = CallerRelativeDlsymDouble()
+        failed_pin.pin_fail_identity = 3
+        require(failed_pin.relative("NEXT", "caller", "shared", external=True) is None,
+                "a pin failure must fall back, never skip the first possible provider")
+        require(failed_pin.fallback_calls == 1 and failed_pin.opens == [("hidden", False)],
+                "pin failure must not open or select a later provider")
+
+        # The first provider may be hidden. External code is denied there even
+        # if a later public image exports the same symbol; privileged code sees
+        # the real first result. NULL-valued exports are still successful.
+        external = CallerRelativeDlsymDouble()
+        require(external.relative("NEXT", "caller", "shared", external=True) is None,
+                "the first hidden provider must deny an external caller")
+        require(external.dlerror() == "symbol not found: shared" and external.dlerror() is None,
+                "relative hidden denial must be one-shot")
+        internal = CallerRelativeDlsymDouble()
+        require(internal.relative("NEXT", "caller", "shared", external=False) == "hidden-symbol",
+                "trusted callers must receive the true hidden first provider")
+        reexport = CallerRelativeDlsymDouble()
+        require(reexport.relative("NEXT", "hidden", "reexport", external=True) is None,
+                "public re-export of a hidden-owned address must still be denied")
+        require(reexport.dlerror() == "symbol not found: reexport",
+                "hidden actual-owner denial must provide a synthetic error")
+        nullable = CallerRelativeDlsymDouble()
+        require(nullable.relative("SELF", "caller", "nil", external=True) is None,
+                "NULL-valued export must preserve its NULL value")
+        require(nullable.dlerror() is None,
+                "NULL-valued export must be distinct from a missing symbol")
+
+        # Identity/generation revalidation restarts rather than reading a
+        # stale snapshot record when an address is reused during the probe.
+        raced = CallerRelativeDlsymDouble()
+        raced.mutate_once = True
+        require(raced.relative("NEXT", "caller", "shared", external=True) is None,
+                "address-reuse retry must still deny the replacement hidden provider")
+        require(raced.generation == 2 and raced.opens.count(("hidden", False)) == 2,
+                "generation change must rebuild and probe only the replacement identity")
+        require(raced.closes == [name for name, _main in raced.opens],
+                "retry must close its pre-race pin")
+
+        # An external hook remap has policy precedence and must not create any
+        # internal loader handles. A native fallback still filters a hidden
+        # provider, while trusted callers retain the fallback truth.
+        remapped = CallerRelativeDlsymDouble()
+        require(
+            remapped.relative("NEXT", "caller", "shared", external=True,
+                              remaps={"shared": "h_shared"}) == "h_shared",
+            "external remap must win before caller-relative resolution",
+        )
+        require(not remapped.opens and not remapped.closes,
+                "remap precedence must not open catalog images")
+        fallback = CallerRelativeDlsymDouble()
+        require(fallback.relative("NEXT", "gone", "fallback-hidden", external=True) is None,
+                "external native fallback must post-filter hidden result")
+        require(fallback.dlerror() == "symbol not found: fallback-hidden",
+                "fallback filtering must provide a synthetic dlsym error")
+        trusted_fallback = CallerRelativeDlsymDouble()
+        require(trusted_fallback.relative("NEXT", "gone", "fallback-hidden", external=False) ==
+                "hidden-fallback-symbol", "trusted fallback must retain unfiltered result")
+
+    check("dlsym_caller_relative_fixture", check_dlsym_caller_relative_fixture)
+
     def check_dlsym_source_contract() -> None:
         require("orig_dlsym(handle, symbol)" in hider, "h_dlsym must preserve the original lookup path")
         require("hidden_dylib_hider_dlsym_remap" in main or "hidden_dylib_hider_dlsym_remap" in hider, "remap must have a caller")
@@ -1111,6 +1342,35 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         require("(void)orig_dlerror()" in hider, "remapped success must consume stale original error state")
         require('{ "dlerror", (void *)dlerror, (void *)h_dlerror }' in hider, "dlerror must be part of the core transaction")
         require('{ "dlerror",                               (void *)h_dlerror' in hider, "dlsym(dlerror) must agree with the GOT hook")
+        for token in (
+            "RHI_DLSYM_RELATIVE_LOOKUP_ATTEMPTS", "RTLD_SELF", "RTLD_NEXT", "RTLD_FIRST",
+            "hider_dlsym_resolve_caller_relative", "hider_dlsym_find_caller_catalog_index",
+            "hider_dlsym_caller_is_verified_flat", "rhi_hider_identity_image_text_range", "MH_TWOLEVEL",
+            "HIDER_DLSYM_RELATIVE_UNAVAILABLE_CALLER_NAMESPACE",
+            "HIDER_DLSYM_RELATIVE_UNAVAILABLE_RETRY_LIMIT",
+            "hider_catalog_snapshot_image_is_current", "catalog_find_active_locked",
+            "paths_match", "hider_dlsym_result_address_is_hidden", "orig_dladdr(address, &owner_info)",
+            "hidden_dylib_hider_catalog_snapshot", "hidden_dylib_hider_catalog_generation_is_current",
+            "orig_dlopen(image->main_executable ? NULL : image->path, mode)",
+            "RTLD_NOLOAD", "orig_dlclose", "HIDER_DLSYM_PROBE_FOUND",
+            "HIDER_DLSYM_RELATIVE_UNAVAILABLE", "hidden_provider",
+        ):
+            require(token in hider, f"caller-relative dlsym contract missing: {token}")
+        require("image->hidden = record->hidden" in hider and "bool                      hidden;" in hider_internal,
+                "relative snapshot must retain hidden state across its owned copy")
+        relative_body_start = hider.find("static hider_dlsym_relative_result_t hider_dlsym_resolve_caller_relative")
+        relative_body_end = hider.find("static void *hider_dlsym_fallback_with_external_filter", relative_body_start)
+        relative_body = hider[relative_body_start:relative_body_end]
+        require(relative_body_start >= 0 and "for (uint32_t attempt = 0; attempt < RHI_DLSYM_RELATIVE_LOOKUP_ATTEMPTS" in relative_body,
+                "relative resolver must use bounded generation retries")
+        require("Never skip a provider whose pin failed" in relative_body and
+                "hider_dlsym_fallback_with_external_filter" in hider,
+                "pin failures must fall back without skipping a provider")
+        hdlerror_body_start = hider.find("__attribute__((noinline))\nstatic char *h_dlerror(void) {")
+        hdlerror_body_end = hider.find("#pragma mark - ObjC runtime hooks", hdlerror_body_start)
+        hdlerror_body = hider[hdlerror_body_start:hdlerror_body_end]
+        require(hdlerror_body.find("g_dlsym_error_pending") < hdlerror_body.find("caller_is_hidden"),
+                "synthetic relative errors must be served for either caller class")
 
     check("dlsym_production_static_contract", check_dlsym_source_contract)
 
@@ -1118,7 +1378,7 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         "id": "dlsym-caller-relative-handle-semantics",
         "severity": "medium",
         "source": "BaseBin/systemhook/src/hidden_dylib_hider.c",
-        "detail": "RTLD_NEXT/RTLD_SELF are delegated through the h_dlsym frame; caller-relative lookup has not been implemented or device-validated.",
+        "detail": "The catalog resolver is intentionally limited to callers verified as flat namespace (MH_TWOLEVEL clear). Two-level, unprovable, pin-failure, and retry-limit cases use native fallback from h_dlsym's wrapper frame, so RTLD_SELF/RTLD_NEXT provider selection may remain wrapper-relative; external results are still post-filtered.",
     })
 
     def check_sysctl_fixture() -> None:

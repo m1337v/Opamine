@@ -45,6 +45,24 @@ publication in the parent (the only intentional wait) and the child chooses
 permanent pass-through, so it never relies on inherited filtering state or a
 vanished worker.
 
+The `dlsym` lane additionally models caller-relative `RTLD_SELF` and
+`RTLD_NEXT` only for a caller with a safely validated flat Mach-O namespace
+(`MH_TWOLEVEL` clear). In that case it proves the resolver starts at (or after)
+the true caller in a complete catalog order; pins the main executable with
+`NULL` and every other image with `RTLD_NOLOAD | RTLD_FIRST`; never skips a
+provider on pin failure; retries on generation/identity changes such as address
+reuse; closes every temporary handle; preserves a NULL-valued export as distinct
+from a missing symbol; and denies an external caller at the first hidden
+provider rather than searching past it. It also covers remap precedence and
+post-filtering when the safe catalog resolver must fall back to libdyld.
+
+Two-level, unprovable, pin-failure, and retry-limit callers deliberately use
+native fallback from the hider wrapper. That preserves availability and external
+hidden-result filtering, but it does not preserve caller-relative provider
+selection, so this remains an explicit production gap. Exact iOS dyld
+pseudo-handle behavior, `RTLD_FIRST` availability, loader error wording, and
+real load/unload races still require a device matrix before release.
+
 Run it from the repository root or from this directory:
 
 ```sh
