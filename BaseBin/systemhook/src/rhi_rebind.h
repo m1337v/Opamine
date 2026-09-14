@@ -40,6 +40,23 @@ typedef enum {
 	RHI_REBIND_UNKNOWN,
 } rhi_rebind_result_t;
 
+/*
+ * A read-only post-activation observation of the committed slot ledger.
+ * This is deliberately independent of rhi_rebind_result_t: a transaction
+ * can have committed COMPLETELY and later fail (or become unknowable) when a
+ * third party changes one of its live import slots.  Attestation never writes
+ * a slot, changes VM protections, or attempts to repair a changed slot.
+ */
+typedef enum {
+	RHI_ATTEST_NOT_ATTEMPTED = 0,
+	/* Every live committed slot still contains its exact replacement raw word. */
+	RHI_ATTEST_INTACT,
+	/* At least one live slot returned exactly to its captured original raw word. */
+	RHI_ATTEST_FAILED,
+	/* Foreign raw data or an unstable/ambiguous lifecycle snapshot was observed. */
+	RHI_ATTEST_UNKNOWN,
+} rhi_rebind_attestation_t;
+
 typedef struct {
 	const char *name;       /* diagnostics only; must stay valid for session life */
 	void *replacee;         /* canonical original target */
@@ -82,6 +99,20 @@ RHI_REBIND_INTERNAL rhi_rebind_result_t rhi_rebind_transaction_commit(
 RHI_REBIND_INTERNAL bool rhi_rebind_transaction_activate_global(
 	rhi_rebind_transaction_t *transaction);
 
+/*
+ * Bounded phase-boundary attestation. This only examines the already
+ * committed ledger; normal per-hook readiness deliberately does not trigger
+ * this scan. Retired image slots are skipped and a zero-site monitored
+ * transaction is intact when its image snapshot remains stable. FAILED and
+ * UNKNOWN are one-way terminal states which disarm later global-image work.
+ */
+RHI_REBIND_INTERNAL rhi_rebind_attestation_t rhi_rebind_transaction_attest(
+	rhi_rebind_transaction_t *transaction);
+RHI_REBIND_INTERNAL rhi_rebind_attestation_t rhi_rebind_transaction_attestation(
+	const rhi_rebind_transaction_t *transaction);
+RHI_REBIND_INTERNAL rhi_rebind_result_t rhi_rebind_transaction_result(
+	const rhi_rebind_transaction_t *transaction);
+
 RHI_REBIND_INTERNAL rhi_hook_state_t rhi_rebind_transaction_state(
 	const rhi_rebind_transaction_t *transaction);
 RHI_REBIND_INTERNAL rhi_hook_state_t rhi_rebind_transaction_hook_state(
@@ -96,5 +127,6 @@ RHI_REBIND_INTERNAL size_t rhi_rebind_transaction_hook_count(
 	const rhi_rebind_transaction_t *transaction);
 RHI_REBIND_INTERNAL const char *rhi_hook_state_name(rhi_hook_state_t state);
 RHI_REBIND_INTERNAL const char *rhi_rebind_result_name(rhi_rebind_result_t result);
+RHI_REBIND_INTERNAL const char *rhi_rebind_attestation_name(rhi_rebind_attestation_t result);
 
 #endif /* RHI_REBIND_H */

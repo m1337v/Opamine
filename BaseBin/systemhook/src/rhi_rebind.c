@@ -146,7 +146,11 @@ struct rhi_rebind_transaction {
 	size_t known_image_count;
 	size_t known_image_capacity;
 	rhi_hook_state_t state;
+	/* Commit truth and later read-only attestation are intentionally distinct.
+	 * A successful commit never becomes a different mutation result merely
+	 * because its post-activation ledger subsequently degrades. */
 	rhi_rebind_result_t result;
+	rhi_rebind_attestation_t attestation;
 	uint64_t lifecycle_generation;
 	bool prepared;
 	bool terminal;
@@ -1429,6 +1433,17 @@ const char *rhi_rebind_result_name(rhi_rebind_result_t result)
 	return "invalid";
 }
 
+const char *rhi_rebind_attestation_name(rhi_rebind_attestation_t result)
+{
+	switch (result) {
+		case RHI_ATTEST_NOT_ATTEMPTED: return "not-attempted";
+		case RHI_ATTEST_INTACT: return "intact";
+		case RHI_ATTEST_FAILED: return "failed";
+		case RHI_ATTEST_UNKNOWN: return "unknown";
+	}
+	return "invalid";
+}
+
 static void rhi_global_image_added(const struct mach_header *header, intptr_t slide);
 static void rhi_global_image_removed(const struct mach_header *header, intptr_t slide);
 
@@ -1474,7 +1489,8 @@ rhi_rebind_transaction_t *rhi_rebind_transaction_create(void)
 	if (!transaction) return NULL;
 	transaction->lock = OS_UNFAIR_LOCK_INIT;
 	RHI_STATE_STORE(&transaction->state, RHI_HOOK_NOT_ATTEMPTED);
-	transaction->result = RHI_REBIND_NONE;
+	RHI_STATE_STORE(&transaction->result, RHI_REBIND_NONE);
+	RHI_STATE_STORE(&transaction->attestation, RHI_ATTEST_NOT_ATTEMPTED);
 	if (!rhi_ensure_lifecycle_callbacks()) {
 		free(transaction);
 		return NULL;
@@ -1571,7 +1587,7 @@ bool rhi_rebind_transaction_prepare_global(rhi_rebind_transaction_t *transaction
 fail:
 	rhi_transaction_clear(transaction);
 	RHI_STATE_STORE(&transaction->state, RHI_HOOK_FAILED);
-	transaction->result = RHI_REBIND_NONE;
+	RHI_STATE_STORE(&transaction->result, RHI_REBIND_NONE);
 	os_unfair_lock_unlock(&transaction->lock);
 	return false;
 }
@@ -1594,13 +1610,13 @@ rhi_rebind_result_t rhi_rebind_transaction_commit(rhi_rebind_transaction_t *tran
 	}
 	if (!rhi_transaction_image_snapshot_stable(transaction)) {
 		RHI_STATE_STORE(&transaction->state, RHI_HOOK_FAILED);
-		transaction->result = RHI_REBIND_NONE;
+		RHI_STATE_STORE(&transaction->result, RHI_REBIND_NONE);
 		rhi_set_hook_states(transaction, RHI_HOOK_FAILED);
 		os_unfair_lock_unlock(&transaction->lock);
 		return RHI_REBIND_NONE;
 	}
 	rhi_rebind_result_t result = rhi_commit_slots(transaction, 0, transaction->slot_count);
-	transaction->result = result;
+	RHI_STATE_STORE(&transaction->result, result);
 	if (result == RHI_REBIND_COMPLETE) {
 		RHI_STATE_STORE(&transaction->state, RHI_HOOK_ACTIVE);
 		for (size_t i = 0; i < transaction->hook_count; i++) {
@@ -1619,6 +1635,114 @@ rhi_rebind_result_t rhi_rebind_transaction_commit(rhi_rebind_transaction_t *tran
 		rhi_set_hook_states(transaction, RHI_HOOK_FAILED);
 	}
 	os_unfair_lock_unlock(&transaction->lock);
+	return result;
+}
+
+/*
+ * This is intentionally an opaque raw-word comparison.  In particular, an
+ * arm64e slot's signed replacement must be byte-for-byte the value committed
+ * for this slot; stripping/authenticating a later foreign raw word would turn
+ * an unprovable ledger into a false positive (and could trap).
+ *
+ * Caller serializes the ledger and lifecycle before invoking this helper.  It
+ * performs atomic loads only: no VM query, protection transition, store, or
+ * repair is allowed on the attestation path.
+ */
+static rhi_rebind_attestation_t rhi_attest_slots_readonly(
+	const rhi_rebind_transaction_t *transaction)
+{
+	if (!transaction) return RHI_ATTEST_UNKNOWN;
+	bool saw_original = false;
+	for (size_t i = 0; i < transaction->slot_count; i++) {
+		const rhi_rebind_slot_t *slot = &transaction->slots[i];
+		/* dlclose retires the address-bearing artifact. Never dereference an
+		 * unmapped old slot, and do not let it invalidate a zero-site monitor. */
+		if (!slot->image.header) continue;
+		if (!slot->address || !slot->wrote ||
+		    ((uintptr_t)slot->address % _Alignof(uintptr_t)) != 0)
+			return RHI_ATTEST_UNKNOWN;
+		const uintptr_t raw = __atomic_load_n((uintptr_t *)slot->address, __ATOMIC_ACQUIRE);
+		if (raw == slot->replacement_raw) continue;
+		if (raw == slot->original_raw) {
+			saw_original = true;
+			continue;
+		}
+		/* A foreign raw word has no safe repair interpretation. */
+		return RHI_ATTEST_UNKNOWN;
+	}
+	return saw_original ? RHI_ATTEST_FAILED : RHI_ATTEST_INTACT;
+}
+
+/*
+ * This is one-way.  Keep result untouched: it records the historic mutation
+ * outcome, whereas attestation records the later observation.  The ledger
+ * remains registered because dyld has no unregister API, but global_armed
+ * prevents it from scheduling any later image writes.
+ *
+ * Caller owns transaction->lock; g_global_lock is held by the public path so
+ * the global registry cannot race this disarm.
+ */
+static rhi_rebind_attestation_t rhi_apply_attestation_locked(
+	rhi_rebind_transaction_t *transaction, rhi_rebind_attestation_t observation)
+{
+	if (!transaction) return RHI_ATTEST_UNKNOWN;
+	const rhi_rebind_attestation_t prior = RHI_STATE_LOAD(&transaction->attestation);
+	if (transaction->terminal || prior == RHI_ATTEST_FAILED || prior == RHI_ATTEST_UNKNOWN)
+		return prior;
+	if (observation == RHI_ATTEST_INTACT) {
+		RHI_STATE_STORE(&transaction->attestation, RHI_ATTEST_INTACT);
+		return RHI_ATTEST_INTACT;
+	}
+	if (observation == RHI_ATTEST_FAILED) {
+		RHI_STATE_STORE(&transaction->attestation, RHI_ATTEST_FAILED);
+		RHI_STATE_STORE(&transaction->state, RHI_HOOK_FAILED);
+		rhi_set_hook_states(transaction, RHI_HOOK_FAILED);
+	} else {
+		RHI_STATE_STORE(&transaction->attestation, RHI_ATTEST_UNKNOWN);
+		RHI_STATE_STORE(&transaction->state, RHI_HOOK_UNKNOWN);
+		rhi_set_hook_states(transaction, RHI_HOOK_UNKNOWN);
+	}
+	transaction->terminal = true;
+	transaction->global_armed = false;
+	return RHI_STATE_LOAD(&transaction->attestation);
+}
+
+rhi_rebind_attestation_t rhi_rebind_transaction_attest(rhi_rebind_transaction_t *transaction)
+{
+	if (!transaction) return RHI_ATTEST_NOT_ATTEMPTED;
+	/* Global -> transaction -> writer is compatible with lifecycle callbacks:
+	 * they release writer before taking global, so a remove cannot unmap a live
+	 * slot between the snapshot checks and raw loads below. */
+	os_unfair_lock_lock(&g_global_lock);
+	os_unfair_lock_lock(&transaction->lock);
+	const rhi_rebind_attestation_t prior = RHI_STATE_LOAD(&transaction->attestation);
+	if (transaction->terminal || prior == RHI_ATTEST_FAILED || prior == RHI_ATTEST_UNKNOWN) {
+		os_unfair_lock_unlock(&transaction->lock);
+		os_unfair_lock_unlock(&g_global_lock);
+		return prior;
+	}
+	if (!transaction->in_global_registry || !transaction->global_armed ||
+	    RHI_STATE_LOAD(&transaction->state) != RHI_HOOK_ACTIVE) {
+		os_unfair_lock_unlock(&transaction->lock);
+		os_unfair_lock_unlock(&g_global_lock);
+		return RHI_ATTEST_NOT_ATTEMPTED;
+	}
+	os_unfair_lock_lock(&g_writer_lock);
+	rhi_rebind_attestation_t observation = RHI_ATTEST_UNKNOWN;
+	if (rhi_transaction_image_snapshot_stable(transaction)) {
+		observation = rhi_attest_slots_readonly(transaction);
+		/* The generation and every header/slide/UUID identity must still be
+		 * stable after the final raw load. */
+		if (observation == RHI_ATTEST_INTACT || observation == RHI_ATTEST_FAILED) {
+			if (!rhi_transaction_image_snapshot_stable(transaction))
+				observation = RHI_ATTEST_UNKNOWN;
+		}
+	}
+	os_unfair_lock_unlock(&g_writer_lock);
+	const rhi_rebind_attestation_t result =
+		rhi_apply_attestation_locked(transaction, observation);
+	os_unfair_lock_unlock(&transaction->lock);
+	os_unfair_lock_unlock(&g_global_lock);
 	return result;
 }
 
@@ -1668,12 +1792,12 @@ static void rhi_global_image_added(const struct mach_header *header, intptr_t sl
 			RHI_STATE_STORE(&transaction->state, RHI_HOOK_FAILED);
 			rhi_set_hook_states(transaction, RHI_HOOK_FAILED);
 		} else if (result == RHI_REBIND_PARTIAL) {
-			transaction->result = result;
+			RHI_STATE_STORE(&transaction->result, result);
 			RHI_STATE_STORE(&transaction->state, RHI_HOOK_PARTIAL);
 			transaction->terminal = true;
 			rhi_set_hook_states(transaction, RHI_HOOK_PARTIAL);
 		} else {
-			transaction->result = result;
+			RHI_STATE_STORE(&transaction->result, result);
 			RHI_STATE_STORE(&transaction->state, RHI_HOOK_UNKNOWN);
 			transaction->terminal = true;
 			rhi_set_hook_states(transaction, RHI_HOOK_UNKNOWN);
@@ -1777,12 +1901,12 @@ static bool rhi_rebind_transaction_reconcile_loaded_images(rhi_rebind_transactio
 			continue;
 		}
 		if (result == RHI_REBIND_PARTIAL) {
-			transaction->result = result;
+			RHI_STATE_STORE(&transaction->result, result);
 			RHI_STATE_STORE(&transaction->state, RHI_HOOK_PARTIAL);
 			transaction->terminal = true;
 			rhi_set_hook_states(transaction, RHI_HOOK_PARTIAL);
 		} else if (result == RHI_REBIND_UNKNOWN) {
-			transaction->result = result;
+			RHI_STATE_STORE(&transaction->result, result);
 			RHI_STATE_STORE(&transaction->state, RHI_HOOK_UNKNOWN);
 			transaction->terminal = true;
 			rhi_set_hook_states(transaction, RHI_HOOK_UNKNOWN);
@@ -1831,6 +1955,19 @@ rhi_hook_state_t rhi_rebind_transaction_state(const rhi_rebind_transaction_t *tr
 {
 	if (!transaction) return RHI_HOOK_FAILED;
 	return RHI_STATE_LOAD(&transaction->state);
+}
+
+rhi_rebind_attestation_t rhi_rebind_transaction_attestation(
+	const rhi_rebind_transaction_t *transaction)
+{
+	if (!transaction) return RHI_ATTEST_NOT_ATTEMPTED;
+	return RHI_STATE_LOAD(&transaction->attestation);
+}
+
+rhi_rebind_result_t rhi_rebind_transaction_result(const rhi_rebind_transaction_t *transaction)
+{
+	if (!transaction) return RHI_REBIND_NONE;
+	return RHI_STATE_LOAD(&transaction->result);
 }
 
 rhi_hook_state_t rhi_rebind_transaction_hook_state(const rhi_rebind_transaction_t *transaction,

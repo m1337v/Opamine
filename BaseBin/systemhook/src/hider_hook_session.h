@@ -29,4 +29,8 @@ RHI_REBIND_INTERNAL bool rhi_hider_hook_session_hook_is_active(
 RHI_REBIND_INTERNAL rhi_hook_state_t rhi_hider_hook_session_state(
 	const rhi_hider_hook_session_t *session);
 
+/* Explicit phase-boundary verification; ordinary readiness stays O(1). */
+RHI_REBIND_INTERNAL rhi_rebind_attestation_t rhi_hider_hook_session_attest(
+	rhi_hider_hook_session_t *session);
+
 #endif /* RHI_HIDER_HOOK_SESSION_H */

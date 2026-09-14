@@ -77,3 +77,9 @@ rhi_hook_state_t rhi_hider_hook_session_state(const rhi_hider_hook_session_t *se
 	if (session->transaction) return rhi_rebind_transaction_state(session->transaction);
 	return session->state;
 }
+
+rhi_rebind_attestation_t rhi_hider_hook_session_attest(rhi_hider_hook_session_t *session)
+{
+	if (!session || !session->transaction) return RHI_ATTEST_NOT_ATTEMPTED;
+	return rhi_rebind_transaction_attest(session->transaction);
+}
