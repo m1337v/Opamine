@@ -53,6 +53,14 @@ bool rhi_hider_hook_session_start(rhi_hider_hook_session_t *session,
 		session->state = rhi_rebind_transaction_state(session->transaction);
 		return false;
 	}
+	/* Activation is not published until a bounded read-only pass proves that
+	 * every committed live slot still contains its exact replacement word.
+	 * Later phase-boundary attestations remain explicit; ordinary readiness is
+	 * intentionally O(1). */
+	if (rhi_rebind_transaction_attest(session->transaction) != RHI_ATTEST_INTACT) {
+		session->state = rhi_rebind_transaction_state(session->transaction);
+		return false;
+	}
 	session->state = RHI_HOOK_ACTIVE;
 	return true;
 }
