@@ -9,7 +9,10 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = roothidehooks
 
 roothidehooks_FILES = $(wildcard *.x) $(wildcard *.c) $(wildcard *.m)
-roothidehooks_CFLAGS = -Werror -fobjc-arc -fno-modules -I../.include
+# RootHide uses private XPC peer helpers that public SDK headers mark unavailable
+# on iOS. Keep those declarations scoped to this hook instead of deleting the
+# SDK-wide XPC headers needed by other subprojects such as XPF.
+roothidehooks_CFLAGS = -Werror -fobjc-arc -fno-modules -I../_external/include -I../.include
 roothidehooks_LDFLAGS = -rpath @loader_path/.jbroot/Library/Frameworks -rpath @loader_path/fallback -L../libjailbreak -ljailbreak
 roothidehooks_INSTALL_PATH = /basebin
 
