@@ -13,7 +13,7 @@ TWEAK_NAME = roothidehooks
 
 roothidehooks_FILES = $(wildcard src/*.x) $(wildcard src/*.c) $(wildcard src/*.m)
 roothidehooks_CFLAGS = -Werror -fobjc-arc -I../.include
-roothidehooks_LDFLAGS = -L../.build -ljailbreak -lbsm -lroothider
+roothidehooks_LDFLAGS = -rpath @loader_path/present -rpath @loader_path/fallback -L../.build -ljailbreak -lbsm -lroothider
 roothidehooks_INSTALL_PATH = /basebin
 
 ifneq ($(DEBUG),1)
@@ -27,7 +27,9 @@ clean::
 	rm -rf ./packages
 
 after-roothidehooks-all::
-	install_name_tool -delete_rpath @loader_path/.jbroot/Library/Frameworks $(THEOS_OBJ_DIR)/roothidehooks.dylib || true
-	install_name_tool -add_rpath @loader_path/present -add_rpath @loader_path/fallback $(THEOS_OBJ_DIR)/roothidehooks.dylib
+	rpaths="$$(otool -l "$(THEOS_OBJ_DIR)/roothidehooks.dylib")" || exit $$?; \
+	if printf '%s\n' "$$rpaths" | awk '$$1 == "path" { print $$2 }' | grep -Fxq '@loader_path/.jbroot/Library/Frameworks'; then \
+		install_name_tool -delete_rpath @loader_path/.jbroot/Library/Frameworks "$(THEOS_OBJ_DIR)/roothidehooks.dylib"; \
+	fi
 	install_name_tool -change @loader_path/.jbroot/usr/lib/libsubstrate.dylib @rpath/CydiaSubstrate.framework/CydiaSubstrate $(THEOS_OBJ_DIR)/roothidehooks.dylib
 	ldid -S $(THEOS_OBJ_DIR)/roothidehooks.dylib
