@@ -7,7 +7,7 @@ LDFLAGS = -dynamiclib -rpath @loader_path/.jbroot/usr/lib -L../../BaseBin/.build
 all: $(TARGET) sign
 
 sign: $(TARGET)
-	@ldid -S $^
+	@ldid -Cadhoc -S $^
 
 $(TARGET): $(wildcard src/*.c)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^

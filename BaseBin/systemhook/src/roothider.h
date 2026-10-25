@@ -1,9 +1,10 @@
 #include <spawn.h>
+#include <libjailbreak/hookd.h>
 #include "private.h"
 
 #include <libjailbreak/jbroot.h>
 #include <libjailbreak/jbclient_xpc.h>
-#include <libjailbreak/roothider/jailbreakd.h>
+#include <libroothider/jailbreakd.h>
 
 #define OS_REASON_DYLD          6
 #define DYLD_EXIT_REASON_OTHER  9

@@ -6,6 +6,8 @@
 //
 
 #import "DOEnvironmentManager.h"
+#import "DOEnvironmentManager+RootHide.h"
+#import "DOBootstrapper+RootHide.h"
 #import "UIImage+JPEG2000.h"
 
 #import <sys/sysctl.h>
@@ -33,7 +35,10 @@
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <CommonCrypto/CommonDigest.h>
 
+#pragma clang diagnostic error "-Wincomplete-implementation"
+
 int reboot3(uint64_t flags, ...);
+CFPropertyListRef MGCopyAnswer(CFStringRef);
 extern char **environ;
 
 NSString * const DORootHideInjectionModeStock = @"stock";
@@ -55,45 +60,27 @@ static NSString * const DORootHelperWaitProtocolMinimumBasebinVersion = @"2.4.9.
 
 static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
 {
-    if ([mode isEqualToString:DORootHideInjectionModeBlacklist] || [mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
-        return mode;
-    }
-    if ([mode isEqualToString:DORootHideInjectionModeStock]) {
+    if ([mode isEqualToString:DORootHideInjectionModeStock] ||
+        [mode isEqualToString:DORootHideInjectionModeBlacklist] ||
+        [mode isEqualToString:DORootHideInjectionModeWhitelist] ||
+        [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] ||
+        [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
         return mode;
     }
     return nil;
 }
 
-static NSArray<NSString *> *DORootHideCandidatePaths(NSString *relativePath)
+static NSDictionary *DORootHideDictionaryAtPath(NSString *relativePath)
 {
-    NSMutableArray<NSString *> *paths = [NSMutableArray array];
-    NSString *jbrootPath = JBROOT_PATH(relativePath);
-    if (jbrootPath.length > 0) {
-        [paths addObject:jbrootPath];
-    }
-    return paths;
+    NSString *path = JBROOT_PATH(relativePath);
+    NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:path];
+    return [dictionary isKindOfClass:NSDictionary.class] ? dictionary : nil;
 }
 
-static NSDictionary *DORootHideDictionaryAtCandidatePaths(NSString *relativePath)
+static BOOL DORootHidePathExists(NSString *relativePath)
 {
-    for (NSString *path in DORootHideCandidatePaths(relativePath)) {
-        NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:path];
-        if ([dictionary isKindOfClass:[NSDictionary class]]) {
-            return dictionary;
-        }
-    }
-    return nil;
-}
-
-static BOOL DORootHidePathExistsAtCandidatePaths(NSString *relativePath)
-{
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    for (NSString *path in DORootHideCandidatePaths(relativePath)) {
-        if ([fileManager fileExistsAtPath:path]) {
-            return YES;
-        }
-    }
-    return NO;
+    NSString *path = JBROOT_PATH(relativePath);
+    return path.length > 0 && [NSFileManager.defaultManager fileExistsAtPath:path];
 }
 
 static NSString *DOFileMD5AtPath(NSString *path)
@@ -105,10 +92,9 @@ static NSString *DOFileMD5AtPath(NSString *path)
 
     unsigned char digest[CC_MD5_DIGEST_LENGTH] = {0};
     CC_MD5(data.bytes, (CC_LONG)data.length, digest);
-
     NSMutableString *hash = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
-    for (NSUInteger i = 0; i < CC_MD5_DIGEST_LENGTH; i++) {
-        [hash appendFormat:@"%02x", digest[i]];
+    for (NSUInteger index = 0; index < CC_MD5_DIGEST_LENGTH; index++) {
+        [hash appendFormat:@"%02x", digest[index]];
     }
     return hash;
 }
@@ -125,63 +111,27 @@ static BOOL DOBasebinSupportsRootHelperWaitProtocol(NSString *version)
 
 static NSDictionary *DODefaultRootHideSystemInjection(void)
 {
-    static NSDictionary *defaultSystemInjection;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        defaultSystemInjection = @{
-            @"/.jbroot" : @YES,
-            @"/xpcproxy" : @YES,
-            @"/Dopamine" : @YES,
-            @"/SpringBoard" : @YES,
-            @"/Preferences" : @YES,
-            @"/amfid" : @YES,
-            @"/cfprefsd" : @YES,
-            @"/lsd" : @YES,
-            @"/transitd" : @YES,
-            @"/watchdogd" : @YES,
-            @"/SafariViewService" : @YES,
-            @"/iconservicesagent" : @YES,
-            @"/mobileassetd" : @YES,
-            @"/MobileGestaltHelper" : @YES,
-            @"/useractivityd" : @YES,
-        };
-    });
-    return defaultSystemInjection;
+    return @{
+        @"/.jbroot" : @YES, @"/xpcproxy" : @YES, @"/Dopamine" : @YES,
+        @"/SpringBoard" : @YES, @"/Preferences" : @YES, @"/amfid" : @YES,
+        @"/cfprefsd" : @YES, @"/lsd" : @YES, @"/transitd" : @YES,
+        @"/watchdogd" : @YES, @"/SafariViewService" : @YES,
+        @"/iconservicesagent" : @YES, @"/mobileassetd" : @YES,
+        @"/MobileGestaltHelper" : @YES, @"/useractivityd" : @YES,
+    };
 }
 
 static NSDictionary *DODefaultRootHideWantsBlacklist(void)
 {
-    static NSDictionary *defaultWantsBlacklist;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        defaultWantsBlacklist = @{
-            @"QQ" : @YES,
-            @"WeChat" : @YES,
-            @"Runner" : @YES,
-            @"AppStore" : @YES,
-        };
-    });
-    return defaultWantsBlacklist;
+    return @{ @"QQ" : @YES, @"WeChat" : @YES, @"Runner" : @YES, @"AppStore" : @YES };
 }
 
 static NSDictionary *DODefaultRootHideJetsamAddend(void)
 {
-    static NSDictionary *defaultJetsamAddend;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        defaultJetsamAddend = @{
-            @"/SpringBoard" : @(239),
-            @"/xxtouch" : @(48),
-            @"/thermalmonitord" : @(16),
-            @"/snapper3ocrd" : @(16),
-        };
-    });
-    return defaultJetsamAddend;
+    return @{ @"/SpringBoard" : @239, @"/xxtouch" : @48, @"/thermalmonitord" : @16, @"/snapper3ocrd" : @16 };
 }
 
 @implementation DOEnvironmentManager
-
-@synthesize bootManifestHash = _bootManifestHash;
 
 + (instancetype)sharedManager
 {
@@ -234,20 +184,15 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     }
 }
 
-- (NSData *)bootManifestHash
+- (NSString *)privatePrebootPath
 {
-    if (!_bootManifestHash) {
-        io_registry_entry_t registryEntry = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/chosen");
-        if (registryEntry) {
-            _bootManifestHash = (__bridge NSData *)IORegistryEntryCreateCFProperty(registryEntry, CFSTR("boot-manifest-hash"), NULL, 0);
-        }
-    }
-    return _bootManifestHash;
+    return @"/private/preboot";
 }
 
 - (NSString *)activePrebootPath
 {
-    return [@"/private/preboot" stringByAppendingPathComponent:[self bootManifestHash].hexString];
+    NSString *bootManifestString = [NSString stringWithUTF8String:boot_manifest_hash()];
+    return [[self privatePrebootPath] stringByAppendingPathComponent:bootManifestString];
 }
 
 /*
@@ -310,7 +255,27 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     NSError *error = nil;
 
     [self locateJailbreakRoot];
-    
+
+    // DOPACLEAN logic to move a corrupted dopamine directory to a different path to at least make jailbreaking work again
+    // if (gSystemInfo.jailbreakInfo.rootPath) {
+    //     NSString *randomizedJailbreakPath = [NSString stringWithUTF8String:gSystemInfo.jailbreakInfo.rootPath].stringByDeletingLastPathComponent;
+    //     NSString *characterSet = @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    //     NSUInteger stringLen = 6;
+    //     NSMutableString *randomString = [NSMutableString stringWithCapacity:stringLen];
+    //     for (NSUInteger i = 0; i < stringLen; i++) {
+    //         NSUInteger randomIndex = arc4random_uniform((uint32_t)[characterSet length]);
+    //         unichar randomCharacter = [characterSet characterAtIndex:randomIndex];
+    //         [randomString appendFormat:@"%C", randomCharacter];
+    //     }
+        
+    //     NSString *activePrebootPath = [self activePrebootPath];
+    //     NSString *orphanedName = [NSString stringWithFormat:@"orphaned-%@", randomString];
+    //     NSString *orphanedPath = [activePrebootPath stringByAppendingPathComponent:orphanedName];
+    //     [[NSFileManager defaultManager] moveItemAtPath:randomizedJailbreakPath toPath:orphanedPath error:nil];
+    // }
+
+    // return [NSError errorWithDomain:@"Cleaned" code:1 userInfo:nil];
+
     if (!gSystemInfo.jailbreakInfo.rootPath || _bootstrapNeedsMigration) {
         [_bootstrapper ensurePrivatePrebootIsWritable];
 
@@ -352,41 +317,49 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 {
     cpu_subtype_t cpusubtype = 0;
     size_t len = sizeof(cpusubtype);
-    if (sysctlbyname("hw.cpusubtype", &cpusubtype, &len, NULL, 0) == -1) { return NO; }
+    if (sysctlbyname("hw.cpusubtype", &cpusubtype, &len, NULL, 0) == -1) return NO;
     return (cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E;
 }
 
 - (BOOL)isSPTM
 {
     if (@available(iOS 17.0, *)) {
-        io_registry_entry_t memoryMap = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/chosen/memory-map");
-        if (memoryMap == IO_OBJECT_NULL) {
-            return NO;
-        }
+        io_registry_entry_t memory_map = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/chosen/memory-map");
+        if (memory_map == IO_OBJECT_NULL)   return NO;
 
-        CFArrayRef keys = (CFArrayRef)IORegistryEntryCreateCFProperty(memoryMap, CFSTR(kIORegistryEntryPropertyKeysKey), kCFAllocatorDefault, 0);
-        IOObjectRelease(memoryMap);
-        if (!keys) {
-            return NO;
-        }
+        CFArrayRef keys = (CFArrayRef)IORegistryEntryCreateCFProperty(memory_map, CFSTR(kIORegistryEntryPropertyKeysKey), kCFAllocatorDefault, 0);
+        IOObjectRelease(memory_map);
+        if (!keys)  return NO;
 
         CFRange range = CFRangeMake(0, CFArrayGetCount(keys));
-        BOOL isSPTM = CFArrayContainsValue(keys, range, CFSTR("SPTM")) &&
-                      CFArrayContainsValue(keys, range, CFSTR("TXM"));
+
+        bool isSPTM = CFArrayContainsValue(keys, range, CFSTR("SPTM")) && CFArrayContainsValue(keys, range, CFSTR("TXM"));
         CFRelease(keys);
+
         return isSPTM;
     }
-
-    return NO;
+    return false;
 }
 
 - (NSString *)versionSupportString
 {
+    cpu_subtype_t cpuFamily = 0;
+    size_t cpuFamilySize = sizeof(cpuFamily);
+    sysctlbyname("hw.cpufamily", &cpuFamily, &cpuFamilySize, NULL, 0);
+    
     if ([self isArm64e]) {
-        return @"iOS 15.0 - 16.5.1 (arm64e)";
+        if (cpuFamily == CPUFAMILY_ARM_VORTEX_TEMPEST || cpuFamily == CPUFAMILY_ARM_LIGHTNING_THUNDER) {
+            return @"iOS 15.0 - 18.7.1, 26.0 - 26.0.1 (A12/A13, PPL)";
+        }
+        else if (![self isSPTM]) {
+            return @"iOS 15.0 - 17.3.1 (PPL)";
+        }
+        else {
+            return @"iOS 17.0 - 17.3.1 (SPTM)";
+        }
     }
     else {
-        return @"iOS 15.0 - 16.7.16 (arm64)";
+        return @"iOS 15.0 - 18.7.1 (arm64)";
     }
 }
 
@@ -401,6 +374,19 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     return trollstoreInstallation;
 }
 
+- (void)updateJailbreakState
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        char *jbVersionC = NULL;
+        _isJailbroken = jbclient_dopamine_is_jailbroken(&jbVersionC);
+        if (jbVersionC) {
+            _jailbrokenVersion = [NSString stringWithUTF8String:jbVersionC];
+            free(jbVersionC);
+        }
+    });
+}
+
 - (BOOL)isJailbroken
 {
 /************** roothide specific ***********/
@@ -408,28 +394,36 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         return NO;
 /************** roothide specific ********/
 
-    
-    static BOOL jailbroken = NO;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+    [self updateJailbreakState];
+    return _isJailbroken;
+}
+
+- (void)setJailbroken:(BOOL)jailbroken withVersion:(NSString *)version
+{
+    _isJailbroken = jailbroken;
+    if (_isJailbroken) _jailbrokenVersion = version;
+}
+
+- (BOOL)isJailbrokenWithOtherJailbreak
+{
+    if (![self isJailbroken]) {
         uint32_t csFlags = 0;
         csops(getpid(), CS_OPS_STATUS, &csFlags, sizeof(csFlags));
-        jailbroken = csFlags & CS_PLATFORM_BINARY;
-    });
-    return jailbroken;
+        
+        // Palera1n
+        if (csFlags & CS_PLATFORM_BINARY) return YES;
+        
+        // Older Dopamine build
+        if (!access("/usr/lib/systemhook.dylib", F_OK)) return YES;
+    }
+    return NO;
 }
 
 - (NSString *)jailbrokenVersion
 {
-    if (!self.isJailbroken) return nil;
-
-    __block NSString *version;
-    [self runAsRoot:^{
-        [self runUnsandboxed:^{
-            version = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil];
-        }];
-    }];
-    return [[version componentsSeparatedByString:@"."] lastObject];
+    [self updateJailbreakState];
+    if (!_isJailbroken) return nil;
+    return _jailbrokenVersion;
 }
 
 - (NSString *)jailbrokenBasebinMD5
@@ -442,18 +436,18 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
             md5 = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.basebin_md5") encoding:NSUTF8StringEncoding error:nil];
         }];
     }];
-    return [md5 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [md5 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
 - (NSString *)launchedBasebinMD5
 {
-    NSString *md5Path = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.md5"];
+    NSString *md5Path = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"basebin.md5"];
     NSString *md5 = [NSString stringWithContentsOfFile:md5Path encoding:NSUTF8StringEncoding error:nil];
     if (md5.length > 0) {
-        return [md5 stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        return [md5 stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     }
 
-    NSString *basebinTarPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin.tar"];
+    NSString *basebinTarPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"basebin.tar"];
     return DOFileMD5AtPath(basebinTarPath);
 }
 
@@ -467,14 +461,28 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
             buildID = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.build_id") encoding:NSUTF8StringEncoding error:nil];
         }];
     }];
-    return [buildID stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [buildID stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
 - (NSString *)launchedBuildID
 {
-    NSString *buildIDPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"basebin-build-id.txt"];
+    NSString *buildIDPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"basebin-build-id.txt"];
     NSString *buildID = [NSString stringWithContentsOfFile:buildIDPath encoding:NSUTF8StringEncoding error:nil];
-    return [buildID stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [buildID stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+- (NSString *)jailbrokenVersionRootHide
+{
+    NSString *versionFile = JBROOT_PATH(@"/basebin/.version-roothide");
+    if(!versionFile) {
+        return nil;
+    }
+    return [NSString stringWithContentsOfFile:versionFile encoding:NSUTF8StringEncoding error:nil];
+}
+
+- (NSString *)systemVersion
+{
+    return (__bridge NSString *)MGCopyAnswer((__bridge CFStringRef)@"ProductVersion");
 }
 
 - (BOOL)isBootstrapped
@@ -487,7 +495,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     if ([self isInstalledThroughTrollStore]) {
         unsandboxBlock();
     }
-    else if([self isJailbroken]) {
+    else if ([self isJailbroken]) {
         uint64_t labelBackup = 0;
         jbclient_root_set_mac_label(1, -1, &labelBackup);
         unsandboxBlock();
@@ -501,22 +509,20 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (void)runAsRoot:(void (^)(void))rootBlock
 {
-    uint32_t orgUser = getuid();
-    uint32_t orgGroup = getgid();
-    if (geteuid() == 0 && orgGroup == 0) {
+    uint32_t orgUser = geteuid();
+    uint32_t orgGroup = getegid();
+    
+    if (orgUser == 0 && orgGroup == 0) {
         rootBlock();
         return;
     }
 
-    int ur = 0, gr = 0;
-    if (orgUser != 0) ur = setuid(0);
-    if (orgGroup != 0) gr = setgid(0);
-    if (ur == 0 && gr == 0) {
-        rootBlock();
+    if (self.isJailbroken) {
+        if (jbclient_dopamine_get_root() == 0) {
+            rootBlock();
+            jbclient_dopamine_drop_root();
+        }
     }
-    
-    if (gr == 0 && orgGroup != 0) setgid(orgGroup);
-    if (ur == 0 && orgUser != 0) seteuid(orgUser);
 }
 
 - (BOOL)installedBasebinSupportsRootHelperWaitProtocol
@@ -590,7 +596,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         if (result != 0) {
             break;
         }
-        if (![arg isKindOfClass:[NSString class]]) {
+        if (![arg isKindOfClass:NSString.class]) {
             result = EINVAL;
             break;
         }
@@ -708,7 +714,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 {
     if (![self installedBasebinSupportsRootHelperWaitProtocol]) {
         // Older RootHide jbctl binaries have no respring subcommand or
-        // --waitfor support. Preserve their existing direct sbreload path.
+        // --waitfor support. Preserve their direct sbreload fallback.
         __block pid_t pid = -1;
         __block int spawnResult = EPERM;
         [self runAsRoot:^{
@@ -738,6 +744,11 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 - (void)rebootUserspace
 {
     [self spawnJbctlAsRootWithArgs:@[@"reboot_userspace"]];
+}
+
+- (void)rebuildIconCache
+{
+    [self spawnJbctlAsRootWithArgs:@[@"rebuild_icon_cache"]];
 }
 
 - (void)refreshJailbreakApps
@@ -827,30 +838,25 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (NSString *)configuredTweakInjectionMode
 {
-    NSDictionary *modeConfiguration = DORootHideDictionaryAtCandidatePaths(DORootHideModeRelativePath);
-    NSString *configuredMode = DONormalizeRootHideInjectionMode(modeConfiguration[@"mode"]);
-    if (configuredMode) {
-        return configuredMode;
+    NSString *mode = DONormalizeRootHideInjectionMode(DORootHideDictionaryAtPath(DORootHideModeRelativePath)[@"mode"]);
+    if (mode) {
+        return mode;
     }
-
-    if (DORootHidePathExistsAtCandidatePaths(DORootHideUninjectRelativePath)) {
+    if (DORootHidePathExists(DORootHideUninjectRelativePath)) {
         return DORootHideInjectionModeBlacklist;
     }
-
-    if (DORootHidePathExistsAtCandidatePaths(DORootHideInjectRelativePath)) {
+    if (DORootHidePathExists(DORootHideInjectRelativePath)) {
         return DORootHideInjectionModeWhitelist;
     }
-
     NSString *preferredMode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]);
     return preferredMode ?: DORootHideInjectionModeStock;
 }
 
 - (void)ensureRootHideDictionaryExistsAtPath:(NSString *)path defaults:(NSDictionary *)defaults
 {
-    if (!path || [[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        return;
+    if (path.length > 0 && ![NSFileManager.defaultManager fileExistsAtPath:path]) {
+        [defaults writeToFile:path atomically:YES];
     }
-    [defaults writeToFile:path atomically:YES];
 }
 
 - (void)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox
@@ -858,23 +864,14 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     NSString *mode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]) ?: DORootHideInjectionModeStock;
 
     void (^syncBlock)(void) = ^{
-        NSFileManager *fileManager = [NSFileManager defaultManager];
+        NSFileManager *fileManager = NSFileManager.defaultManager;
         NSString *rootHidePath = JBROOT_PATH(DORootHideDirectoryRelativePath);
         if (rootHidePath.length == 0) {
             return;
         }
 
-        NSDictionary *directoryAttributes = @{
-            NSFilePosixPermissions : @(0755),
-            NSFileOwnerAccountID : @(501),
-            NSFileGroupOwnerAccountID : @(501),
-        };
-        NSDictionary *fileAttributes = @{
-            NSFilePosixPermissions : @(0644),
-            NSFileOwnerAccountID : @(501),
-            NSFileGroupOwnerAccountID : @(501),
-        };
-
+        NSDictionary *directoryAttributes = @{ NSFilePosixPermissions : @0755, NSFileOwnerAccountID : @501, NSFileGroupOwnerAccountID : @501 };
+        NSDictionary *fileAttributes = @{ NSFilePosixPermissions : @0644, NSFileOwnerAccountID : @501, NSFileGroupOwnerAccountID : @501 };
         if (![fileManager fileExistsAtPath:rootHidePath]) {
             [fileManager createDirectoryAtPath:rootHidePath withIntermediateDirectories:YES attributes:directoryAttributes error:nil];
         }
@@ -890,7 +887,9 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         [@{ @"mode" : mode } writeToFile:modePath atomically:YES];
         [self ensureRootHideDictionaryExistsAtPath:jetsamAddendPath defaults:DODefaultRootHideJetsamAddend()];
 
-        if ([mode isEqualToString:DORootHideInjectionModeWhitelist] || [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
+        if ([mode isEqualToString:DORootHideInjectionModeWhitelist] ||
+            [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] ||
+            [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
             [self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}];
             [self ensureRootHideDictionaryExistsAtPath:injectSystemPath defaults:DODefaultRootHideSystemInjection()];
             [self ensureRootHideDictionaryExistsAtPath:injectWantsBlacklistPath defaults:DODefaultRootHideWantsBlacklist()];
@@ -910,9 +909,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     };
 
     if (needsUnsandbox) {
-        [self runAsRoot:^{
-            [self runUnsandboxed:syncBlock];
-        }];
+        [self runAsRoot:^{ [self runUnsandboxed:syncBlock]; }];
     }
     else {
         syncBlock();
@@ -999,16 +996,16 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 {
     int r = 0;
     if (mounted != [self isFakelibMounted]) {
-        const char *arg = mounted ? "mount" : "unmount";
-        r = exec_cmd(JBROOT_PATH("/basebin/jbctl"), "internal", "fakelib", arg, NULL);
+        NSString *arg = mounted ? @"mount" : @"unmount";
+        r = [self spawnJbctlAsRootWithArgs:@[@"internal", @"fakelib", arg]];
     }
     return r;
 }
 
 - (int)setPrivatePrebootProtected:(BOOL)protected
 {
-    const char *arg = protected ? "activate" : "deactivate";
-    return exec_cmd(JBROOT_PATH("/basebin/jbctl"), "internal", "protection", arg, NULL);
+    NSString *arg = protected ? @"activate" : @"deactivate";
+    return [self spawnJbctlAsRootWithArgs:@[@"internal", @"protection", arg]];
 }
 
 - (BOOL)isJailbreakHidden
@@ -1060,7 +1057,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (NSString *)accessibleKernelPath
 {
-    if ([self isInstalledThroughTrollStore]) {
+    if ([self isInstalledThroughTrollStore] || getuid() == 0) {
         NSString *kernelcachePath = [[self activePrebootPath] stringByAppendingPathComponent:@"System/Library/Caches/com.apple.kernelcaches/kernelcache"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:kernelcachePath]) {
             return kernelcachePath;
@@ -1076,7 +1073,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         [[DOUIManager sharedInstance] sendLog:@"Downloading Kernel" debug:NO];
         NSString *kernelcachePath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kernelcache"];
         if (![[NSFileManager defaultManager] fileExistsAtPath:kernelcachePath]) {
-            if (grab_kernelcache(kernelcachePath) == false) return nil;
+            if (grab_images([NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]) == false) return nil;
         }
         return kernelcachePath;
     }
@@ -1084,26 +1081,24 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (NSString *)accessibleSPTMPath
 {
-    NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *sptmInAppPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"sptm.img4"];
-    if ([fileManager fileExistsAtPath:sptmInAppPath]) {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:sptmInAppPath]) {
         return sptmInAppPath;
     }
-
+    
     NSString *sptmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sptm.img4"];
-    if ([fileManager fileExistsAtPath:sptmInDocsPath]) {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:sptmInDocsPath]) {
         return sptmInDocsPath;
     }
-
+    
     sptmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sptm.im4p"];
-    if ([fileManager fileExistsAtPath:sptmInDocsPath]) {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:sptmInDocsPath]) {
         return sptmInDocsPath;
     }
 
-    // The active preboot volume is only accessible from a privileged app context.
     if ([self isInstalledThroughTrollStore] || getuid() == 0) {
-        NSString *sptmPath = [[self activePrebootPath] stringByAppendingPathComponent:@"usr/standalone/firmware/FUD/Ap,SecurePageTableMonitor.img4"];
-        if ([fileManager fileExistsAtPath:sptmPath]) {
+        NSString *sptmPath = [[self activePrebootPath] stringByAppendingPathComponent:@"/usr/standalone/firmware/FUD/Ap,SecurePageTableMonitor.img4"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:sptmPath]) {
             return sptmPath;
         }
     }
@@ -1113,32 +1108,31 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 
 - (NSString *)accessibleTXMPath
 {
-    NSFileManager *fileManager = [NSFileManager defaultManager];
     NSString *txmInAppPath = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"txm.img4"];
-    if ([fileManager fileExistsAtPath:txmInAppPath]) {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:txmInAppPath]) {
         return txmInAppPath;
     }
-
+    
     NSString *txmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/txm.img4"];
-    if ([fileManager fileExistsAtPath:txmInDocsPath]) {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:txmInDocsPath]) {
         return txmInDocsPath;
     }
-
+    
     txmInDocsPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/txm.im4p"];
-    if ([fileManager fileExistsAtPath:txmInDocsPath]) {
+    if ([[NSFileManager defaultManager] fileExistsAtPath:txmInDocsPath]) {
         return txmInDocsPath;
     }
 
-    // Keep the RootHide preboot resolver authoritative; never infer /var/jb here.
     if ([self isInstalledThroughTrollStore] || getuid() == 0) {
-        NSString *txmPath = [[self activePrebootPath] stringByAppendingPathComponent:@"usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4"];
-        if ([fileManager fileExistsAtPath:txmPath]) {
+        NSString *txmPath = [[self activePrebootPath] stringByAppendingPathComponent:@"/usr/standalone/firmware/FUD/Ap,TrustedExecutionMonitor.img4"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:txmPath]) {
             return txmPath;
         }
     }
 
     return nil;
 }
+
 
 - (BOOL)isPACBypassRequired
 {
@@ -1257,7 +1251,7 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         UIImage *bootLogoImage;
 
         if ([[DOPreferenceManager sharedManager] boolPreferenceValueForKey:@"customBootlogoEnabled" fallback:NO]) {
-            bootLogoImage = [UIImage imageWithContentsOfFile:[DOUIManager sharedInstance].bootlogoPath];
+            bootLogoImage = [NSClassFromString(@"UIImage") imageWithContentsOfFile:[DOUIManager sharedInstance].bootlogoPath];
         }
 
         if (!bootLogoImage) {

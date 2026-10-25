@@ -41,7 +41,7 @@
   "owners": [
     {
       "id": "mode-resolution",
-      "owner": "BaseBin/systemhook/src/common.c",
+      "owner": "BaseBin/systemhook/src/common/common.c",
       "phase": "pre-spawn and runtime mode lookup",
       "symbols": [
         "root_hide_injection_mode",

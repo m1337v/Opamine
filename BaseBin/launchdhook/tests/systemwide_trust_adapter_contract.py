@@ -101,6 +101,9 @@ def main() -> int:
             "transaction input is released before the signer runs")
     require("return result;" in handler,
             "transaction/preparation errors are not propagated to the caller")
+    require("if (result == 0 && attach)" in handler and
+            "fcntl(fd, F_ADDSIGS, &sigInfos[i].signature)" in handler,
+            "Dopamine 3 attach requests must receive the exact refreshed local signature")
 
     print("systemwide trust adapter contract: RootHide jbrand/policy + D3 transaction: PASS")
     return 0

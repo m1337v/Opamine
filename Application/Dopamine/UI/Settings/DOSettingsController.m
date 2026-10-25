@@ -13,6 +13,7 @@
 #import "DOPkgManagerPickerViewController.h"
 #import "DOHeaderCell.h"
 #import "DOEnvironmentManager.h"
+#import "DOEnvironmentManager+RootHide.h"
 #import "DOExploitManager.h"
 #import "DOPSListItemsController.h"
 #import "DOPSExploitListItemsController.h"
@@ -151,13 +152,7 @@
 
 - (NSArray *)tweakInjectionModeIdentifiers
 {
-    return @[
-        DORootHideInjectionModeStock,
-        DORootHideInjectionModeBlacklist,
-        DORootHideInjectionModeWhitelist,
-        DORootHideInjectionModeHiddenWhitelist,
-        DORootHideInjectionModeBlacklistAllowlist,
-    ];
+    return @[DORootHideInjectionModeStock, DORootHideInjectionModeBlacklist, DORootHideInjectionModeWhitelist, DORootHideInjectionModeHiddenWhitelist, DORootHideInjectionModeBlacklistAllowlist];
 }
 
 - (NSArray *)tweakInjectionModeTitles
@@ -182,6 +177,7 @@
         
         SEL defGetter = @selector(readPreferenceValue:);
         SEL defSetter = @selector(setPreferenceValue:specifier:);
+        SEL expGetter = @selector(readExploitPreferenceValue:);
         
         NSSortDescriptor *prioritySortDescriptor = [NSSortDescriptor sortDescriptorWithKey:@"priority" ascending:NO];
         
@@ -202,7 +198,7 @@
                 exploitGroupSpecifier.name = DOLocalizedString(@"Section_Exploits");
                 [specifiers addObject:exploitGroupSpecifier];
                 
-                PSSpecifier *kernelExploitSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Kernel Exploit") target:self set:defSetter get:defGetter detail:nil cell:PSLinkListCell edit:nil];
+                PSSpecifier *kernelExploitSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Kernel Exploit") target:self set:defSetter get:expGetter detail:nil cell:PSLinkListCell edit:nil];
                 [kernelExploitSpecifier setProperty:@YES forKey:@"enabled"];
                 [kernelExploitSpecifier setProperty:exploitManager.preferredKernelExploit.identifier forKey:@"default"];
                 kernelExploitSpecifier.detailControllerClass = [DOPSExploitListItemsController class];
@@ -213,7 +209,7 @@
                 [specifiers addObject:kernelExploitSpecifier];
                 
                 if (envManager.isArm64e) {
-                    PSSpecifier *pacBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"PAC Bypass") target:self set:defSetter get:defGetter detail:nil cell:PSLinkListCell edit:nil];
+                    PSSpecifier *pacBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"PAC Bypass") target:self set:defSetter get:expGetter detail:nil cell:PSLinkListCell edit:nil];
                     [pacBypassSpecifier setProperty:@YES forKey:@"enabled"];
                     DOExploit *preferredPACBypass = exploitManager.preferredPACBypass;
                     if (!preferredPACBypass) {
@@ -229,7 +225,13 @@
                     [pacBypassSpecifier setProperty:([envManager isPACBypassRequired] ? _availablePACBypasses.firstObject.identifier : @"none") forKey:@"recommendedExploitIdentifier"];
                     [specifiers addObject:pacBypassSpecifier];
                     
-                    PSSpecifier *pplBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"PPL Bypass") target:self set:defSetter get:defGetter detail:nil cell:PSLinkListCell edit:nil];
+                    NSString *pplBypassName = @"PPL Bypass";
+                    if ([DOEnvironmentManager sharedManager].isSPTM) {
+                        // SPTM bypasses are also handled as PPL bypasses in the code, we just change the name of the setting in the UI
+                        pplBypassName = @"SPTM Bypass";
+                    }
+
+                    PSSpecifier *pplBypassSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(pplBypassName) target:self set:defSetter get:expGetter detail:nil cell:PSLinkListCell edit:nil];
                     [pplBypassSpecifier setProperty:@YES forKey:@"enabled"];
                     [pplBypassSpecifier setProperty:exploitManager.preferredPPLBypass.identifier forKey:@"default"];
                     pplBypassSpecifier.detailControllerClass = [DOPSExploitListItemsController class];
@@ -254,7 +256,7 @@
             PSSpecifier *tweakInjectionModeSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Settings_Tweak_Injection_Mode") target:self set:@selector(setTweakInjectionMode:specifier:) get:@selector(readTweakInjectionMode:) detail:nil cell:PSLinkListCell edit:nil];
             [tweakInjectionModeSpecifier setProperty:@YES forKey:@"enabled"];
             [tweakInjectionModeSpecifier setProperty:@"tweakInjectionMode" forKey:@"key"];
-            [tweakInjectionModeSpecifier setProperty:[[self tweakInjectionModeIdentifiers] firstObject] forKey:@"default"];
+            [tweakInjectionModeSpecifier setProperty:self.tweakInjectionModeIdentifiers.firstObject forKey:@"default"];
             tweakInjectionModeSpecifier.detailControllerClass = [DOPSListItemsController class];
             [tweakInjectionModeSpecifier setProperty:@"tweakInjectionModeIdentifiers" forKey:@"valuesDataSource"];
             [tweakInjectionModeSpecifier setProperty:@"tweakInjectionModeTitles" forKey:@"titlesDataSource"];
@@ -309,12 +311,12 @@
                 [removeJailbreakSwitchSpecifier setProperty:@"removeJailbreakEnabled" forKey:@"key"];
                 [specifiers addObject:removeJailbreakSwitchSpecifier];
             }
-            
+
             if (envManager.isBootstrapped) {
                 PSSpecifier *actionsGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
                 actionsGroupSpecifier.name = DOLocalizedString(@"Section_Actions");
                 [specifiers addObject:actionsGroupSpecifier];
-                
+
                 if (envManager.isJailbroken) {
                     PSSpecifier *refreshAppsSpecifier = [PSSpecifier preferenceSpecifierNamed:@"" target:self set:defSetter get:defGetter detail:nil cell:PSStaticTextCell edit:nil];
                     [refreshAppsSpecifier setProperty:@"Button_Refresh_Jailbreak_Apps" forKey:@"title"];
@@ -343,12 +345,13 @@
                     [reinstallPackageManagersSpecifier setProperty:@"reinstallPackageManagersPressed" forKey:@"action"];
                     [specifiers addObject:reinstallPackageManagersSpecifier];
                 }
-                // A live jailbreak must be removed by the reboot/rejailbreak flow.
-                // Direct deletion is only supported for a TrollStore install while
-                // the environment is inactive; exposing it while jailbroken can
-                // leave a half-removed randomized RootHide root behind.
-                if (!envManager.isJailbroken && envManager.isInstalledThroughTrollStore && envManager.isBootstrapped) {
+
 /*
+                BOOL hideJailbreakButtonShown = (envManager.isJailbroken || (envManager.isInstalledThroughTrollStore && !envManager.isJailbreakHidden));
+                if (hideJailbreakButtonShown) {
+                    // The "Hide Jailbreak" button should be shown
+                    // - When jailbroken
+                    // - When Dopamine is installed by TrollStore and the jailbreak is not hidden yet
                     PSSpecifier *hideUnhideJailbreakSpecifier = [PSSpecifier preferenceSpecifierNamed:@"" target:self set:defSetter get:defGetter detail:nil cell:PSStaticTextCell edit:nil];
                     [hideUnhideJailbreakSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];
                     [hideUnhideJailbreakSpecifier setProperty:buttonHeight forKey:@"height"];
@@ -361,30 +364,29 @@
                         [hideUnhideJailbreakSpecifier setProperty:@"eye.slash" forKey:@"image"];
                     }
                     [hideUnhideJailbreakSpecifier setProperty:@"hideUnhideJailbreakPressed" forKey:@"action"];
-                    BOOL hideJailbreakButtonShown = (envManager.isJailbroken || (envManager.isInstalledThroughTrollStore && envManager.isBootstrapped && !envManager.isJailbreakHidden));
-                    if (hideJailbreakButtonShown) {
-                        [specifiers addObject:hideUnhideJailbreakSpecifier];
-                    }
+                    [specifiers addObject:hideUnhideJailbreakSpecifier];
+                }
 */
-                    
+
+                if (!envManager.isJailbroken && envManager.isInstalledThroughTrollStore) {
+                    // The "Remove Jailbreak" button cannot show when being jailbroken since pressing it would kinda be russian roulette
+                    // It might work, it might not and panic your device and leave it in a half uninstalled state
+                    // So this button is only for when you're not jailbroken and have Dopamine installed with TrollStore
+                    // The only supported uninstallation flow without TrollStore is to reboot and "rejailbreak" with "Remove Jailbreak" toggle enabled
                     PSSpecifier *removeJailbreakSpecifier = [PSSpecifier preferenceSpecifierNamed:@"" target:self set:defSetter get:defGetter detail:nil cell:PSStaticTextCell edit:nil];
                     [removeJailbreakSpecifier setProperty:@"Button_Remove_Jailbreak" forKey:@"title"];
                     [removeJailbreakSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];
                     [removeJailbreakSpecifier setProperty:buttonHeight forKey:@"height"];
                     [removeJailbreakSpecifier setProperty:@"trash" forKey:@"image"];
                     [removeJailbreakSpecifier setProperty:@"removeJailbreakPressed" forKey:@"action"];
-/*
-                    if (hideJailbreakButtonShown) {
-                        if (envManager.isJailbroken) {
-                            [removeJailbreakSpecifier setProperty:DOLocalizedString(@"Hint_Hide_Jailbreak_Jailbroken") forKey:@"footerText"];
-                        }
-                        else {
-                            [removeJailbreakSpecifier setProperty:DOLocalizedString(@"Hint_Hide_Jailbreak") forKey:@"footerText"];
-                        }
-                    }
-*/
                     [specifiers addObject:removeJailbreakSpecifier];
                 }
+                
+/*
+                if (hideJailbreakButtonShown) {
+                    [actionsGroupSpecifier setProperty:DOLocalizedString(envManager.isJailbroken ? @"Hint_Hide_Jailbreak_Jailbroken" : @"Hint_Hide_Jailbreak") forKey:@"footerText"];
+                }
+*/
             }
         }
         
@@ -455,6 +457,32 @@
     return value;
 }
 
+- (id)readExploitPreferenceValue:(PSSpecifier *)specifier
+{
+    id value = [self readPreferenceValue:specifier];
+
+    SEL dataSourceSel = nil;
+    NSString *selString = [specifier propertyForKey:@"valuesDataSource"];
+    if (selString) {
+        dataSourceSel = NSSelectorFromString(selString);
+    }
+
+    if (dataSourceSel && [value isKindOfClass:[NSString class]]) {
+        NSString *valueString = (NSString *)value;
+
+        IMP imp = [specifier.target methodForSelector:dataSourceSel];
+        if (imp) {
+            NSArray *(*func)(id, SEL) = (void *)imp;
+            NSArray *availableIdentifiers = func(specifier.target, dataSourceSel);
+            if (![availableIdentifiers containsObject:valueString]) {
+                return [specifier propertyForKey:@"default"];
+            }
+        }
+    }
+
+    return value;
+}
+
 - (id)readIDownloadEnabled:(PSSpecifier *)specifier
 {
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
@@ -487,7 +515,7 @@
     [self setPreferenceValue:value specifier:specifier];
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     if (envManager.isJailbroken) {
-        [[DOEnvironmentManager sharedManager] setTweakInjectionEnabled:((NSNumber *)value).boolValue];
+        [envManager setTweakInjectionEnabled:((NSNumber *)value).boolValue];
         [self presentUserspaceRebootAlert];
     }
 }
@@ -495,17 +523,13 @@
 - (id)readTweakInjectionMode:(PSSpecifier *)specifier
 {
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
-    if (envManager.isJailbroken) {
-        return [envManager configuredTweakInjectionMode];
-    }
-    return [self readPreferenceValue:specifier];
+    return envManager.isJailbroken ? envManager.configuredTweakInjectionMode : [self readPreferenceValue:specifier];
 }
 
 - (void)setTweakInjectionMode:(id)value specifier:(PSSpecifier *)specifier
 {
     NSString *previousMode = [self readTweakInjectionMode:specifier];
     [self setPreferenceValue:value specifier:specifier];
-
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     if (envManager.isJailbroken) {
         [envManager syncRootHideInjectionSettingsNeedsUnsandbox:YES];
@@ -779,15 +803,12 @@
 
 - (void)presentUserspaceRebootAlert
 {
-    UIAlertController *userspaceRebootAlertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Title") message:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Body") preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *rebootNowAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Now") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Title") message:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Body") preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Now") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [[DOEnvironmentManager sharedManager] rebootUserspace];
-    }];
-    UIAlertAction *rebootLaterAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Later") style:UIAlertActionStyleCancel handler:nil];
-
-    [userspaceRebootAlertController addAction:rebootNowAction];
-    [userspaceRebootAlertController addAction:rebootLaterAction];
-    [self presentViewController:userspaceRebootAlertController animated:YES completion:nil];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Alert_Tweak_Injection_Toggled_Reboot_Later") style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 

@@ -5,7 +5,7 @@ CFLAGS = -framework Foundation -framework CoreServices -framework Security -I../
 LDFLAGS = -dynamiclib -rpath @loader_path/present -rpath @loader_path/fallback -L../_external/lib -lellekit -framework IOKit
 
 sign: $(TARGET)
-	@ldid -S $^
+	@ldid -Cadhoc -S $^
 
 $(TARGET): $(wildcard src/*.m src/*.c ../libjailbreak/src/jbclient_*.c)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^

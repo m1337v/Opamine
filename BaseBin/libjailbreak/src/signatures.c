@@ -24,7 +24,7 @@
 #include "kernel.h"
 #include "primitives.h"
 #include "codesign.h"
-#include "roothider.h"
+#include <libroothider/libroothider.h>
 
 static void signature_outputs_clear(cdhash_t **cdhashesOut, uint32_t *cdhashCountOut)
 {

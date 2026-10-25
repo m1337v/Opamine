@@ -16,6 +16,10 @@
 #include <libjailbreak/jbclient_xpc.h>
 #include <libjailbreak/codesign.h>
 #include <libjailbreak/jbroot.h>
+#include <libjailbreak/hookd.h>
+#include "common/hookd_external.h"
+#include "common/inline.h"
+#include <choma/CSBlob.h>
 #include "../dyldhook/src/dyld_jbinfo.h"
 #include "litehook.h"
 #include "sandbox.h"
@@ -404,6 +408,62 @@ int __execve_hook(const char *path, char *const argv[], char *const envp[])
 	return roothide_systemhook___execve_prehook(path, argv, envp, (void *)roothide_systemhook___execve_posthook, jbclient_trust_file_by_path);
 }
 
+xpc_object_t copy_entitlements_xpc(void)
+{
+	pid_t pid = getpid();
+	CS_GenericBlob hdr = {0};
+
+	// Get size (will fail with ERANGE)
+	if (csops(pid, CS_OPS_ENTITLEMENTS_BLOB, &hdr, sizeof(hdr)) != 0) {
+		if (errno != ERANGE) {
+			return NULL;
+		}
+	}
+
+hdr.length = ntohl(hdr.length);
+
+	if (hdr.length <= sizeof(hdr)) {
+		// No entitlements
+		return NULL;
+	}
+
+	// Get blob
+	void *buf = malloc(hdr.length);
+	if (!buf)
+		return NULL;
+
+	if (csops(pid, CS_OPS_ENTITLEMENTS_BLOB, buf, hdr.length) != 0) {
+		free(buf);
+		return NULL;
+	}
+
+	// Skip cs_blob header
+	const void *plist = (const uint8_t *)buf + sizeof(CS_GenericBlob);
+	size_t plist_size = hdr.length - sizeof(CS_GenericBlob);
+
+	// Convert to XPC dictionary
+	xpc_object_t obj = xpc_create_from_plist(plist, plist_size);
+
+	free(buf);
+
+	if (!obj || xpc_get_type(obj) != XPC_TYPE_DICTIONARY) {
+		if (obj) xpc_release(obj);
+		return NULL;
+	}
+
+	return obj;
+}
+
+bool process_requires_hookd(void)
+{
+	xpc_object_t entitlementsXdict = copy_entitlements_xpc();
+	if (!entitlementsXdict) return true;
+
+	bool requiresHookd = xpc_dictionary_get_bool(entitlementsXdict, "com.apple.private.cs.debugger") != true;
+	xpc_release(entitlementsXdict);
+	return requiresHookd;
+}
+
 const struct mach_header_64 *get_dyld_mach_header(void)
 {
 	static const struct mach_header_64 *dyldMachHeader = NULL;
@@ -523,7 +583,7 @@ __attribute__((constructor)) static void initializer(void)
 		rhi_diag_log("dyldhook jbinfo failed (%d), trying jbclient checkin", dyldCheckinResult);
 		// If under any circumstances dyldhook has *not* performed a check-in, do it now
 		// This code path is taken inside xpcproxy on iOS 16, because launchd apparently no longer passes it a bootstrap port
-		int processCheckinResult = jbclient_process_checkin(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged);
+		int processCheckinResult = jbclient_process_checkin(&JB_RootPath, &JB_BootUUID, &JB_SandboxExtensions, &gFullyDebugged, NULL);
 		if (processCheckinResult == 0) {
 			rhi_diag_log("jbclient checkin OK");
 			consume_tokenized_sandbox_extensions(JB_SandboxExtensions);
@@ -556,6 +616,37 @@ __attribute__((constructor)) static void initializer(void)
 		sanitize_dyld_insert_libraries_env();
 	}
 	rhi_diag_log("POST-SANITIZE DYLD_INSERT_LIBRARIES=%s", getenv("DYLD_INSERT_LIBRARIES") ?: "(null)");
+
+	// On iOS 26+, hooks have to be applied through hookd
+	if (__builtin_available(iOS 19.0, *)) {
+
+		// If available, use jbclient_mach_hookd_send_msg inside dyld instead...
+		// The reason for this is that dyldhook in itself is fully self contained without calling any external code
+		// We want to make sure no external code is invoked when some binary calls vm_protect
+		// This is mainly due to the fact if the binary is trying to remove the executable flag of a page our logic depends on, the binary will crash
+		// Frida is notorious for this, it hooks something in libsystem in every process it injects to
+		// Alternatively we could also
+		// - Implement inline mach_msg* syscalls into systemhook
+		// - Refactor all logic involving hookd into it's own library and implement the inline syscalls there
+		// But for now this works, the only problem could be something trying to hook a page in dyld itself....
+		void *dyld_jbclient_mach_hookd_send_msg = litehook_find_symbol(get_dyld_mach_header(), "_jbclient_mach_hookd_send_msg");
+		if (dyld_jbclient_mach_hookd_send_msg) {
+			hookd_send_msg = dyld_jbclient_mach_hookd_send_msg;
+		}
+
+/**************************** roothide specfic **********************/
+		if(!dyld_jbclient_mach_hookd_send_msg) {
+			extern int inline_jbclient_mach_hookd_send_msg(struct hookd_mach_msg *hookdMsg, struct hookd_mach_msg_reply *hookdReply);
+			hookd_send_msg = inline_jbclient_mach_hookd_send_msg;
+		}
+/********************************************************************/
+
+		if (process_requires_hookd()) {
+			litehook_hook_memory = litehook_hook_memory_hookd;
+			litehook_hook_function(mach_vm_protect, mach_vm_protect_fixed);
+			init_hookd_external_support();
+		}
+	}
 
 	// Install dylib image hiding hooks for hidden-injection processes.
 	// Must happen after env consumption (filter is loaded) and before
@@ -608,6 +699,11 @@ __attribute__((constructor)) static void initializer(void)
 			if (gDyldPtr) {
 				// TODO: Maybe we can just rebind sandbox_apply instead?
 				dyld_hook_routine(*gDyldPtr, 17, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+			} else {
+				void ***gAPIsPtr = litehook_find_dsc_symbol("/usr/lib/system/libdyld.dylib", "__ZN5dyld45gAPIsE");
+				if (gAPIsPtr) {
+					dyld_hook_routine(*gAPIsPtr, 16, (void *)&dyld_dlsym_hook, (void **)&dyld_dlsym_orig, 0x839D);
+				}
 			}
 		} else {
 			rhi_diag_log("hidden injection: refusing unverified gDyld vtable mutation");

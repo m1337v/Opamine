@@ -16,41 +16,47 @@ static pthread_mutex_t gLock;
 void flush_tlb(void)
 {
 	if (__builtin_available(iOS 27.0, *)) {
-		/* Newer kernels do not reliably flush this user controlled ASID. */
+		// HACK FIX: Tlb flush seems unreliable on iOS 27 :/
+		// I made sure the asid offset is correct, don't know what's wrong
+		// So we just fall back to the good old reliable (but slow) way
 		usleep(80);
 		usleep(80);
 		__asm("dmb sy");
 		return;
 	}
 
-	if (gAsid && koffsetof(pmap, sw_asid)) {
-		uint8_t *swAsid = (uint8_t *)gAsid;
-		uint8_t fakeAsid = UINT8_MAX;
-		uint8_t origAsid = *swAsid;
-		if (origAsid != fakeAsid) {
-			*swAsid = fakeAsid;
-			__asm("dmb sy");
-			usleep(0);
-			*swAsid = origAsid;
-			__asm("dmb sy");
-			return;
+	if (gAsid) {
+		if (koffsetof(pmap, sw_asid)) {
+			uint8_t *swAsid = (uint8_t *)gAsid;
+			uint8_t fakeSwAsid = UINT8_MAX;
+			uint8_t origAsid = *swAsid;
+			if (origAsid != fakeSwAsid) {
+				*swAsid = fakeSwAsid;
+				__asm("dmb sy");
+				usleep(0); // Force context switch
+				*swAsid = origAsid;
+				__asm("dmb sy");
+				return;
+			}
+		}
+		else if (koffsetof(pmap, asid)) {
+			uint16_t *asid = (uint16_t *)gAsid;
+			uint16_t fakeAsid = UINT16_MAX;
+			uint16_t origAsid = *asid;
+			if (origAsid != fakeAsid) {
+				*asid = fakeAsid;
+				__asm("dmb sy");
+				usleep(0); // Force context switch
+				*asid = origAsid;
+				__asm("dmb sy");
+				return;
+			}
 		}
 	}
-	else if (gAsid && koffsetof(pmap, asid)) {
-		uint16_t *asid = (uint16_t *)gAsid;
-		uint16_t fakeAsid = UINT16_MAX;
-		uint16_t origAsid = *asid;
-		if (origAsid != fakeAsid) {
-			*asid = fakeAsid;
-			__asm("dmb sy");
-			usleep(0);
-			*asid = origAsid;
-			__asm("dmb sy");
-			return;
-		}
-	}
-
-	/* Missing capability data or a reserved ASID: use the conservative path. */
+	
+	// Fallback if either
+	// gAsid is NULL
+	// origAsid == fakeSwAsid
 	usleep(80);
 	usleep(80);
 	__asm("dmb sy");

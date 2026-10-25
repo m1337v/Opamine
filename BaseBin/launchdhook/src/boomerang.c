@@ -5,9 +5,9 @@
 #include <libjailbreak/physrw.h>
 #include <libjailbreak/physrw_pte.h>
 #include <libjailbreak/primitives_IOSurface.h>
-#include <libjailbreak/kalloc_pt.h>
 #include <libjailbreak/kcall_Fugu14.h>
 #include <libjailbreak/kcall_arm64.h>
+#include <libjailbreak/stock_fixes.h>
 #include <unistd.h>
 
 int posix_spawnattr_set_registered_ports_np(posix_spawnattr_t *__restrict attr, mach_port_t portarray[], uint32_t count);

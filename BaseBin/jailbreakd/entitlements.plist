@@ -6,11 +6,15 @@
 	<true/>
 	<key>task_for_pid-allow</key>
 	<true/>
+	<key>com.apple.private.cs.debugger</key>
+	<true/>
 	<key>com.apple.system-task-ports</key>
 	<true/>
 	<key>com.apple.system-task-ports.control</key>
 	<true/>
 	<key>com.apple.private.thread-set-state</key>
+	<true/>
+	<key>com.apple.private.set-exception-port</key>
 	<true/>
 	<key>com.apple.private.security.no-sandbox</key>
 	<true/>

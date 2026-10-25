@@ -20,15 +20,17 @@ build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar FORCE
 	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO GCC_PREPROCESSOR_DEFINITIONS='NIGHTLY=1 COMMIT_HASH=\"$(COMMIT_HASH)\"'
 else
 build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar FORCE
-	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO MARKETING_VERSION="$(shell cat ../BaseBin/_external/basebin/.version)"
+	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
 endif
 	touch build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine.roothide
+	cp -a Dopamine/Resources/*.deb build/Build/Products/Debug-iphoneos/Dopamine.app/
 	cp -f ../BaseBin/basebin.tar build/Build/Products/Debug-iphoneos/Dopamine.app/basebin.tar
 	md5 -q ../BaseBin/basebin.tar > build/Build/Products/Debug-iphoneos/Dopamine.app/basebin.md5
 	cp -f ../BaseBin/.build/.build_id build/Build/Products/Debug-iphoneos/Dopamine.app/basebin-build-id.txt
-	cp -a Dopamine/Resources/*.deb build/Build/Products/Debug-iphoneos/Dopamine.app/
+	cp ../BaseBin/.build/libroothider.dylib build/Build/Products/Debug-iphoneos/Dopamine.app/
+	plutil -replace CFBundleIdentifier -string "com.m1337v.Opamine" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
+	plutil -replace CFBundleShortVersionString -string "$(shell cat ../BaseBin/_external/basebin/.version)-$(shell cat ../BaseBin/_external/basebin/.version-roothide)" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
 # ifeq ($(PALEHIDE), 1)
-	find /var/folders -type d -path '*/C/clang/ModuleCache' -prune -exec rm -rf {} + 2>/dev/null || true
 	make -C Dopamine/Exploits/palera1n package
 	cp -a Dopamine/Exploits/palera1n/.framework build/Build/Products/Debug-iphoneos/Dopamine.app/Frameworks/palera1n.framework
 # endif

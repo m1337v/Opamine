@@ -9,18 +9,20 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface DOBootstrapper : NSObject <NSURLSessionDelegate, NSURLSessionDownloadDelegate>
-{
-    NSURLSession *_urlSession;
-    NSURLSessionDownloadTask *_bootstrapDownloadTask;
-    void (^_downloadCompletionBlock)(NSURL * _Nullable location, NSError * _Nullable error);
-}
+extern NSString *const bootstrapErrorDomain;
+typedef NS_ENUM(NSInteger, BootstrapErrorCode) {
+    BootstrapErrorCodeFailedToGetURL            = -1,
+    BootstrapErrorCodeFailedToDownload          = -2,
+    BootstrapErrorCodeFailedDecompressing       = -3,
+    BootstrapErrorCodeFailedExtracting          = -4,
+    BootstrapErrorCodeFailedRemount             = -5,
+    BootstrapErrorCodeFailedFinalising          = -6,
+    BootstrapErrorCodeFailedReplacing           = -7,
+};
 
-- (void)prepareBootstrapWithCompletion:(void (^)(NSError *))completion;
-- (NSError *)ensurePrivatePrebootIsWritable;
+@interface DOBootstrapper : NSObject
+
 - (NSError *)installPackageManagers;
-- (NSError *)finalizeBootstrap;
-- (NSError *)deleteBootstrap;
 
 @end
 

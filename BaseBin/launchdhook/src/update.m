@@ -6,29 +6,11 @@
 #include <libjailbreak/basebin_gen.h>
 #include <xpc/xpc.h>
 #include <dlfcn.h>
-#include <CommonCrypto/CommonDigest.h>
 
 #import <Foundation/Foundation.h>
 
 //void abort_with_reason(uint32_t reason_namespace, uint64_t reason_code, const char *reason_string, uint64_t reason_flags);
 #define abort_with_reason(reason_namespace,reason_code,reason_string,reason_flags)  launchd_panic("%s",reason_string)
-
-static NSString *basebin_tar_md5(NSString *path)
-{
-	NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
-	if (data.length == 0) {
-		return nil;
-	}
-
-	unsigned char digest[CC_MD5_DIGEST_LENGTH] = {0};
-	CC_MD5(data.bytes, (CC_LONG)data.length, digest);
-
-	NSMutableString *hash = [NSMutableString stringWithCapacity:CC_MD5_DIGEST_LENGTH * 2];
-	for (NSUInteger i = 0; i < CC_MD5_DIGEST_LENGTH; i++) {
-		[hash appendFormat:@"%02x", digest[i]];
-	}
-	return hash;
-}
 
 static bool jbupdate_append_xpf_set(const char *sets[], size_t capacity, size_t *setCount, const char *set)
 {
@@ -48,7 +30,6 @@ int jbupdate_basebin(const char *basebinTarPath)
 		if (access(basebinTarPath, F_OK) != 0) return 1;
 
 		NSString *prevVersion = [NSString stringWithContentsOfFile:JBROOT_PATH(@"/basebin/.version") encoding:NSUTF8StringEncoding error:nil] ?: @"2.0";
-		NSString *basebinMD5 = basebin_tar_md5(@(basebinTarPath));
 
 		// Extract basebin tar
 		NSString *tmpExtractionPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
@@ -79,9 +60,6 @@ int jbupdate_basebin(const char *basebinTarPath)
 			[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
 			return 5;
 		}
-		else {
-			[[NSFileManager defaultManager] removeItemAtPath:trustcachePath error:nil];
-		}
 
 		// Replace basebin content
 		NSArray *newBasebinContents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:tmpBasebinPath error:nil];
@@ -92,9 +70,6 @@ int jbupdate_basebin(const char *basebinTarPath)
 				[[NSFileManager defaultManager] removeItemAtPath:oldBasebinPath error:nil];
 			}
 			[[NSFileManager defaultManager] copyItemAtPath:newBasebinPath toPath:oldBasebinPath error:nil];
-		}
-		if (basebinMD5.length > 0) {
-			[basebinMD5 writeToFile:JBROOT_PATH(@"/basebin/.basebin_md5") atomically:YES encoding:NSUTF8StringEncoding error:nil];
 		}
 		[[NSFileManager defaultManager] removeItemAtPath:tmpExtractionPath error:nil];
 
@@ -150,13 +125,19 @@ void jbupdate_update_system_info(void)
 			return;
 		}
 
-		// Read these before invoking XPF. Their presence means the prior launchd
-		// state was built with the SPTM/TXM path and must not be downgraded.
+		/* Updating runs with dynamically-loaded XPF.  Preserve the serialized
+		 * launchd image bases rather than allowing a partial invocation to erase
+		 * the SPTM/TXM capability state. */
 		xpc_object_t systemInfoXdict = jbinfo_get_serialized();
+		if (!systemInfoXdict || xpc_get_type(systemInfoXdict) != XPC_TYPE_DICTIONARY) {
+			dlclose(xpfHandle);
+			abort_with_reason(7, 1, "Dopamine: serialized launchd system information is invalid.", 0);
+			return;
+		}
 		uint64_t staticBase = systemInfoXdict ? xpc_dictionary_get_uint64(systemInfoXdict, "kernelConstant.staticBase") : 0;
 		uint64_t staticSptmBase = systemInfoXdict ? xpc_dictionary_get_uint64(systemInfoXdict, "kernelConstant.staticSptmBase") : 0;
 		uint64_t staticTxmBase = systemInfoXdict ? xpc_dictionary_get_uint64(systemInfoXdict, "kernelConstant.staticTxmBase") : 0;
-		if (!systemInfoXdict || !staticBase) {
+		if (!staticBase) {
 			dlclose(xpfHandle);
 			abort_with_reason(7, 1, "Dopamine: existing static kernel image base is unavailable.", 0);
 			return;
@@ -215,26 +196,20 @@ void jbupdate_update_system_info(void)
 				error = "Dopamine: XPF set list overflow while preparing perfkrw offsets.";
 			}
 
-			// RootHide requires this validated pair for its namecache implementation.
+			/* RootHide consumes this validated set for namecache hiding. */
 			if (!error && (!xpf_set_is_supported("namecache") ||
 				!jbupdate_append_xpf_set(sets, sizeof(sets) / sizeof(*sets), &setCount, "namecache"))) {
 				error = "Dopamine: RootHide namecache offsets are unavailable.";
 			}
 
 			bool requiresAMFIOIDs = false;
-			if (__builtin_available(iOS 16.0, *)) {
-				requiresAMFIOIDs = true;
-			}
+			if (__builtin_available(iOS 16.0, *)) requiresAMFIOIDs = true;
 			if (!error && requiresAMFIOIDs && (!xpf_set_is_supported("amfi_oids") ||
 				!jbupdate_append_xpf_set(sets, sizeof(sets) / sizeof(*sets), &setCount, "amfi_oids"))) {
-				// launchd's first-load path must not call hideDeveloperMode with
-				// unvalidated or missing AMFI record offsets.
 				error = "Dopamine: validated RootHide AMFI developer-mode offsets are unavailable.";
 			}
 
-			if (!error) {
-				newSystemInfoXdict = xpf_construct_offset_dictionary(sets);
-			}
+			if (!error) newSystemInfoXdict = roothide_xpf_construct_offset_dictionary_wrapper(sets);
 			if (!error && !newSystemInfoXdict) {
 				snprintf(xpfError, sizeof(xpfError), "%s", xpf_get_error() ?: "unknown XPF error");
 				error = xpfError;
@@ -260,17 +235,17 @@ void jbupdate_update_system_info(void)
 			return;
 		}
 
-		if (!newSystemInfoXdict) {
-			error = "Dopamine: XPF did not return a system information dictionary.";
+		if (!newSystemInfoXdict || xpc_get_type(newSystemInfoXdict) != XPC_TYPE_DICTIONARY) {
+			error = "Dopamine: XPF did not return a valid system information dictionary.";
 		}
 
-		// Keep the original image bases from the serialized launchd state. XPF is
-		// dynamically loaded here, unlike the app path where gXPF is available.
 		if (!error) {
 			xpc_dictionary_apply(newSystemInfoXdict, ^_Bool(const char *key, xpc_object_t xobj) {
 				xpc_dictionary_set_value(systemInfoXdict, key, xobj);
 				return true;
 			});
+			/* Dynamic patchfinding must not overwrite the static image bases that
+			 * the runtime uses to decide whether SPTM/TXM paths are available. */
 			xpc_dictionary_set_uint64(systemInfoXdict, "kernelConstant.staticBase", staticBase);
 			xpc_dictionary_set_uint64(systemInfoXdict, "kernelConstant.staticSptmBase", staticSptmBase);
 			xpc_dictionary_set_uint64(systemInfoXdict, "kernelConstant.staticTxmBase", staticTxmBase);
@@ -310,8 +285,7 @@ void jbupdate_finalize_stage2(const char *prevVersion, const char *newVersion)
 	}
 
 	if (strcmp(prevVersion, "3.0") < 0 && strcmp(newVersion, "3.0") >= 0) {
-		// An in-place 2.x -> 3.x update is unsafe after the PPLRW user mapping
-		// change. Reboot before any remaining update finalizers use the new basebin.
+		// Dopamine 3.0 changed PPLRW_USER_MAPPING_OFFSET and a jbupdate from 2.x to >=3.x is therefore unsupported
 		reboot(0);
 	}
 
@@ -325,10 +299,10 @@ void jbupdate_finalize_stage2(const char *prevVersion, const char *newVersion)
 		// Set it during jbupdate if prev version is <2.1 and new version is >=2.1
 		gSystemInfo.jailbreakSettings.markAppsAsDebugged = true;
 
-#ifndef __arm64e__
-		// Initialize kcall only after we have the offsets required for it
-		arm64_kcall_init();
-#endif
+		if (!host_is_arm64e()) {
+			// Initialize kcall only after we have the offsets required for it
+			arm64_kcall_init();
+		}
 	}
 
 	// Update patched dyld

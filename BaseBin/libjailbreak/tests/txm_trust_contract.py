@@ -59,14 +59,15 @@ def main() -> int:
     require(signing.index("fd_attach_signature") < signing.index("jb_trustcache_add_cdhashes"),
             "rewritten signatures must attach before their cdhash is globally trusted")
 
-    require("if (__builtin_available(iOS 26.0, *)) return -ENOTSUP;" in txm,
-            "iOS 26+ TXM allocation must remain disabled without hookd/provider")
-    require(txm.index("if (__builtin_available(iOS 26.0, *)) return -ENOTSUP;") <
-            txm.index("vm_protect("),
-            "iOS 26+ must not reach direct vm_protect")
-    require("!keyBacking || keyBacking < koffsetof(TXMCodeRegion, startAddr)" in txm and
-            "uint64_t key = keyBacking - koffsetof(TXMCodeRegion, startAddr);" in txm,
-            "TXM RB lookup key must validate translation before subtraction")
+    require('#include "hookd.h"' in txm and
+            "if (__builtin_available(iOS 26, *))" in txm and
+            "kr = hookd_vm_protect(" in txm,
+            "iOS 26+ TXM allocation must use the upstream hookd provider")
+    require(txm.index("kr = hookd_vm_protect(") < txm.index("kr = vm_protect("),
+            "iOS 26+ must not fall through to direct vm_protect")
+    require("if (kr != KERN_SUCCESS)" in txm and
+            "vm_deallocate(mach_task_self_, victimPage, 0x4000);" in txm,
+            "hookd failure must release the temporary allocation before failing")
 
     list_insert = between(trustcache, "static int trustcache_list_insert_transactional(",
                           "int trustcache_list_insert(")
@@ -96,7 +97,7 @@ def main() -> int:
             "filesystem trustcache collection must retain path policy and not traverse symlinks")
 
     print("signature contract: RootHide ABI, jbrand ordering, attach-before-trust transaction")
-    print("TXM contract: append-only list and iOS 26+ hookd/provider fail-closed gate")
+    print("TXM contract: append-only list and iOS 26+ hookd/provider failure handling")
     print("trustcache contract: duplicate suppression, verified replacement, rollback")
     print("filesystem contract: RootHide-aware collection with bounded no-symlink traversal")
     return 0

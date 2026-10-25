@@ -1347,6 +1347,26 @@ static rhi_rebind_result_t rhi_write_slot(const rhi_rebind_slot_t *slot)
 	/* Artifacts stay in the ledger even after a partial/unknown result. */
 	((rhi_rebind_slot_t *)slot)->original_protection = original_protection;
 	((rhi_rebind_slot_t *)slot)->protection_captured = true;
+	if (__builtin_available(iOS 19.0, *)) {
+		/* Protected mappings on iOS 26+ require the same hookd provider as
+		 * upstream's instruction hooks. Never fall back to a direct store if
+		 * the provider rejects the request or its result cannot be verified. */
+		extern kern_return_t hookd_hook(mach_port_t, uint64_t, uint8_t *, size_t);
+		uintptr_t replacement = slot->replacement_raw;
+		kern_return_t result = hookd_hook(mach_task_self(), (uint64_t)slot->address,
+		                                  (uint8_t *)&replacement, sizeof(replacement));
+		uintptr_t observed = __atomic_load_n((uintptr_t *)slot->address, __ATOMIC_ACQUIRE);
+		((rhi_rebind_slot_t *)slot)->wrote = observed != slot->original_raw;
+		mach_vm_address_t observed_page = 0;
+		mach_vm_size_t observed_size = 0;
+		vm_prot_t observed_protection = VM_PROT_NONE;
+		bool protection_verified = rhi_page_protection(slot->address, &observed_page,
+			&observed_size, &observed_protection) && observed_page == page &&
+			observed_size == page_size && observed_protection == original_protection;
+		if (result == KERN_SUCCESS && observed == replacement && protection_verified) return RHI_REBIND_COMPLETE;
+		if (!protection_verified) return RHI_REBIND_UNKNOWN;
+		return observed == slot->original_raw ? RHI_REBIND_NONE : RHI_REBIND_UNKNOWN;
+	}
 	kern_return_t kr = mach_vm_protect(mach_task_self(), page, page_size, false,
 	                                  original_protection | VM_PROT_WRITE | VM_PROT_COPY);
 	if (kr != KERN_SUCCESS) return RHI_REBIND_NONE;

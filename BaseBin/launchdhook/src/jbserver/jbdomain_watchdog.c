@@ -5,7 +5,7 @@
 #include <libjailbreak/util.h>
 #include "../crashreporter.h"
 
-#include <libjailbreak/roothider.h>
+#include <libroothider/libroothider.h>
 
 static bool watchdog_domain_allowed(audit_token_t clientToken)
 {

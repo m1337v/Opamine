@@ -1,4 +1,5 @@
 #import <xpc/xpc.h>
+#import <xpc_private.h>
 #import <sys/types.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -6,8 +7,7 @@
 #import <mach-o/dyld.h>
 #import <libjailbreak/libjailbreak.h>
 #import <Foundation/Foundation.h>
-
-extern xpc_object_t xpc_create_from_plist(const void *buf, size_t len);
+#import <litehook.h>
 
 void xpc_dictionary_add_launch_daemon_plist_at_path(xpc_object_t xdict, const char *path)
 {
@@ -49,6 +49,10 @@ xpc_object_t xpc_dictionary_get_value_hook(xpc_object_t xdict, const char *key)
 				}
 			}
 */
+
+			// mtmergeprops reloads the touch controller firmware, which already happened on the initial boot.
+			// Running it again after a userspace reboot can leave touch dead on some aftermarket displays, so skip it.
+			xpc_dictionary_set_value(origXvalue, "/System/Library/LaunchDaemons/com.apple.mtmergeprops.plist", NULL);
 		}
 	}
 	else if (!strcmp(key, "Paths")) {
@@ -76,5 +80,6 @@ xpc_object_t xpc_dictionary_get_value_hook(xpc_object_t xdict, const char *key)
 
 void initDaemonHooks(void)
 {
-	MSHookFunction(&xpc_dictionary_get_value, (void *)xpc_dictionary_get_value_hook, (void **)&xpc_dictionary_get_value_orig);
+	xpc_dictionary_get_value_orig = xpc_dictionary_get_value;
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, xpc_dictionary_get_value, (void *)xpc_dictionary_get_value_hook, NULL);
 }

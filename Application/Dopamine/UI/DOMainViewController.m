@@ -122,7 +122,7 @@
     ]];
     
     //Jailbreak Button
-    BOOL isJailbroken = [[DOEnvironmentManager sharedManager] isJailbroken];
+    BOOL isJailbroken = [[DOEnvironmentManager sharedManager] isJailbroken] || [[DOEnvironmentManager sharedManager] isJailbrokenWithOtherJailbreak];
     BOOL isSupported = [[DOEnvironmentManager sharedManager] isSupported];
 
     NSString *jailbreakButtonTitle = [self jailbreakButtonTitle];
@@ -179,6 +179,12 @@
                 [self setupUpdateAvailable:YES];
             });
         }
+        else if ([[DOUIManager sharedInstance] isUpdateAvailable])
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self setupUpdateAvailable:NO];
+            });
+        }
     });
 }
 
@@ -213,44 +219,31 @@
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
         if ([jailbreaker contiguousMappingWorkaroundNeeded]) {
+            
             cpu_subtype_t cpuFamily = 0;
             size_t cpuFamilySize = sizeof(cpuFamily);
             sysctlbyname("hw.cpufamily", &cpuFamily, &cpuFamilySize, NULL, 0);
-
             NSString *workaroundMessage = DOLocalizedString(@"Respring_Required_Message");
             if (cpuFamily == CPUFAMILY_ARM_TYPHOON) {
-                workaroundMessage = [workaroundMessage stringByAppendingFormat:@"\n\n%@", DOLocalizedString(@"Respring_Required_Notice_A8")];
+                workaroundMessage = [workaroundMessage stringByAppendingString:[NSString stringWithFormat:@"\n\n%@", DOLocalizedString(@"Respring_Required_Notice_A8")]];
             }
 
+            UIAlertController *contiguousMappingWorkaroundAlertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Respring_Required") message:workaroundMessage preferredStyle:UIAlertControllerStyleAlert];
+            
+            UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Respring_Cancel") style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+                exit(0);
+            }];
+            
+            UIAlertAction *workaroundAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Apply_Workaround") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [jailbreaker applyContiguousMappingWorkaround];
+            }];
+            
+            [contiguousMappingWorkaroundAlertController addAction:cancelAction];
+            [contiguousMappingWorkaroundAlertController addAction:workaroundAction];
+            contiguousMappingWorkaroundAlertController.preferredAction = workaroundAction;
+
             dispatch_async(dispatch_get_main_queue(), ^{
-                UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Respring_Required")
-                                                                                           message:workaroundMessage
-                                                                                    preferredStyle:UIAlertControllerStyleAlert];
-                UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Respring_Cancel")
-                                                                         style:UIAlertActionStyleCancel
-                                                                       handler:nil];
-                UIAlertAction *workaroundAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Apply_Workaround")
-                                                                             style:UIAlertActionStyleDefault
-                                                                           handler:^(UIAlertAction * _Nonnull action) {
-                    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                        NSError *workaroundError = [jailbreaker applyContiguousMappingWorkaround];
-                        if (workaroundError) {
-                            dispatch_async(dispatch_get_main_queue(), ^{
-                                UIAlertController *failureAlert = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Log_Error")
-                                                                                                          message:workaroundError.localizedDescription
-                                                                                                   preferredStyle:UIAlertControllerStyleAlert];
-                                [failureAlert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close")
-                                                                                     style:UIAlertActionStyleDefault
-                                                                                   handler:nil]];
-                                [self presentViewController:failureAlert animated:YES completion:nil];
-                            });
-                        }
-                    });
-                }];
-                [alertController addAction:cancelAction];
-                [alertController addAction:workaroundAction];
-                alertController.preferredAction = workaroundAction;
-                [self presentViewController:alertController animated:YES completion:nil];
+                [self presentViewController:contiguousMappingWorkaroundAlertController animated:YES completion:nil];
             });
             return;
         }
@@ -267,19 +260,17 @@
         [jailbreaker runWithError:&error didRemoveJailbreak:&didRemove showLogs:&showLogs];
         dispatch_async(dispatch_get_main_queue(), ^{
             BOOL rebootRequired = [error.userInfo[DOJailbreakerErrorRequiresFullRebootKey] boolValue];
-            // A post-launchd failure always has a log and must remain on the
-            // recovery screen even if a future caller suppresses generic logs.
+            // A post-launchd failure is a terminal recovery state even when a
+            // caller elects to suppress ordinary diagnostic logs.
             if (error && (showLogs || rebootRequired)) {
                 [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"Jailbreak failed with error: %@", error] debug:NO];
-                [self.navigationController pushViewController:[[DOLogCrashViewController alloc] initWithTitle:[error localizedDescription] rebootRequired:rebootRequired] animated:YES];
+                [self.navigationController pushViewController:[[DOLogCrashViewController alloc] initWithTitle:error.localizedDescription rebootRequired:rebootRequired] animated:YES];
             }
             else if (error && !showLogs) {
                 // Used when there is an error that is explainable in such detail that additional logs are not needed
                 UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Log_Error") message:[error localizedDescription] preferredStyle:UIAlertControllerStyleAlert];
                 UIAlertAction *rebootAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Reboot") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    // DOEnvironmentManager uses the direct reboot3 syscall.
-                    // Do not spawn a BaseBin helper here: systemhook may be
-                    // the component that just failed to load.
+                    // Avoid the BaseBin/systemhook loader on a recovery path.
                     [[DOEnvironmentManager sharedManager] reboot];
                 }];
                 [alertController addAction:rebootAction];
@@ -317,25 +308,13 @@
 
     if (environmentUpdate)
     {
-        releaseFrom = [[DOEnvironmentManager sharedManager] jailbrokenVersion];
+/************************************* roothide specfic ***********************************/
+        releaseFrom = [[DOEnvironmentManager sharedManager] jailbrokenVersionRootHide];
+/************************************* roothide specfic ***********************************/
         releaseTo = [[DOUIManager sharedInstance] getLaunchedReleaseTag];
     }
 
     self.updateButton = [DOActionMenuButton buttonWithAction:[UIAction actionWithTitle:title image:[UIImage systemImageNamed:@"arrow.down.circle" withConfiguration:[DOGlobalAppearance smallIconImageConfiguration]] identifier:@"update-available" handler:^(__kindof UIAction * _Nonnull action) {
-        if (environmentUpdate) {
-            self.updateButton.enabled = NO;
-            self.updateButton.alpha = 0.5;
-            NSError *error = [[DOEnvironmentManager sharedManager] updateEnvironment];
-            if (error) {
-                UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Error Updating Environment" message:error.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
-                [alert addAction:[UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Close") style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:alert animated:YES completion:nil];
-                self.updateButton.enabled = YES;
-                self.updateButton.alpha = 1.0;
-            }
-            return;
-        }
-
         [self.navigationController pushViewController:[[DOUpdateViewController alloc] initFromTag:releaseFrom toTag:releaseTo] animated:YES];
     }] chevron:NO];
 

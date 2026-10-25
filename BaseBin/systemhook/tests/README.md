@@ -10,11 +10,26 @@ The checks therefore have three parts:
 * pure host doubles for deterministic contracts (token parsing, executable
   selection, hook/remap state, callback replay/catalog ordering, `dlsym`
   error semantics, sysctl two-pass behavior and directory state lifetime); and
+* a host-compiled fixture extracted from the production `posix_spawn` wrapper,
+  exercising persona capture, restoration, and failure handling with stubs; and
 * static assertions against the current production sources plus a JSON
   ownership matrix; and
 * a macOS-host executable fixture that includes the production `rhi_rebind.c`
   decoder and validates chained import metadata, addends, weak imports, PAC
   schema decoding, original-file chain words and malformed-precommit refusal.
+
+A static source contract separately asserts that iOS 19 and later slot writes
+use hookd and return on provider failure without falling through to direct
+protection changes or a direct store. The host fixture provides a failing
+hookd stub only so the metadata-only executable can link; it does not exercise
+that device route.
+
+The host hookd protection contract extracts the production range-query helper
+and `apply_hook` implementation, then exercises them against stub Mach VM APIs.
+It checks data-page R-to-RW-copy-to-R restoration, RX pages temporarily changed
+to RW-copy without execute and then restored to RX, restore-after-write-failure,
+refusal before mutation when the range cannot be queried or covered by one leaf
+mapping, and failure reporting when protection restoration fails.
 
 Passing this lane does **not** prove that an iOS hook is installed, that PAC or
 dyld-private ABI behavior is correct, or that a detector is bypassed.  The

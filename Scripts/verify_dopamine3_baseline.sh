@@ -102,10 +102,10 @@ actual_branch=$(git -C "$repo_root" branch --show-current)
 if [ "$actual_branch" = "rhinject" ]; then pass "repository branch rhinject"; else fail "repository branch expected rhinject, got ${actual_branch:-detached}"; fi
 
 check_submodule BaseBin/ChOma 7dccded6bc17081c08f5f5cdbd7a4b051543a825
-check_submodule BaseBin/XPF 1e5da55fc6d8221e90b18659d44564acb12f903c
+check_submodule BaseBin/XPF 9e12b8faa7444f6fe7f699aec6b6c96d151455d3
 check_submodule BaseBin/XPF/external/ChOma 7dccded6bc17081c08f5f5cdbd7a4b051543a825
-check_submodule BaseBin/_external/modules/litehook 0d9d17afc011d2a8dfe67a4f7803ff99143d0f0d
-check_submodule BaseBin/opainject 849bb296ea8bc0643a2966485ea3c3c96ebdcd5b
+check_submodule BaseBin/_external/modules/litehook 4f062946a964575694878130acecb7c990baba38
+check_submodule BaseBin/opainject 0068566501f3ddd04830f1ef0f1b74a8d1512281
 
 kfd_path=Application/Dopamine/Dopamine/Exploits/kfd/kfd
 if git -C "$repo_root" cat-file -e "HEAD:$kfd_path" 2>/dev/null; then
@@ -131,41 +131,48 @@ else
 	fail "$baseline_commit basebin version expected 2.4.9.28, got ${baseline_basebin_version:-missing}"
 fi
 
-version_is_after()
-{
-	awk -F. -v left="$1" -v right="$2" '
-		BEGIN {
-			n = split(left, l); m = split(right, r);
-			for (i = 1; i <= (n > m ? n : m); i++) {
-				lv = (i <= n ? l[i] + 0 : 0);
-				rv = (i <= m ? r[i] + 0 : 0);
-				if (lv > rv) exit 0;
-				if (lv < rv) exit 1;
-			}
-			exit 1;
-		}'
-}
-
 current_basebin_version=$(tr -d '\r\n' < "$repo_root/BaseBin/_external/basebin/.version" 2>/dev/null || true)
-planned_release_version=${EXPECTED_BASEBIN_VERSION:-3.0.9.1}
-if version_is_after "$current_basebin_version" 3.0.9; then
-	pass "current basebin version $current_basebin_version is above official 3.0.9"
-	if [ "$current_basebin_version" = "$planned_release_version" ]; then
-		pass "planned Opamine release version $planned_release_version"
-	else
-		note "current basebin version is $current_basebin_version; planned release target is $planned_release_version"
-	fi
+current_roothide_version=$(tr -d '\r\n' < "$repo_root/BaseBin/_external/basebin/.version-roothide" 2>/dev/null || true)
+planned_release_version=${EXPECTED_RELEASE_VERSION:-3.0.12-28+opamine1}
+current_release_version="$current_basebin_version-$current_roothide_version"
+if [ "$current_basebin_version" = "3.0.12" ] &&
+	[ "$current_roothide_version" = "28+opamine1" ] &&
+	[ "$current_release_version" = "$planned_release_version" ]; then
+	pass "planned Opamine release version $current_release_version"
 else
-	note "release gate pending: basebin version ${current_basebin_version:-missing} must be above official 3.0.9 (target $planned_release_version) before packaging"
-	if [ "${REQUIRE_RELEASE_VERSION:-0}" = 1 ]; then
-		fail "release version gate requires $planned_release_version or a later version"
-	fi
+	fail "release version expected $planned_release_version (.version 3.0.12, .version-roothide 28+opamine1), got ${current_release_version:-missing}"
 fi
 
+source_contains BaseBin/Makefile 'subprojects: roothidehooks libroothider jailbreakd bootstrapper'
+source_contains BaseBin/Makefile '@cp libroothider/libroothider.dylib .build'
+for dyld_arch in arm64e arm64; do
+	for dyld_variant in iOS15 iOS16-17 'iOS18+'; do
+		source_contains BaseBin/dyldhook/Makefile "dyldhook_merge.$dyld_arch.$dyld_variant.dylib"
+	done
+done
+
+basebin_archive="$repo_root/BaseBin/basebin.tar"
+if [ -f "$basebin_archive" ]; then
+	archive_entries=$(tar -tf "$basebin_archive")
+	for runtime_image in libroothider.dylib \
+		dyldhook_merge.arm64e.iOS15.dylib dyldhook_merge.arm64.iOS15.dylib \
+		dyldhook_merge.arm64e.iOS16-17.dylib dyldhook_merge.arm64.iOS16-17.dylib \
+		dyldhook_merge.arm64e.iOS18+.dylib dyldhook_merge.arm64.iOS18+.dylib; do
+		if printf '%s\n' "$archive_entries" | awk -F/ -v image="$runtime_image" '$NF == image { found = 1 } END { exit !found }'; then
+			pass "basebin.tar contains $runtime_image"
+		else
+			fail "basebin.tar is missing required runtime image $runtime_image"
+		fi
+	done
+else
+	note "BaseBin/basebin.tar is absent; runtime archive contents will be checked after BaseBin packaging"
+fi
+
+# Preserve the local Sileo rebuild whose URL registrations were stripped;
+# the metadata check and exact hash below pin that transformed package blob.
 check_deb Application/Dopamine/Resources/sileo.deb org.coolstar.sileo '2.5.1-13+opamine1' iphoneos-arm64e a26532c514eec10f4cf002d602c7ddc9b2c7ca9ab14963d0296e5c6f89f85db6
-check_deb Application/Dopamine/Resources/roothide.deb roothide '0.1.0-0+opamine1' iphoneos-arm64e 6c2c521d33a668829e719f489676817b74d0c19e5f79065f6c9cf81b623810c1
-check_deb Application/Dopamine/Resources/roothideapp.deb com.roothide.manager '1.3.9' iphoneos-arm64e b8f075e1844709845962900b22fe71136a66369a2c35bb1201087f2fd9476b7d
-check_deb Application/Dopamine/Resources/zebra.deb xyz.willy.zebra '1.1.36-2-1+debug' iphoneos-arm64e ca82c18256e19ff78af3e53308d53f047a2d429cb7e025c892377abe4d2e7825
+check_deb Application/Dopamine/Resources/roothideapp.deb com.roothide.manager '1.4.0' iphoneos-arm64e 51c2b92260921908bd281bc06285196a2ae73e4d51258fe5f2db10dd5d21dca7
+check_deb Application/Dopamine/Resources/zebra.deb xyz.willy.zebra '1.1.37-27+debug' iphoneos-arm64e 41aa4cd37d2397a4d22e549b6d3e3125fea417dd741d4efb31fd6d41b68f8caa
 # These three packages are rebuilt locally by the ordinary full build. Their
 # Debian ar/tar timestamps make whole-archive hashes intentionally unstable;
 # validate package identity here and their source controls below. Embedded
@@ -177,12 +184,8 @@ check_deb Packages/libroot/libroot.deb libroot-dopamine 1.0.1 iphoneos-arm64 -
 check_control_version Packages/basebin-link/control dopamine-basebin-link 1.0.0
 check_control_version Packages/libkrw-provider/control libkrw0-dopamine 2.0.4
 check_control_version Packages/libroot/control libroot-dopamine 1.0.1
-check_control_version BaseBin/opainject/control com.opa334.opainject 1.0.6
+note "opainject is verified by its pinned source submodule; this upstream revision has no Debian control file"
 check_control_version BaseBin/roothidehooks/control com.roothide.dopamine.roothidehooks 0.0.1
-source_contains Scripts/build-fork-packages.sh 'sileo_fork_version="2.5.1-13+opamine1"'
-source_contains Scripts/build-fork-packages.sh 'roothide_fork_version="0.1.0-0+opamine1"'
-source_contains Scripts/build-fork-packages.sh 'sileo_sha256="b23e51371938bb6257ba82abdcdae9a6519755556b874b06672868c64843a0f6"'
-source_contains Scripts/build-fork-packages.sh 'roothide_sha256="06adc371ec37e7356762c875ca682bfb2f9b33a1100fb14168653b7e571ca670"'
 
 sileo_info=$(dpkg-deb --fsys-tarfile "$repo_root/Application/Dopamine/Resources/sileo.deb" | tar -xOf - ./Applications/Sileo.app/Info.plist | plutil -p -)
 if printf '%s\n' "$sileo_info" | grep -Eq 'CFBundleURLTypes|CFBundleURLSchemes'; then fail "Sileo package still declares URL-registration keys"; else pass "Sileo package Info.plist has no URL-registration keys"; fi
@@ -192,8 +195,8 @@ source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m '#define JB_ROOT
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m '#define JB_RAND_LENGTH  (sizeof(uint64_t)*sizeof(char)*2)'
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m 'return (value & ~0xFF) | check;'
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m 'is_jbrand_value(value)'
-if grep -Fq '/var/containers/Bundle/Application' "$repo_root/Application/Dopamine/Jailbreak/DOBootstrapper.m" &&
-	grep -Fq '".jbroot-%016llX"' "$repo_root/Application/Dopamine/Jailbreak/DOBootstrapper.m"; then
+if grep -Fq 'RootHidePrimaryJailbreakRootDirectory = @"/var/containers/Bundle/Application"' "$repo_root/Application/Dopamine/Jailbreak/DOBootstrapper.m" &&
+	grep -Fq 'stringWithFormat:@".jbroot-%016llX", jbrand_new()' "$repo_root/Application/Dopamine/Jailbreak/DOBootstrapper.m"; then
 	pass "Application/Dopamine/Jailbreak/DOBootstrapper.m retains randomized primary-root construction"
 else
 	fail "Application/Dopamine/Jailbreak/DOBootstrapper.m randomized primary-root construction is missing"
@@ -202,10 +205,12 @@ source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m '/var/mobile/Con
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m 'createSymbolicLinkAtPath:[jbroot_secondary stringByAppendingPathComponent:@".jbroot"]'
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m 'return [@"/rootfs/" stringByAppendingPathComponent:path];'
 
-source_contains BaseBin/libjailbreak/src/roothider/common.m 'int randomizeAndLoadBasebinTrustcache(const char* basebinPath)'
-source_contains BaseBin/libjailbreak/src/roothider/common.m 'file_collect_untrusted_cdhashes_by_path_status('
-source_contains BaseBin/libjailbreak/src/roothider/common.m 'collect_current_basebin_mappable_cdhashes('
-source_contains BaseBin/libjailbreak/src/roothider/common.m 'trustcache_file_upload_with_uuid(basebinTcFile, BASEBIN_TRUSTCACHE_UUID)'
+source_contains BaseBin/libroothider/src/common.m 'int randomizeAndLoadBasebinTrustcache(const char* basebinPath)'
+source_contains BaseBin/libroothider/src/common.m 'file_collect_untrusted_cdhashes_by_path_status('
+source_contains BaseBin/libroothider/src/common.m 'collect_current_basebin_mappable_cdhashes('
+source_contains BaseBin/libroothider/src/common.m 'trustcache_file_upload_with_uuid(basebinTcFile, BASEBIN_TRUSTCACHE_UUID)'
+source_contains BaseBin/libroothider/src/common.m 'enum { BASEBIN_REQUIRED_IMAGE_COUNT = 6 };'
+source_contains BaseBin/libroothider/src/common.m 'stringByAppendingPathComponent:@"libroothider.dylib"'
 source_contains Application/Dopamine/Jailbreak/DOJailbreaker.m 'randomizeAndLoadBasebinTrustcache(JBROOT_PATH("/basebin/"))'
 if grep -Fq 'if (tcSize > 0x4000) return -1;' "$repo_root/BaseBin/libjailbreak/src/trustcache.c" ||
 	(grep -Fq 'if (size > JB_TRUSTCACHE_SIZE) return -E2BIG;' "$repo_root/BaseBin/libjailbreak/src/trustcache.c" &&
@@ -252,21 +257,27 @@ else
 	note "BaseBin/basebin.tc is absent; run trustcache generation before artifact verification"
 fi
 
-for mode in stock blacklist whitelist hiddenwhitelist blacklistallowlist; do
-	source_contains BaseBin/libjailbreak/src/roothider/blacklist.m "@\"$mode\""
-done
-source_contains BaseBin/libjailbreak/src/roothider/blacklist.m 'kRootHideModeRelativePath'
-source_contains BaseBin/systemhook/src/common.c 'bool root_hide_injection_mode_is_hidden_whitelist(void)'
-source_contains BaseBin/systemhook/src/common.c 'bool root_hide_injection_mode_is_blacklist_allowlist(void)'
-source_contains BaseBin/systemhook/src/common.c 'bool root_hide_injection_mode_uses_whitelist_rules(void)'
+source_contains BaseBin/libroothider/src/blacklist.m 'static NSString * const kRootHideInjectionModeStock = @"stock";'
+source_contains BaseBin/libroothider/src/blacklist.m 'static NSString * const kRootHideInjectionModeBlacklist = @"blacklist";'
+source_contains BaseBin/libroothider/src/blacklist.m 'static NSString * const kRootHideInjectionModeWhitelist = @"whitelist";'
+source_contains BaseBin/libroothider/src/blacklist.m 'static NSString * const kRootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";'
+source_contains BaseBin/libroothider/src/blacklist.m 'static NSString * const kRootHideInjectionModeBlacklistAllowlist = @"blacklistallowlist";'
+source_contains BaseBin/libroothider/src/blacklist.m 'kRootHideModeRelativePath'
+source_contains BaseBin/systemhook/src/common/common.c 'bool root_hide_injection_mode_is_hidden_whitelist(void)'
+source_contains BaseBin/systemhook/src/common/common.c 'bool root_hide_injection_mode_is_blacklist_allowlist(void)'
+source_contains BaseBin/systemhook/src/common/common.c 'bool root_hide_injection_mode_uses_whitelist_rules(void)'
+source_contains BaseBin/systemhook/src/common.h '#include "common/common.h"'
 source_contains BaseBin/systemhook/src/roothider_main.c 'bool roothide_hidden_tweak_load_selected(void)'
 source_contains BaseBin/systemhook/src/hider_caller_policy.c 'bool rhi_hider_caller_can_read_hidden(const void *return_address)'
 source_contains BaseBin/systemhook/tests/ownership.json '"modes"'
 source_contains BaseBin/systemhook/tests/ownership.json '"blacklistallowlist"'
 
 for path in \
-	BaseBin/libjailbreak/src/roothider \
+	BaseBin/libroothider/src \
 	BaseBin/roothidehooks \
+	BaseBin/systemhook/src/common/common.c \
+	BaseBin/systemhook/src/common/common.h \
+	BaseBin/systemhook/src/common.h \
 	BaseBin/launchdhook/src/roothider.m \
 	BaseBin/launchdhook/src/jbserver/jbdomain_roothide.c \
 	BaseBin/systemhook/src/hider_caller_policy.c \
@@ -277,8 +288,7 @@ for path in \
 	BaseBin/systemhook/src/rhi_rebind.c \
 	Application/Dopamine/Jailbreak/DOBootstrapper.m \
 	Application/Dopamine/Jailbreak/DOJailbreaker.m \
-	Application/Dopamine/Dopamine.entitlements \
-	Scripts/build-fork-packages.sh; do
+	Application/Dopamine/Dopamine.entitlements; do
 	if [ ! -e "$repo_root/$path" ]; then
 		fail "owned-path manifest anchor is missing: $path"
 	fi

@@ -44,18 +44,48 @@ def main() -> None:
     ):
         require(contract in header, f"late-failure public contract missing: {contract}")
 
+    inject_method = section(jailbreaker, "- (NSError *)injectLaunchdHook", "\n/*")
     run = section(jailbreaker, "- (void)runWithError:", "- (void)finalize")
     inject = run.index("*errOut = [self injectLaunchdHook];")
-    phase_transition = run.index(
-        "self.activationPhase = DOJailbreakActivationPhaseLaunchdFirstLoad;", inject
-    )
+    inject_failure = run[inject:run.index("// After the launchd hook", inject)]
     require(
-        phase_transition > inject,
-        "launchd-first-load phase may only be entered after injectLaunchdHook succeeds",
+        "[self errorRequiringFullRebootIfNeeded:*errOut]" in inject_failure,
+        "an injectLaunchdHook error must be marked reboot-required",
     )
     require(
         "self.activationPhase = DOJailbreakActivationPhasePreInjection;" in run,
         "every jailbreak attempt must start in pre-injection state",
+    )
+    phase_transition = inject_method.index(
+        "self.activationPhase = DOJailbreakActivationPhaseLaunchdFirstLoad;"
+    )
+    injector_spawn = inject_method.index("exec_cmd_nowait")
+    require(
+        phase_transition < injector_spawn,
+        "launchd-first-load phase must be entered before the injector is spawned",
+    )
+    for contract in (
+        "DOBoomerangInfo",
+        "(__bridge_retained void *)info",
+        "CFBridgingRelease(context)",
+        "info = nil;",
+        "dispatch_semaphore_wait(boomerangDone, injectionDeadline)",
+        "mach_port_destroy(mach_task_self(), info.serverPort)",
+        "exec_cmd_nowait(&injectorPid",
+        "waitpid(pid, &status, WNOHANG)",
+        "kill(pid, SIGKILL)",
+    ):
+        require(contract in jailbreaker, f"bounded launchd-injection contract missing: {contract}")
+    require("xpc_release(" not in jailbreaker,
+            "ARC build must not manually release the boomerang XPC reply")
+    post_handoff = inject_method[inject_method.index("info = nil;"):]
+    require(
+        "info.serverPort" not in post_handoff and "info->" not in post_handoff,
+        "caller must not dereference boomerang state after starting its receiver",
+    )
+    require(
+        "dispatch_time_t injectionDeadline" in inject_method,
+        "injector and boomerang acknowledgement must share one 45-second deadline",
     )
     for late_failure in (
         "int ret = basebin_generate(false);",
@@ -69,8 +99,8 @@ def main() -> None:
             f"post-launchd failure must be marked reboot-required: {late_failure}",
         )
     require(
-        "It cannot undo a rerandomized root, uploaded trust" in jailbreaker,
-        "cleanup must not claim a rollback for late first-load state",
+        "Do not clean up, retry, or launch a BaseBin helper after the first" in run,
+        "a post-injection failure must preserve the elevated recovery path",
     )
     finalize = section(jailbreaker, "- (void)finalize", "- (IOSurfaceRef)")
     require(
@@ -83,7 +113,7 @@ def main() -> None:
         "main UI must consume the reboot-required error contract",
     )
     require(
-        "initWithTitle:[error localizedDescription] rebootRequired:rebootRequired" in main_view,
+        "initWithTitle:error.localizedDescription rebootRequired:rebootRequired" in main_view,
         "post-launchd failures must open the recovery log screen",
     )
     require("exec_cmd_trusted" not in main_view, "main recovery UI must not spawn a BaseBin reboot helper")
@@ -107,7 +137,7 @@ def main() -> None:
     require("exec_cmd_trusted" not in log_view, "recovery reboot must not spawn a BaseBin helper")
     require("rebootUserspace" not in log_view, "recovery must require a full device reboot")
 
-    print("late first-load recovery contracts: PASS")
+    print("late first-load recovery and bounded launchd-injection contracts: PASS")
 
 
 if __name__ == "__main__":

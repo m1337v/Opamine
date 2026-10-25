@@ -410,7 +410,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 									gSystemInfo.kernelStruct.pmap_cs_code_directory.trust = 0x1EC;
 								}
 
-								if (strcmp(darwinVersion, "22.4.0") == 0) { // iOS 16.4 ONLY
+								if (strcmp(darwinVersion, "22.4.0") == 0) { // iOS 16.4 ONLY 
 									// iOS 16.4 beta 1-3 use the old proc struct, 16.4b4+ use new
 									if (gSystemInfo.kernelStruct.proc.struct_size != 0x730) {
 										gSystemInfo.kernelStruct.proc.flag    = 0x25C;
@@ -470,7 +470,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 										// inpcb
 										gSystemInfo.kernelStruct.inpcb.icmp6filt = 0x148;
 										gSystemInfo.kernelStruct.inpcb.chksum 	 = 0x150;
-
+										
 										// socket
 										gSystemInfo.kernelStruct.socket.usecount = 0x24c;
 
@@ -479,7 +479,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 
 											// IOSurface
 											gSystemInfo.kernelStruct.IOSurface.memoryDescriptor = 0x30;
-
+											
 											// socket
 											gSystemInfo.kernelStruct.socket.proto    = 0x20;
 											gSystemInfo.kernelStruct.socket.usecount = 0x254;
@@ -508,7 +508,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 												else {
 													gSystemInfo.kernelStruct.task.task_can_transfer_memory_ownership = 0x548;
 												}
-
+												
 												// iOS 18.1+ (beta 5 and up)
 												if (strcmp(darwinVersion, "24.1.0") >= 0 && xnu_version_compare(xnuVersion, (struct xnu_version){.major = 11215, .minor = 40, .patch = 59}) >= 0) {
 													// No more size
@@ -532,7 +532,7 @@ void jbinfo_initialize_hardcoded_offsets(void)
 														else {
 															gSystemInfo.kernelStruct.task.task_can_transfer_memory_ownership = 0x568;
 														}
-
+											
 														// No more prev (Fully back to iOS 15 format, lol)
 														gSystemInfo.kernelStruct.trustcache.prevptr = 0x0;
 
@@ -559,13 +559,13 @@ void jbinfo_initialize_hardcoded_offsets(void)
 														if (strcmp(darwinVersion, "25.0.0") >= 0) {
 															gSystemInfo.kernelConstant.TFRO_HARDENED = 0x0;
 															gSystemInfo.kernelConstant.TFRO_PLATFORM = 0x80;
-
+															
 															// socket
 															gSystemInfo.kernelStruct.socket.usecount = 0x23c;
 
 															// task
 															gSystemInfo.kernelStruct.task.task_can_transfer_memory_ownership = 0x560 + taskJitboxAdjust;
-
+											
 															if (hasSPTM) {
 																// pmap
 																gSystemInfo.kernelStruct.pmap.txm_address_space = 0x98;
@@ -606,45 +606,55 @@ void jbinfo_initialize_hardcoded_offsets(void)
 																gSystemInfo.kernelStruct.vm_map_header.first    = 0x0;
 																gSystemInfo.kernelStruct.vm_map_header.last     = 0x8;
 																gSystemInfo.kernelStruct.vm_map_header.nentries = 0x28;
-
+																
 																// vm_map_entry
 																gSystemInfo.kernelStruct.vm_map_entry.next =  0x0;
 																gSystemInfo.kernelStruct.vm_map_entry.prev =  0x8;
 																gSystemInfo.kernelStruct.vm_map_entry.flags = 0x38;
 
-																// iOS 27.0+
-																if (strcmp(darwinVersion, "27.0.0") >= 0) {
-																	gSystemInfo.kernelConstant.PVH_TYPE_MASK = 0x7;
-																	gSystemInfo.kernelConstant.PVH_HIGH_FLAGS = 0x64C0000000000000;
+																// iOS 26.5+
+																if (strcmp(darwinVersion, "25.4.0") >= 0) {
+																	// proc_ro->task_tokens was removed in 26.5
+																	gSystemInfo.kernelStruct.proc_ro.task_tokens            = 0;
+																	gSystemInfo.kernelStruct.proc_ro.mach_trap_filter_mask -= 0x28;
+																	gSystemInfo.kernelStruct.proc_ro.mach_kobj_filter_mask -= 0x28;
+																	gSystemInfo.kernelStruct.proc_ro.t_flags_ro            -= 0x28;
 
-																	// vm_map
-																	gSystemInfo.kernelStruct.vm_map.hdr   = 0x0;
-																	gSystemInfo.kernelStruct.vm_map.flags = 0xB0;
 
-																	// vm_map_entry
-																	gSystemInfo.kernelStruct.vm_map_entry.prev                 = 0x4;
-																	gSystemInfo.kernelStruct.vm_map_entry.next                 = 0x8;
-																	gSystemInfo.kernelStruct.vm_map_entry.start                = 0x10;
-																	gSystemInfo.kernelStruct.vm_map_entry.end                  = 0x18;
-																	gSystemInfo.kernelStruct.vm_map_entry.flags_prot           = 4;
-																	gSystemInfo.kernelStruct.vm_map_entry.flags_maxprot        = 8;
-																	gSystemInfo.kernelStruct.vm_map_entry.flags_xnu_user_debug = 23;
+																	// iOS 27.0+
+																	if (strcmp(darwinVersion, "27.0.0") >= 0) {
+																		gSystemInfo.kernelConstant.PVH_TYPE_MASK = 0x7;
+																		gSystemInfo.kernelConstant.PVH_HIGH_FLAGS = 0x64C0000000000000;
 
-																	// proc
-																	gSystemInfo.kernelStruct.proc.flag = 0x444;
+																		// vm_map
+																		gSystemInfo.kernelStruct.vm_map.hdr   = 0x0;
+																		gSystemInfo.kernelStruct.vm_map.flags = 0xB0;
 
-																	// proc_ro
-																	gSystemInfo.kernelStruct.proc_ro.ucred                 += 0x8;
-																	gSystemInfo.kernelStruct.proc_ro.syscall_filter_mask   += 0x8;
-																	gSystemInfo.kernelStruct.proc_ro.mach_trap_filter_mask += 0x8;
-																	gSystemInfo.kernelStruct.proc_ro.mach_kobj_filter_mask += 0x8;
-																	gSystemInfo.kernelStruct.proc_ro.t_flags_ro            += 0x8;
-																	gSystemInfo.kernelStruct.proc_ro.task_tokens           = 0;
+																		// vm_map_entry
+																		gSystemInfo.kernelStruct.vm_map_entry.prev                 = 0x4;
+																		gSystemInfo.kernelStruct.vm_map_entry.next                 = 0x8;
+																		gSystemInfo.kernelStruct.vm_map_entry.start                = 0x10;
+																		gSystemInfo.kernelStruct.vm_map_entry.end                  = 0x18;
+																		gSystemInfo.kernelStruct.vm_map_entry.flags_prot           = 4;
+																		gSystemInfo.kernelStruct.vm_map_entry.flags_maxprot        = 8;
+																		gSystemInfo.kernelStruct.vm_map_entry.flags_xnu_user_debug = 23;
 
-																	if (hasSPTM) {
-																		// vm_page
-																		gSystemInfo.kernelStruct.vm_page.pv_head = 0x30;
-																		gSystemInfo.kernelStruct.vm_page.struct_size = 0x40;
+																		// proc
+																		gSystemInfo.kernelStruct.proc.flag = 0x444;
+
+																		// proc_ro
+																		// proc_ro->p_fixed_vfs_resolve_flags was added before ucred
+																		gSystemInfo.kernelStruct.proc_ro.ucred                 += 0x8;
+																		gSystemInfo.kernelStruct.proc_ro.syscall_filter_mask   += 0x8;
+																		gSystemInfo.kernelStruct.proc_ro.mach_trap_filter_mask += 0x8;
+																		gSystemInfo.kernelStruct.proc_ro.mach_kobj_filter_mask += 0x8;
+																		gSystemInfo.kernelStruct.proc_ro.t_flags_ro            += 0x8;
+
+																		if (hasSPTM) {
+																			// vm_page
+																			gSystemInfo.kernelStruct.vm_page.pv_head = 0x30;
+																			gSystemInfo.kernelStruct.vm_page.struct_size = 0x40;
+																		}
 																	}
 																}
 															}
@@ -672,6 +682,11 @@ void jbinfo_initialize_boot_constants(void)
 	gSystemInfo.kernelConstant.physBase = kread64(ksymbol(gPhysBase));
 	gSystemInfo.kernelConstant.physSize = kread64(ksymbol(gPhysSize));
 	gSystemInfo.kernelConstant.cpuTTEP  = kread64(ksymbol(cpu_ttep));
+
+	gSystemInfo.kernelConstant.sptmBase = 0;
+	gSystemInfo.kernelConstant.txmBase = 0;
+	gSystemInfo.kernelConstant.sptmSlide = 0;
+	gSystemInfo.kernelConstant.txmSlide = 0;
 
 	if (jbinfo_has_sptm_metadata()) {
 		/* A legacy one-argument XPF startup only supplies the kernel image.

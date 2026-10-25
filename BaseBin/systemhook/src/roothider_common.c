@@ -170,7 +170,8 @@ int syscall__sysctlbyname(const char *name, size_t namelen, void *oldp, size_t *
 }
 int __sysctlbyname_hook(const char *name, size_t namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
-	if(name && namelen && strncmp(name, "security.mac.amfi.developer_mode_status", namelen)==0) {
+	const char* target = "security.mac.amfi.developer_mode_status";
+	if(name && namelen==strlen(target) && strncmp(name, target, namelen)==0) {
 
 		const char* name2 = "security.mac.amfi.launch_env_logging";
 		size_t namelen2 = strlen(name2);
@@ -186,4 +187,66 @@ int __sysctlbyname_hook(const char *name, size_t namelen, void *oldp, size_t *ol
 		}
 	}
 	return syscall__sysctlbyname(name,namelen,oldp,oldlenp,newp,newlen);
+}
+
+
+#include <libkern/OSCacheControl.h>
+
+extern int roothider_inline_version;
+
+static void inline_memcpy(void *restrict dest, const void *src, size_t len)
+{
+    const uint8_t* s8 = src;
+    volatile uint8_t* d8 = dest;
+    while (len--) *d8++ = *s8++;
+}
+
+static
+__attribute__((noinline, naked))
+kern_return_t inline_vm_protect(mach_port_t task, vm_address_t address, vm_size_t size, bool set_maximum, vm_prot_t new_protection)
+{
+    __asm("mov x16, #0xFFFFFFFFFFFFFFF2");
+    __asm("svc 0x80");
+    __asm("ret");
+}
+
+//Export these for use by other hook frameworks
+
+__attribute__((visibility("default"))) 
+kern_return_t substrate_hook_memory(void* target, void* data, size_t size)
+{
+	if(roothider_inline_version >= 19) {
+		return hookd_hook(mach_task_self_, (uint64_t)target, data, size);
+	}
+
+    kern_return_t kr = inline_vm_protect(mach_task_self_, (vm_address_t)target, size, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+
+    if (kr != KERN_SUCCESS) {
+        return kr;
+    }
+
+    inline_memcpy(target, data, size);
+
+    // this might fail when developer mode is disabled.
+    kr = inline_vm_protect(mach_task_self_, (vm_address_t)target, size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+
+    if (kr != KERN_SUCCESS) {
+		// if it fails here, the process is corrupted because we can't recover the previous executable page.
+        __builtin_trap(); 
+        return kr;
+    }
+
+    sys_icache_invalidate(target, size);
+	
+    return kr;
+}
+
+__attribute__((visibility("default"))) 
+kern_return_t substrate_vm_protect(mach_port_t task, vm_address_t address, vm_size_t size, bool set_maximum, vm_prot_t new_protection)
+{
+	if(roothider_inline_version >= 19) {
+		return hookd_vm_protect(task, address, size, set_maximum, new_protection);
+	}
+
+	return inline_vm_protect(task, address, size, set_maximum, new_protection);
 }

@@ -25,6 +25,7 @@
 #include "rhi_rebind.h"
 
 #include "common.h"
+#include "common/inline.h"
 #include "envbuf.h"
 #include "hider_caller_policy.h"
 #include "hider_internal.h"
@@ -32,8 +33,8 @@
 #include "roothider.h"
 
 const char* HOOK_DYLIB_PATH = NULL;
-extern char *JB_RootPath;
 
+extern char *JB_RootPath;
 bool dyld_patch_fallback_enabled = false;
 /*
  * This flag is read by hidden_dylib_hider.c from dlsym paths that may run
@@ -1426,7 +1427,8 @@ bool roothide_hidden_tweak_load_selected(void)
 }
 
 //export for PatchLoader
-__attribute__((visibility("default"))) int PLRequiredJIT() {
+__attribute__((visibility("default"))) 
+int PLRequiredJIT() {
 	return 0;
 }
 
@@ -1466,8 +1468,10 @@ static const RoothideHooksDiagnosticPath kRoothideHooksDiagnosticPaths[] = {
 	{ "active-root", "" },
 	{ "roothidehooks", "/basebin/roothidehooks.dylib" },
 	{ "libjailbreak", "/basebin/libjailbreak.dylib" },
+	{ "libroothider", "/basebin/libroothider.dylib" },
 	{ "basebin-jbroot", "/basebin/.jbroot" },
 	{ "usr-lib-jbroot", "/usr/lib/.jbroot" },
+	{ "usr-libexec-jbroot", "/usr/libexec/.jbroot" },
 	{ "libroothide", "/usr/lib/libroothide.dylib" },
 	{ "roothideinit", "/usr/lib/roothideinit.dylib" },
 	{ "basebin-present", "/basebin/present" },
@@ -1639,6 +1643,7 @@ void loadPathHook()
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
 		void* roothidehooks = roothidehooks_load_or_abort();
+		ASSERT(roothidehooks != NULL);
 		void (*pathhook)() = dlsym(roothidehooks, "pathhook");
 		ASSERT(pathhook != NULL);
 		pathhook();
@@ -1745,12 +1750,12 @@ void redirect_paths(const char* rootdir)
 }
 
 
-kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[restrict]);
+kSpawnConfig roothide_spawn_config_for_executable(const char* path, char *const argv[restrict]);
 void string_enumerate_components(const char *string, const char *separator, void (^enumBlock)(const char *pathString, bool *stop));
 
 void trust_insert_libraries(char** envc)
 {
-	const char* DYLD_INSERT_LIBRARIES = envbuf_getenv((const char * const *)envc, "DYLD_INSERT_LIBRARIES");
+	const char* DYLD_INSERT_LIBRARIES = envbuf_getenv(envc, "DYLD_INSERT_LIBRARIES");
 	if(!DYLD_INSERT_LIBRARIES) return;
 
 	string_enumerate_components(DYLD_INSERT_LIBRARIES, ":", ^(const char *path, bool *stop) {
@@ -1772,7 +1777,7 @@ int posix_spawnattr_getprocesstype_np(const posix_spawnattr_t * __restrict, int 
 int roothide_systemhook___posix_spawn_prehook(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict], void *orig, int (*trust_binary)(const char *path), int (*set_process_debugged)(uint64_t pid, bool fullyDebugged), double jetsamMultiplier)
 {
 	if(!path) { //Don't crash here due to bad posix_spawn call
-		return __posix_spawn_orig(pidp, path, desc, argv, envp);
+		return __posix_spawn_inline(pidp, path, desc, argv, envp);
 	}
 
 	if(!desc || !desc->attrp) {
@@ -1788,23 +1793,7 @@ int roothide_systemhook___posix_spawn_prehook(pid_t *restrict pidp, const char *
 		trust_binary = __no_need_to_trust_now__;
 	}
 
-	char **envc = NULL;
-	const char *const *effectiveEnvp = (const char *const *)envp;
-	if (roothide_hidden_tweak_env_is_configured()) {
-		envc = envbuf_mutcopy((const char **)envp);
-		if (!envc || !roothide_hidden_tweak_envbuf_apply(&envc)) {
-			envbuf_free(envc);
-			errno = ENOMEM;
-			return ENOMEM;
-		}
-		effectiveEnvp = (const char *const *)envc;
-	}
-
-	int ret = posix_spawn_hook_shared(pidp, path, desc, argv, (char *const *)effectiveEnvp, orig, trust_binary, set_process_debugged, jetsamMultiplier);
-	if (envc) {
-		envbuf_free(envc);
-	}
-	return ret;
+	return posix_spawn_hook_shared(pidp, path, desc, argv, envp, orig, trust_binary, set_process_debugged, jetsamMultiplier);
 }
 
 int roothide_systemhook___posix_spawn_posthook(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict])
@@ -1814,7 +1803,7 @@ int roothide_systemhook___posix_spawn_posthook(pid_t *restrict pidp, const char 
 	kSpawnConfig spawnConfig = 0;
 	if(!jbclient_dyld_patch_enabled())
 	{
-		spawnConfig = spawn_config_for_executable(path, argv);
+		spawnConfig = roothide_spawn_config_for_executable(path, argv);
 
 		if (spawnConfig & kSpawnConfigTrust) {
 			size_t outCount = 0;
@@ -1876,18 +1865,9 @@ int roothide_systemhook___posix_spawn_posthook(pid_t *restrict pidp, const char 
 	// on some devices dyldhook may fail due to vm_protect(VM_PROT_READ|VM_PROT_WRITE), 2, (os/kern) protection failure in dsc::__DATA_CONST:__const, 
 	// so we need to disable dyld-in-cache here. (or we can use VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)
 	char **envc = envbuf_mutcopy((const char **)envp);
-	bool ownsEnvc = envc != NULL;
-	if (!envc) {
-		if (envbuf_getenv((const char **)envp, "DYLD_INSERT_LIBRARIES")) {
-			posix_spawnattr_setflags(attrp, flags);
-			return ENOMEM;
-		}
-		envc = (char **)envp;
-	}
-	if(envbuf_getenv((const char **)envc, "DYLD_INSERT_LIBRARIES") && !envbuf_setenv(&envc, "DYLD_IN_CACHE", "0")) {
-		if (ownsEnvc) envbuf_free(envc);
-		posix_spawnattr_setflags(attrp, flags);
-		return ENOMEM;
+	if(envbuf_getenv(envc, "DYLD_INSERT_LIBRARIES")) {
+		envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
+		envbuf_setenv(&envc, "DYLD_SHARED_REGION", "use");
 	}
 
 	if(!jbclient_dyld_patch_enabled())
@@ -1899,10 +1879,10 @@ int roothide_systemhook___posix_spawn_posthook(pid_t *restrict pidp, const char 
 
 	pid_t pidval = 0;
 	if (!pidp) pidp = &pidval;
-	int ret = __posix_spawn_orig(pidp, path, desc, argv, envc);
+	int ret = __posix_spawn_inline(pidp, path, desc, argv, envc);
 	pid_t pid = *pidp;
 	
-	if (ownsEnvc) envbuf_free(envc);
+	envbuf_free(envc);
 
 	// maybe caller will use it again? restore flags
 	posix_spawnattr_setflags(attrp, flags);
@@ -1940,22 +1920,7 @@ int roothide_systemhook___execve_prehook(const char *path, char *const argv[], c
 	if(ret==EPERM && access(path, X_OK)==0 && sandbox_check(getpid(), "process-fork", SANDBOX_CHECK_NO_REPORT, NULL) == 0)
 	{
 		trust_binary = __no_need_to_trust_now__;
-		char **envc = NULL;
-		const char *const *effectiveEnvp = (const char *const *)envp;
-		if (roothide_hidden_tweak_env_is_configured()) {
-			envc = envbuf_mutcopy((const char **)envp);
-			if (!envc || !roothide_hidden_tweak_envbuf_apply(&envc)) {
-				envbuf_free(envc);
-				errno = ENOMEM;
-				return -1;
-			}
-			effectiveEnvp = (const char *const *)envc;
-		}
-		int hookRet = execve_hook_shared(path, argv, (char *const *)effectiveEnvp, orig, trust_binary);
-		if (envc) {
-			envbuf_free(envc);
-		}
-		return hookRet;
+		return execve_hook_shared(path, argv, envp, orig, trust_binary);
 	}
 
 	// posix_spawn will return errno and restore errno if it fails
@@ -1980,24 +1945,15 @@ int roothide_systemhook___execve_posthook(const char *path, char *const argv[], 
 	while(!traced) usleep(10*1000);
 
 	char **envc = envbuf_mutcopy((const char **)envp);
-	bool ownsEnvc = envc != NULL;
-	if (!envc) {
-		if (envbuf_getenv((const char **)envp, "DYLD_INSERT_LIBRARIES")) {
-			errno = ENOMEM;
-			return -1;
-		}
-		envc = (char **)envp;
-	}
-	if(envbuf_getenv((const char **)envc, "DYLD_INSERT_LIBRARIES") && !envbuf_setenv(&envc, "DYLD_IN_CACHE", "0")) {
-		if (ownsEnvc) envbuf_free(envc);
-		errno = ENOMEM;
-		return -1;
+	if(envbuf_getenv(envc, "DYLD_INSERT_LIBRARIES")) {
+		envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
+		envbuf_setenv(&envc, "DYLD_SHARED_REGION", "use");
 	}
 	
-	int ret = __execve_orig(path, argv, envc);
+	int ret = __execve_inline(path, argv, envc);
 	int olderr = errno;
 	
-	if (ownsEnvc) envbuf_free(envc);
+	envbuf_free(envc);
 
 	// exec* should never return if successful
 
@@ -2270,40 +2226,154 @@ bool roothide_hidden_tweak_hooks_ready(void)
 	return true;
 }
 
+extern char** NXArgv;
+extern int    NXArgc;
+
+#define gDyldHookLog false
+#define _simple_getenv(e,n) getenv(n)
+#define _simple_dprintf(...)
+#define simple_atoi	atoi
+
+void dopamine_fixsugids(const char** argv, int argc)
+{
+	if (_simple_getenv(envp, "DYLD_HOOK_SETUID") != NULL) {
+		int uid = 0, gid = 0, ruid = 0, rgid = 0, fd = -1;
+		gid_t groups[NGROUPS_MAX] = { 0 };
+
+		for (int i = 1; i < argc; i++) {
+			if (gDyldHookLog) {
+				_simple_dprintf(2, "Processing %s\n", argv[i]);
+			}
+
+			int r = argc - i - 1;
+			if (!strcmp(argv[i], "--fd")) {
+				if (r < 1) break;
+				fd = simple_atoi(argv[++i]);
+			}
+			else if (!strcmp(argv[i], "--uid")) {
+				if (r < 1) break;
+				uid = simple_atoi(argv[++i]);
+			}
+			else if (!strcmp(argv[i], "--ruid")) {
+				if (r < 1) break;
+				ruid = simple_atoi(argv[++i]);
+			}
+			else if (!strcmp(argv[i], "--gid")) {
+				if (r < 1) break;
+				gid = simple_atoi(argv[++i]);
+			}
+			else if (!strcmp(argv[i], "--rgid")) {
+				if (r < 1) break;
+				rgid = simple_atoi(argv[++i]);
+			}
+			else if (!strcmp(argv[i], "--groups")) {
+				if (r < NGROUPS_MAX) break;
+				for (int k = 0; k < NGROUPS_MAX; k++) {
+					groups[k] = simple_atoi(argv[++i]);
+				}
+			}
+		}
+
+		if (gDyldHookLog) {
+			_simple_dprintf(2, "DYLD_HOOK_SETUID (fd=%d, uid=%d, ruid=%d, gid=%d, rgid=%d)\n", fd, uid, ruid, gid, rgid);
+		}
+
+		if (fd == -1) return;
+
+		setgid(gid);
+		setgid(gid);
+		setregid(rgid, -1);
+		int ngroups;
+		for (ngroups = 0; ngroups < NGROUPS_MAX; ngroups++) {
+			if (groups[ngroups] == -1) break;
+		}
+		setgroups(ngroups, groups);
+		setuid(uid);
+		setuid(uid);
+		setreuid(ruid, -1);
+
+		// if (gDyldHookLog) {
+		// 	uid_t uid  = getuid();
+		// 	uid_t euid = geteuid();
+		// 	gid_t gid  = getgid();
+		// 	gid_t egid = getegid();
+
+		// 	_simple_dprintf(2, "PID  : %d\n", (int)getpid());
+		// 	_simple_dprintf(2, "PPID : %d\n", (int)getppid());
+		// 	_simple_dprintf(2, "uid  : real=%d  effective=%d\n", (int)uid,  (int)euid);
+		// 	_simple_dprintf(2, "gid  : real=%d  effective=%d\n", (int)gid,  (int)egid);
+		// }
+
+		char r = 0x42;
+		write(fd, &r, sizeof(r));
+
+		__asm("b .");
+	}
+}
+
 extern struct mach_header __dso_handle;
 extern const char* dyld_image_path_containing_address(const void* addr);
 
+extern const struct mach_header_64 *get_dyld_mach_header(void);
 extern int parse_dyldhook_jbinfo(char **jbRootPathOut, char **bootUUIDOut, char **sandboxExtensionsOut, bool *fullyDebuggedOut);
+
+extern int roothider_inline_version;
+
+extern void roothider_inline_init_dyld_symbols(void(*visit)(void*, const char*, void**), void *context);
+
+static void resolve_dyld_symbol_callback(void* dyld, const char* symbol, void** storage)
+{
+    void *address = litehook_find_symbol(dyld, symbol);
+	ASSERT(address != NULL);
+	*storage = address;
+}
 
 void roothide_init()
 {
+	dopamine_fixsugids(NXArgv, NXArgc);
+
 	if(getenv("DYLD_INSERT_LIBRARIES")) {
 		const char* DYLD_IN_CACHE = getenv("DYLD_IN_CACHE");
 		if(DYLD_IN_CACHE && strcmp(DYLD_IN_CACHE, "0") == 0) {
 			unsetenv("DYLD_IN_CACHE");
 		}
+		//ios18.4+
+		const char* DYLD_SHARED_REGION = getenv("DYLD_SHARED_REGION");
+		if(DYLD_SHARED_REGION && strcmp(DYLD_SHARED_REGION, "use") == 0) {
+			unsetenv("DYLD_SHARED_REGION");
+		}
 	}
 
-	const char *hookDylibPath = dyld_image_path_containing_address(&__dso_handle);
-	if (hookDylibPath) {
-		char *hookDylibPathCopy = strdup(hookDylibPath);
-		if (hookDylibPathCopy) {
-			free((void *)HOOK_DYLIB_PATH);
-			HOOK_DYLIB_PATH = hookDylibPathCopy;
-		}
+	if (__builtin_available(iOS 19.0, *)) {
+		roothider_inline_version = 19;
+	} else if (__builtin_available(iOS 18.0, *)) {
+		roothider_inline_version = 18;
+	} else if (__builtin_available(iOS 16.0, *)) {
+		roothider_inline_version = 16;
+	} else if (__builtin_available(iOS 15.0, *)) {
+		roothider_inline_version = 15;
 	}
 
 	if(parse_dyldhook_jbinfo(NULL, NULL, NULL, NULL) != 0)
 	{
 		dyld_patch_fallback_enabled = true;
+
+		roothider_inline_init_dyld_symbols(resolve_dyld_symbol_callback, (void*)get_dyld_mach_header());
 	}
+	
+	HOOK_DYLIB_PATH = strdup(dyld_image_path_containing_address(&__dso_handle));
+	
+	jbdSystemwideLog("CoreFoundation=%llx Foundation=%llx IOKit=%llx",
+		dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOLOAD),
+		dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_NOLOAD),
+		dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOLOAD)
+	);
 }
 
 void roothide_init_with_checkin(const char* rootdir)
 {
 	roothide_hidden_tweak_consume_environment();
-
-	if (dyld_patch_fallback_enabled || gHiddenTweakNameCount > 0)
+	if(dyld_patch_fallback_enabled || gHiddenTweakNameCount > 0)
 	{
 		init_dyldhooks();
 	}
@@ -2323,6 +2393,11 @@ void roothide_init_with_executable(const char* executable)
 		}
 	}
 
+	if(strcmp(executable, "/usr/libexec/runningboardd")==0)
+	{
+		roothidehooks_load_or_abort();
+	}
+
 #ifndef __arm64e__
 	if(strcmp(executable, "/System/Library/Frameworks/LocalAuthentication.framework/Support/coreauthd")==0
 	|| strcmp(executable, "/System/Library/Frameworks/CryptoTokenKit.framework/ctkd")==0
@@ -2331,6 +2406,7 @@ void roothide_init_with_executable(const char* executable)
 		if(jbclient_palehide_present())
 		{
 			void* roothidehooks = roothidehooks_load_or_abort();
+			ASSERT(roothidehooks != NULL);
 			void (*palera1n)() = dlsym(roothidehooks, "palera1n");
 			palera1n();
 		}

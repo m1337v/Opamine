@@ -24,7 +24,7 @@
 #include <errno.h>
 extern char **environ;
 
-#include "roothider.h"
+#include <libroothider/libroothider.h>
 
 #define FAKE_PHYSPAGE_TO_MAP 0x13370000
 
@@ -175,7 +175,7 @@ uint32_t sptm_frame_get_refcnt_off(uint64_t frame)
 	if (ksymbol(libsptm_frame_type_params)) {
 		uint64_t typeDescriptor = kread64(ksymbol(libsptm_frame_type_params)) + (ksizeof(sptm_frame_type_descriptor) * typeIdx);
 		uint8_t type = kread8(typeDescriptor + koffsetof(sptm_frame_type_descriptor, type));
-
+		
 		if (type == 1) {
 			refcnt_off = koffsetof(sptm_frame, nested_refcnt);
 		}
@@ -187,7 +187,7 @@ uint32_t sptm_frame_get_refcnt_off(uint64_t frame)
 		}
 	}
 	else {
-			if (typeIdx == 8 || typeIdx == 17 || typeIdx == 18 || typeIdx == 31) {
+		if (typeIdx == 8 || typeIdx == 17 || typeIdx == 18 || typeIdx == 31) {
 			refcnt_off = koffsetof(sptm_frame, nested_refcnt);
 		}
 		else if (typeIdx == 9 || typeIdx == 19 || typeIdx == 20 || typeIdx == 32) {
@@ -313,7 +313,7 @@ void pagetable_set_level(uint64_t pt_pa, uint8_t level)
 }
 
 #define L2_ROUND_DOWN(x) (((vm_address_t)(x)) & (~(L2_BLOCK_SIZE-1)))
-#define L2_ROUND_UP(x) ( (((vm_address_t)(x)) + L2_BLOCK_SIZE-1)  & (~(L2_BLOCK_SIZE-1)) )
+#define L2_ROUND_UP(x) ( (((vm_address_t)(x)) + L2_BLOCK_SIZE-1)  & (~(L2_BLOCK_SIZE-1)) ) 
 
 void *allocate_page_table_range(void)
 {
@@ -358,7 +358,7 @@ uint64_t alloc_page_table_unassigned(void)
 		}
 		// Now, fault in one page to make the kernel allocate the page table for it
 		mlock((void *)free_lvl2, 0x4000);
-
+	
 		// Find the newly allocated page table
 		uint64_t lvl = PMAP_TT_L2_LEVEL;
 		allocatedPT = vtophys_lvl(ttep, (uint64_t)free_lvl2, &lvl, &ttep_lvl2);
@@ -495,7 +495,7 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 
 				// Change type back
 				physwrite8(kvtophys(pmap + koffsetof(pmap, type)), 0);
-
+				
 				unmappedStart = 0;
 				unmappedSize = 0;
 				continue;
@@ -636,7 +636,7 @@ int pmap_map_in_with_flags(uint64_t pmap, uint64_t uaStart, uint64_t paStart, ui
 
 int pmap_map_in(uint64_t pmap, uint64_t uaStart, uint64_t paStart, uint64_t size)
 {
-	return pmap_map_in_with_flags(pmap, uaStart, paStart, size, PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
+	return pmap_map_in_with_flags(pmap, uaStart, paStart, size, PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);	
 }
 
 uint64_t pmap_find_main_binary_code_dir(uint64_t pmap)
@@ -891,8 +891,6 @@ int __exec_cmd_internal_va(bool suspended, bool root, bool waitForExit, pid_t *p
 	}
 
 	pid_t spawnedPid = 0;
-	/* RootHide owns process creation here: it applies the fork's hiding and
-	 * injection policy before the child can observe its environment. */
 	int spawnError = exec_cmd_roothide_spawn(&spawnedPid, binary, NULL, &attr, (char *const *)argv, envToUse);
 	if (attr) posix_spawnattr_destroy(&attr);
 	if (spawnError != 0) return spawnError;
@@ -1004,6 +1002,35 @@ int jbctl_earlyboot(mach_port_t earlyBootServer, ...)
 	return cmd_wait_for_exit(spawnedPid);
 }
 
+void walk_backtrace(bool (^block)(int frame_index, unw_word_t pc, unw_word_t offset, const char *symbol_name))
+{
+	unw_cursor_t cursor;
+	unw_context_t context;
+
+	unw_getcontext(&context);
+	unw_init_local(&cursor, &context);
+
+	int frame_index = 0;
+
+	while (unw_step(&cursor) > 0) {
+		unw_word_t offset, pc;
+		unw_get_reg(&cursor, UNW_REG_IP, &pc);
+		if (pc == 0) break;
+
+		char sym[256];
+		if (unw_get_proc_name(&cursor, sym, sizeof(sym), &offset) != 0) {
+			sym[0] = '\0';
+			offset = 0;
+		}
+
+		if (!block(frame_index, pc, offset, sym)) {
+			break;
+		}
+
+		frame_index++;
+	}
+}
+
 void proc_ucred_update(uint64_t proc, uint64_t newUcred)
 {
 	if (gSystemInfo.kernelStruct.proc_ro.exists) {
@@ -1027,7 +1054,7 @@ void proc_copy_ucred(uint64_t procCopyFrom, uint64_t procCopyTo)
 	// Every process and every thread holds a lock on both ucred and ucred_rw
 
 	// Since we replace the ucred of procCopyTo, we need to decrement the refcnt of it's original ucred
-	// Then it will be freed by the system as soon as all threads have switched
+	// Then it will be freed by the system as soon as all threads have switched 
 	// to the new ucred via current_cached_proc_cred_update
 	kauth_cred_drop(origUcred);
 	kauth_cred_unref(origUcred);
@@ -1093,7 +1120,7 @@ int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t rui
 
 	// In order to speed things up, skip any injection into the child process we spawn
 	const char *envp[] = {
-		"_SafeMode=1",
+		// "_SafeMode=1", //remove this to allow injecting systemhook into stock executables
 		"DYLD_HOOK_SETUID=1",
 		NULL,
 	};
@@ -1103,9 +1130,10 @@ int target_proc_with_ucred(const char *procPath, uid_t uid, gid_t gid, uid_t rui
 	posix_spawn_file_actions_destroy(&act);
 	if (r == 0) {
 		int r = 0;
+		close(comPipe[1]); // close first
 		read(comPipe[0], &r, sizeof(r));
 		close(comPipe[0]);
-		close(comPipe[1]);
+		if(r!=0x42) { kill(pid, SIGKILL); return -1; } //safe guard
 		return pid;
 	}
 
@@ -1207,7 +1235,7 @@ void killall(const char *executablePath, int signal)
 	struct kinfo_proc *info;
 	size_t length;
 	int count;
-
+	
 	if (sysctl(mib, 3, NULL, &length, NULL, 0) < 0)
 		return;
 	if (!(info = malloc(length)))
@@ -1296,7 +1324,7 @@ int libarchive_unarchive(const char *fileToExtract, const char *extractionPath)
 			strlcat(outputPath, currentFile, PATH_MAX);
 
 			archive_entry_set_pathname(entry, outputPath);
-
+			
 			r = archive_write_header(ext, entry);
 			if (r < ARCHIVE_OK)
 					fprintf(stderr, "%s\n", archive_error_string(ext));
@@ -1317,7 +1345,7 @@ int libarchive_unarchive(const char *fileToExtract, const char *extractionPath)
 	archive_read_free(a);
 	archive_write_close(ext);
 	archive_write_free(ext);
-
+	
 	return 0;
 }
 
@@ -1418,7 +1446,7 @@ int convert_hex_string_to_data(const char *string, void *outBuf)
 char *boot_manifest_hash(void)
 {
 	static char *gBuf = NULL;
-
+	
 	static dispatch_once_t onceToken;
 	dispatch_once(&onceToken, ^{
 		io_registry_entry_t registryEntry = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/chosen");

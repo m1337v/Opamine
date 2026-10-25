@@ -1,49 +1,16 @@
 #import <libjailbreak/libjailbreak.h>
 #import <libjailbreak/jbclient_xpc.h>
 #import <libjailbreak/jbclient_mach.h>
+#import <libjailbreak/stock_fixes.h>
 #import "internal.h"
 
 #import <Foundation/Foundation.h>
 #import <CoreServices/LSApplicationProxy.h>
-#import <errno.h>
-#import <limits.h>
-#import <stdio.h>
-#import <stdlib.h>
-#import <unistd.h>
+#import <CoreServices/LSApplicationWorkspace.h>
 
 int reboot3(uint64_t flags, ...);
 #define RB2_USERREBOOT (0x2000000000000000llu)
 extern char **environ;
-
-static int wait_for_root_cleanup_if_requested(int argc, char *argv[], int *commandArgc)
-{
-	*commandArgc = argc;
-	if (argc < 4 || strcmp(argv[argc - 2], "--waitfor") != 0) {
-		return 0;
-	}
-
-	char *end = NULL;
-	errno = 0;
-	long parsedFD = strtol(argv[argc - 1], &end, 10);
-	if (errno != 0 || !end || *end != '\0' || parsedFD < 3 || parsedFD > INT_MAX) {
-		return EINVAL;
-	}
-
-	char signal = 0;
-	ssize_t bytesRead;
-	do {
-		bytesRead = read((int)parsedFD, &signal, sizeof(signal));
-	} while (bytesRead == -1 && errno == EINTR);
-	close((int)parsedFD);
-
-	if (bytesRead != sizeof(signal)) {
-		return bytesRead == 0 ? EPIPE : errno;
-	}
-
-	// Keep the private synchronization arguments out of the command parser.
-	*commandArgc -= 2;
-	return 0;
-}
 
 void print_usage(void)
 {
@@ -53,7 +20,7 @@ Available commands:\n\
 	trustcache info\t\t\tPrint info about all jailbreak related trustcaches and the cdhashes contained in them\n\
 	trustcache clear\t\tClears all existing cdhashes from the jailbreaks trustcache\n\
 	trustcache add /path/to/macho\t\tAdd the cdhash of a macho to the jailbreaks trustcache\n\
-	update <tipa/basebin> <path>\tInitiates a jailbreak update either based on a TIPA or based on a basebin.tar file, TIPA installation depends on TrollStore, afterwards it triggers a userspace reboot\n");
+	update <tipa/basebin/tarball> <path>\tInitiates a jailbreak update either based on a TIPA, based on a basebin.tar file or based on a standalone tarball, TIPA installation depends on TrollStore, afterwards it triggers a userspace reboot\n");
 }
 
 int main(int argc, char* argv[])
@@ -84,11 +51,15 @@ int main(int argc, char* argv[])
 		setuid(0);
 	}
 
-	int commandArgc = argc;
-	int waitResult = wait_for_root_cleanup_if_requested(argc, argv, &commandArgc);
-	if (waitResult != 0) {
-		fprintf(stderr, "jbctl: root-helper synchronization failed: %d\n", waitResult);
-		return waitResult;
+	if (argc > 2) {
+		if (!strcmp(argv[argc-2], "--waitfor")) {
+			// When the Dopamine app spawns jbctl it needs to clean up it's own ucred before jbctl does the requested action
+			// For this it will attach a pipe fd and write to it once the cleanup is done, so we need to wait until that write happens
+			int fd = atoi(argv[argc-1]);
+			int r = 0;
+			read(fd, &r, sizeof(r));
+			close(fd);
+		}
 	}
 
 	const char *rootPath = jbclient_get_jbroot();
@@ -185,14 +156,21 @@ int main(int argc, char* argv[])
 			
 		}
 	}
-	else if (!strcmp(cmd, "respring")) {
-		return exec_cmd(JBROOT_PATH("/usr/bin/sbreload"), NULL);
-	}
 	else if (!strcmp(cmd, "reboot_userspace")) {
 		return reboot3(RB2_USERREBOOT);
 	}
+	else if (!strcmp(cmd, "respring")) {
+		const char *sbreloadPath = JBROOT_PATH("/usr/bin/sbreload");
+		if (execve(sbreloadPath, (char *[]){ (char *)sbreloadPath, NULL }, environ) != 0) {
+			killall("/usr/libexec/backboardd", SIGTERM);
+		}
+	}
+	else if (!strcmp(cmd, "rebuild_icon_cache")) {
+		BOOL suc = [[LSApplicationWorkspace defaultWorkspace] _LSPrivateRebuildApplicationDatabasesForSystemApps:YES internal:YES user:YES];
+		return suc ? 0 : -1;
+	}
 	else if (!strcmp(cmd, "update")) {
-		if (commandArgc < 4) {
+		if (argc < 4) {
 			print_usage();
 			return 2;
 		}
@@ -226,8 +204,19 @@ int main(int argc, char* argv[])
 			updateFile = strdup([dopamineAppProxy.bundleURL.path stringByAppendingPathComponent:@"basebin.tar"].fileSystemRepresentation);
 			// Fall through to basebin installation
 		}
+		else if (!strcmp(updateType, "tarball")) {
+			NSString *tmpPath = [@"/tmp" stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+			[[NSFileManager defaultManager] createDirectoryAtPath:tmpPath withIntermediateDirectories:NO attributes:nil error:nil];
+			int r = libarchive_unarchive(updateFile, tmpPath.fileSystemRepresentation);
+			if (r != 0) {
+				printf("Failed to extract tarball: %d\n", r);
+				return 7;
+			}
+			updateFile = strdup([tmpPath stringByAppendingPathComponent:@"basebin.tar"].fileSystemRepresentation);
+			// Fall through to basebin installation
+		}
 		else if (strcmp(updateType, "basebin") != 0) {
-			// If type is neither tipa nor basebin, bail out
+			// If type is not tipa, tarball or basebin, bail out
 			print_usage();
 			return 2;
 		}
@@ -245,10 +234,10 @@ int main(int argc, char* argv[])
 	}
 	else if (!strcmp(cmd, "internal")) {
 		if (getuid() != 0) return 41;
-		if (commandArgc < 3) return 42;
+		if (argc < 3) return 42;
 
 		const char *internalCmd = argv[2];
-		return jbctl_handle_internal(internalCmd, commandArgc - 2, &argv[2]);
+		return jbctl_handle_internal(internalCmd, argc-2, &argv[2]);
 	}
 
 	return 0;

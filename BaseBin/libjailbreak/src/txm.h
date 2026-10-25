@@ -5,17 +5,18 @@
 #include "translation.h"
 
 enum {
-	kTXMCodeRegionTypeExecutable = 0,
-	kTXMCodeRegionTypeSharedRegion = 1,
-	kTXMCodeRegionTypeJIT = 2,
-	kTXMCodeRegionTypeDebug = 3,
+	kTXMCodeRegionTypeExecutable=0,
+	kTXMCodeRegionTypeSharedRegion=1,
+	kTXMCodeRegionTypeJIT=2,
+	kTXMCodeRegionTypeDebug=3
 };
+
+// Basically we need a kernel address that at + koffsetof(TXMCodeRegion, startAddr) has the adress we want to search for
+// This produces it by just translating the userspace address to kernelspace and substracting the offset
+#define CodeRegionRBTree_KEY(x) (phystokv(vtophys(ttep_self(), (uint64_t)&x)) - koffsetof(TXMCodeRegion, startAddr))
 
 RB_PROTOTYPE(TXMCodeRegionRBTree, uint64_t, koffsetof(TXMCodeRegion, RBLink), TXMCodeRegion_comparator)
 
-/* 0 on a supported 17–25 TXM runtime; -ENOTSUP for legacy/incomplete startup
- * and intentionally on iOS 26+ until the hookd/provider transaction lands. */
-int txm_code_region_allocator_status(void);
 uint64_t allocateCodeRegionObject(void);
 
 #endif

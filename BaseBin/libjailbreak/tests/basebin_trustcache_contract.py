@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-COMMON = ROOT / "BaseBin/libjailbreak/src/roothider/common.m"
+COMMON = ROOT / "BaseBin/libroothider/src/common.m"
 
 COMPLETED = 0
 SKIPPED = 1
@@ -65,7 +65,7 @@ def main() -> int:
             "fixed-UUID replacement must rebuild from already-trusted current hashes")
     require("dyldhook_dylib_for_platform()" in common,
             "the device-selected dyldhook image must be required")
-    for image in ("roothidehooks.dylib", "systemhook.dylib", "libjailbreak.dylib", "launchdhook.dylib"):
+    for image in ("roothidehooks.dylib", "systemhook.dylib", "libjailbreak.dylib", "libroothider.dylib", "launchdhook.dylib"):
         require(image in common, f"required runtime image missing from contract: {image}")
     require("is_cdhash_trustcached(requiredImages[i].cdhashes[j])" in common,
             "every required randomized mappable-slice CDHash must be verified after upload")
@@ -79,9 +79,9 @@ def main() -> int:
             "every mappable signature must be read and malformed input must fail without a second mutation pass")
     require("return sawSlice ? FILE_CDHASH_COLLECTION_SKIPPED : -EINVAL" in common,
             "valid non-mappable Mach-O must skip while an empty/malformed parse fails")
-    require("BASEBIN_REQUIRED_IMAGE_COUNT = 5" in common and
+    require("BASEBIN_REQUIRED_IMAGE_COUNT = 6" in common and
             "requiredPathCount != BASEBIN_REQUIRED_IMAGE_COUNT" in common,
-            "required-image storage must have an explicit five-image bound")
+            "required-image storage must have an explicit six-image bound")
     require("selectedDyldhook.isAbsolutePath" in common and
             "rangeOfString:@\"/\"" in common,
             "selected dyldhook must be a BaseBin-local filename")

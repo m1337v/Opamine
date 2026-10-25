@@ -101,7 +101,7 @@ struct system_info {
 		uint64_t developer_mode_enabled;
 		uint64_t ppl_trust_cache_rt;
 
-		// SPTM/TXM only
+		// SPTM-only
 		uint64_t SPTMArgs;
 		uint64_t libsptm_n_papt_ranges;
 		uint64_t libsptm_papt_ranges;
@@ -219,8 +219,8 @@ struct system_info {
 			uint32_t itk_space;
 			uint32_t flags;
 			uint32_t task_can_transfer_memory_ownership;
-			uint32_t mach_trap_filter_mask;
-			uint32_t mach_kobj_filter_mask;
+			uint32_t mach_trap_filter_mask; // ???
+			uint32_t mach_kobj_filter_mask; // ???
 			uint32_t security_config;
 		} task;
 
@@ -281,8 +281,12 @@ struct system_info {
 			uint32_t pmap_cs_main;
 			uint32_t wx_allowed;
 			uint32_t type;
+			
+			// Non SPTM/TXM only
 			uint32_t sw_asid;
-			uint32_t asid;
+
+			// SPTM/TXM only
+			uint32_t asid; 
 			uint32_t txm_address_space;
 		} pmap;
 
@@ -379,6 +383,7 @@ struct system_info {
 
 		struct {
 			uint32_t type;
+
 			uint32_t struct_size;
 		} sptm_frame_type_descriptor;
 	} kernelStruct;
@@ -417,18 +422,28 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelConstant.TFRO_HARDENED);
 
 #define JAILBREAK_INFO_ITERATE(ctx, iterator) \
-	iterator(ctx, jailbreakInfo.usesPACBypass); \
-	iterator(ctx, jailbreakInfo.rootPath); \
-	iterator(ctx, jailbreakInfo.appIdentifier); \
+	\
 	iterator(ctx, jailbreakInfo.jbrand); \
 	iterator(ctx, jailbreakInfo.palera1n); \
-	iterator(ctx, jailbreakInfo.dyld_patch_enabled);
+	iterator(ctx, jailbreakInfo.dyld_patch_enabled); \
+	\
+	\
+	iterator(ctx, jailbreakInfo.usesPACBypass); \
+	iterator(ctx, jailbreakInfo.rootPath); \
+	iterator(ctx, jailbreakInfo.appIdentifier);
 
 #define JAILBREAK_SETTINGS_ITERATE(ctx, iterator) \
 	iterator(ctx, jailbreakSettings.markAppsAsDebugged); \
 	iterator(ctx, jailbreakSettings.jetsamMultiplier);
 
 #define KERNEL_SYMBOLS_ITERATE(ctx, iterator) \
+	\
+	iterator(ctx, kernelSymbol.nchashtbl); \
+	iterator(ctx, kernelSymbol.nchashmask); \
+	iterator(ctx, kernelSymbol.launch_env_logging); \
+	iterator(ctx, kernelSymbol.developer_mode_status); \
+	\
+	\
 	iterator(ctx, kernelSymbol.perfmon_dev_open); \
 	iterator(ctx, kernelSymbol.vn_kqfilter); \
 	iterator(ctx, kernelSymbol.proc_find); \
@@ -446,6 +461,7 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelSymbol.hw_lck_ticket_reserve_orig_allow_invalid); \
 	iterator(ctx, kernelSymbol.exception_return); \
 	iterator(ctx, kernelSymbol.mac_label_set); \
+	\
 	iterator(ctx, kernelSymbol.perfmon_devices); \
 	iterator(ctx, kernelSymbol.cdevsw); \
 	iterator(ctx, kernelSymbol.allproc); \
@@ -475,11 +491,7 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelSymbol.papt_ranges_compressed); \
 	iterator(ctx, kernelSymbol.libsptm_frame_type_params); \
 	iterator(ctx, kernelSymbol.txm_developer_mode_storage); \
-	iterator(ctx, kernelSymbol.txm_trustcache_root); \
-	iterator(ctx, kernelSymbol.nchashtbl); \
-	iterator(ctx, kernelSymbol.nchashmask); \
-	iterator(ctx, kernelSymbol.launch_env_logging); \
-	iterator(ctx, kernelSymbol.developer_mode_status);
+	iterator(ctx, kernelSymbol.txm_trustcache_root);
 
 #define KERNEL_GADGETS_ITERATE(ctx, iterator) \
 	iterator(ctx, kernelGadget.pacda); \
@@ -518,13 +530,19 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelStruct.proc_ro.mach_kobj_filter_mask); \
 	iterator(ctx, kernelStruct.proc_ro.t_flags_ro); \
 	iterator(ctx, kernelStruct.proc_ro.task_tokens); \
+	\
 	iterator(ctx, kernelStruct.task_token_ro_data.audit_token); \
 	\
 	iterator(ctx, kernelStruct.filedesc.ofiles_start); \
+	\
 	iterator(ctx, kernelStruct.fileproc.glob); \
+	\
 	iterator(ctx, kernelStruct.fileglob.data); \
+	\
 	iterator(ctx, kernelStruct.vnode.un); \
+	\
 	iterator(ctx, kernelStruct.ubc_info.cs_blobs); \
+	\
 	iterator(ctx, kernelStruct.cs_blob.next); \
 	iterator(ctx, kernelStruct.cs_blob.cpu_type); \
 	iterator(ctx, kernelStruct.cs_blob.cpu_subtype); \
@@ -539,6 +557,7 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelStruct.ucred.rgid); \
 	iterator(ctx, kernelStruct.ucred.svgid); \
 	iterator(ctx, kernelStruct.ucred.label); \
+	\
 	iterator(ctx, kernelStruct.ucred_rw.exists); \
 	iterator(ctx, kernelStruct.ucred_rw.weak_ref); \
 	\
@@ -582,6 +601,7 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelStruct.vm_map_entry.flags_prot); \
 	iterator(ctx, kernelStruct.vm_map_entry.flags_maxprot); \
 	iterator(ctx, kernelStruct.vm_map_entry.flags_xnu_user_debug); \
+	\
 	iterator(ctx, kernelStruct.vm_page.pv_head); \
 	iterator(ctx, kernelStruct.vm_page.struct_size); \
 	\
@@ -618,23 +638,30 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelStruct.inpcb.socket); \
 	iterator(ctx, kernelStruct.inpcb.icmp6filt); \
 	iterator(ctx, kernelStruct.inpcb.chksum); \
+	\
 	iterator(ctx, kernelStruct.inpcbinfo.ipi_zone); \
+	\
 	iterator(ctx, kernelStruct.kalloc_type_view.kt_zv_zv_name); \
 	\
 	iterator(ctx, kernelStruct.socket.usecount); \
 	iterator(ctx, kernelStruct.socket.proto); \
 	\
 	iterator(ctx, kernelStruct.protosw.input); \
+	\
 	iterator(ctx, kernelStruct.IOSurface.memoryDescriptor); \
 	iterator(ctx, kernelStruct.IOSurface.ranges); \
 	iterator(ctx, kernelStruct.IOSurface.rangeCount); \
+	\
 	iterator(ctx, kernelStruct.IOMachPort.object); \
+	\
 	iterator(ctx, kernelStruct.sptm_frame.type); \
 	iterator(ctx, kernelStruct.sptm_frame.level); \
 	iterator(ctx, kernelStruct.sptm_frame.nested_refcnt); \
 	iterator(ctx, kernelStruct.sptm_frame.mapping_refcnt); \
+	\
 	iterator(ctx, kernelStruct.TXMAddressSpace.allowsInvalidCode); \
 	iterator(ctx, kernelStruct.TXMAddressSpace.codeRegions); \
+	\
 	iterator(ctx, kernelStruct.TXMCodeRegion.active); \
 	iterator(ctx, kernelStruct.TXMCodeRegion.type); \
 	iterator(ctx, kernelStruct.TXMCodeRegion.nestedSpace); \
@@ -642,8 +669,10 @@ extern struct system_info gSystemInfo;
 	iterator(ctx, kernelStruct.TXMCodeRegion.startAddr); \
 	iterator(ctx, kernelStruct.TXMCodeRegion.endAddr); \
 	iterator(ctx, kernelStruct.TXMCodeRegion.RBLink); \
+	\
 	iterator(ctx, kernelStruct.sptm_frame_type_descriptor.type); \
 	iterator(ctx, kernelStruct.sptm_frame_type_descriptor.struct_size); \
+	\
 	iterator(ctx, kernelStruct.RBLink.rbe_left); \
 	iterator(ctx, kernelStruct.RBLink.rbe_right); \
 	iterator(ctx, kernelStruct.RBLink.rbe_parent);

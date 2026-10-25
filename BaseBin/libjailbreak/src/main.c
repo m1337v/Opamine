@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include "physrw.h"
 #include "physrw_pte.h"
-#include "kalloc_pt.h"
+#include "legacy_kalloc_compat.h"
 #include "primitives_IOSurface.h"
 #include "info.h"
 #include "translation.h"
@@ -31,8 +31,8 @@ int jbclient_initialize_primitives_internal(bool physrwPTE)
 			if (initResult != 0) return initResult;
 			libjailbreak_translation_init();
 			libjailbreak_IOSurface_primitives_init();
-			/* RootHide still has external boomerang/launchdhook users of this
-			 * compatibility primitive.  Retire it only with those callers. */
+			/* Kept as a named compatibility shim for RootHide users that still
+			 * depend on the iOS 16 page-table allocator fallback. */
 			if (__builtin_available(iOS 16.0, *)) {
 				libjailbreak_kalloc_pt_init();
 			}

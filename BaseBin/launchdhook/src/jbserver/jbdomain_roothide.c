@@ -1,9 +1,8 @@
 #include <signal.h>
-#include <syslog.h>
 #include "jbserver_global.h"
 
 #include <libjailbreak/libjailbreak.h>
-#include <libjailbreak/roothider.h>
+#include <libroothider/libroothider.h>
 #include <libjailbreak/codesign.h>
 
 int roothide_unsupport_request()
@@ -15,19 +14,14 @@ int roothide_unsupport_request()
 bool roothide_domain_allowed(audit_token_t clientToken)
 {
 	//its fast enough
-	if(isBlacklistedToken(&clientToken) && !isRestrictedBlacklistedToken(&clientToken)) {
-		JBLogDebug("ignore xpc message from blacklisted process (%d),%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
+	if(isBlacklistedToken(&clientToken)) {
+		JBLogDebug("ignore mach/xpc message from blacklisted process (%d),%s", audit_token_to_pid(clientToken), proc_get_path(audit_token_to_pid(clientToken),NULL));
 		return false;
 	}
 
 	return true;
 }
 
-typedef struct {
-	uint32_t Count;
-	uint32_t* Types;
-	uint32_t* Subtypes;
-} preferredArchInfo;
 void recurse_collect_untrusted_cdhashes(const char *path, const char *callerImagePath, const char *callerExecutablePath, const char *workingDir, preferredArchInfo* preferredArch, cdhash_t **cdhashesOut, uint32_t *cdhashCountOut);
 
 static int trust_macho_recurse(const char *machoPath, const char *dlopenCallerImagePath, const char *dlopenCallerExecutablePath, const char *workingDir, xpc_object_t preferredArchsArray)
@@ -105,6 +99,8 @@ static int roothide_palehide_present(audit_token_t *callerToken, bool* palehide)
 
 static int roothide_blacklist_check(audit_token_t *callerToken, const char* checktype, xpc_object_t checkvalue, bool* blacklisted)
 {
+	if(!checktype) return -1;
+	
 	if(strcmp(checktype, "pid")==0) {
 		pid_t pid = (pid_t)xpc_uint64_get_value(checkvalue);
 		if(pid > 1) {
@@ -162,7 +158,7 @@ static int roothide_set_dyld_patch(audit_token_t *callerToken, bool enabled)
 	uid_t uid = audit_token_to_euid(*callerToken);
 
     uint32_t csFlags = 0;
-    csops(getpid(), CS_OPS_STATUS, &csFlags, sizeof(csFlags));
+    csops(pid, CS_OPS_STATUS, &csFlags, sizeof(csFlags));
 
 	if(uid != 0 && (csFlags & CS_PLATFORM_BINARY)==0) {
 		JBLogError("roothide_set_dyld_patch: denying request from %d,%d", pid, uid);
@@ -181,6 +177,23 @@ static int roothide_set_dyld_patch(audit_token_t *callerToken, bool enabled)
 
 	jbinfo(dyld_patch_enabled) = enabled;
 	
+	return 0;
+}
+
+extern mach_port_t gJBServerAlternativePort;
+static int roothide_get_alternative_port(audit_token_t *callerToken, xpc_object_t *portOut)
+{
+	pid_t pid = audit_token_to_pid(*callerToken);
+
+    uint32_t csFlags = 0;
+    csops(pid, CS_OPS_STATUS, &csFlags, sizeof(csFlags));
+
+	if((csFlags & CS_PLATFORM_BINARY) == 0) {
+		JBLogError("roothide_get_alternative_port: denying request from %d,%s", pid, proc_get_path(pid,NULL));
+		return -1;
+	}
+
+	*portOut = xpc_mach_send_create(gJBServerAlternativePort);
 	return 0;
 }
 
@@ -228,6 +241,15 @@ struct jbserver_domain gRootHideDomain = {
 		//JBS_ROOTHIDE_JAILBREAKD_CHECKIN
         {
             .handler = roothide_jailbreakd_checkin,
+            .args = (jbserver_arg[]) {
+                    { .name = "caller-token", .type = JBS_TYPE_CALLER_TOKEN, .out = false },
+                    { .name = "port", .type = JBS_TYPE_XPC_GENERIC, .out = true },
+                    { 0 },
+            },
+        },
+		//JBS_ROOTHIDE_GET_ALTERNATIVE_PORT
+        {
+            .handler = roothide_get_alternative_port,
             .args = (jbserver_arg[]) {
                     { .name = "caller-token", .type = JBS_TYPE_CALLER_TOKEN, .out = false },
                     { .name = "port", .type = JBS_TYPE_XPC_GENERIC, .out = true },

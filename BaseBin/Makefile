@@ -9,20 +9,20 @@
 
 all: basebin.tar
 
-TRUSTCACHE ?= $(strip $(firstword \
-	$(wildcard $(CURDIR)/trustcache) \
-	$(wildcard $(CURDIR)/../../Opamine-dopamine/BaseBin/trustcache) \
-	$(shell command -v trustcache 2>/dev/null)))
+TRUSTCACHE ?= $(strip $(firstword $(wildcard $(CURDIR)/trustcache) $(wildcard $(CURDIR)/../../Opamine-dopamine/BaseBin/trustcache) $(shell command -v trustcache 2>/dev/null)))
 
-subprojects: ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook boomerang jbctl idownloadd watchdoghook roothidehooks jailbreakd bootstrapper
+subprojects: ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook rootlesshooks dopamine
+subprojects: roothidehooks libroothider jailbreakd bootstrapper
 
 ChOma: .build .include
 	@$(MAKE) -C ChOma TARGET=ios DISABLE_SIGNING=1 DISABLE_TESTS=1 DYLIB_LDFLAGS="-install_name @loader_path/libchoma.dylib"
+	@ldid -Cadhoc -s ChOma/output/ios/lib/libchoma.dylib
 	@cp ChOma/output/ios/lib/libchoma.dylib .build
 	@cp -r ChOma/output/ios/include/choma .include
 
 XPF: .build .include ChOma
 	@$(MAKE) -C XPF output/ios/libxpf.dylib CHOMA_PATH=../ChOma CHOMA_DYLIB_PATH="../.build"
+	@ldid -Cadhoc -s XPF/output/ios/libxpf.dylib
 	@cp XPF/output/ios/libxpf.dylib .build/libxpf.dylib
 	@mkdir -p .include/xpf
 	@cp XPF/src/xpf.h .include/xpf
@@ -32,16 +32,14 @@ MachOMerger: .build .include
 	@cp MachOMerger/MachOMerger .build
 
 opainject: .build .include
-	$(MAKE) -C opainject FINALPACKAGE=1
-	@cp opainject/.theos/obj/opainject .build
+	$(MAKE) -C opainject
+	@cp opainject/opainject .build
 
 libjailbreak: .build .include ChOma
 	$(MAKE) -C libjailbreak
 	@cp libjailbreak/libjailbreak.dylib .build
 	@mkdir -p .include/libjailbreak
 	@cp libjailbreak/src/*.h .include/libjailbreak
-	@mkdir -p .include/libjailbreak/roothider
-	@cp libjailbreak/src/roothider/*.h .include/libjailbreak/roothider
 
 systemhook: .build .include libjailbreak
 	$(MAKE) -C systemhook
@@ -54,6 +52,10 @@ forkfix: .build .include libjailbreak systemhook
 launchdhook: .build .include libjailbreak
 	$(MAKE) -C launchdhook
 	@cp launchdhook/launchdhook.dylib .build
+
+hookd: .build .include libjailbreak
+	$(MAKE) -C hookd
+	@cp hookd/hookd .build
 
 boomerang: .build .include libjailbreak
 	$(MAKE) -C boomerang
@@ -71,8 +73,11 @@ watchdoghook: .build .include libjailbreak
 	$(MAKE) -C watchdoghook
 	@cp watchdoghook/watchdoghook.dylib .build
 
-roothidehooks: .build .include libjailbreak
-	@find /var/folders -type d -path '*/C/clang/ModuleCache' -prune -exec rm -rf {} + 2>/dev/null || true
+rootlesshooks: .build .include libjailbreak
+	$(MAKE) -C rootlesshooks
+	@cp rootlesshooks/.theos/obj/rootlesshooks.dylib .build
+
+roothidehooks: .build .include libjailbreak libroothider
 	$(MAKE) -C roothidehooks
 	@cp roothidehooks/.theos/obj/roothidehooks.dylib .build
 
@@ -80,16 +85,36 @@ bootstrapper: .build .include libjailbreak
 	$(MAKE) -C bootstrapper
 	@cp bootstrapper/bootstrapper .build
 
-jailbreakd: .build .include libjailbreak
+libroothider-stub: .include .build ChOma XPF
+	@mkdir -p .include/libjailbreak
+	@cp libjailbreak/src/*.h .include/libjailbreak
+	@mkdir -p .include/libroothider
+	@cp libroothider/src/*.h .include/libroothider
+	$(MAKE) -C libroothider libroothider-stub.dylib
+	@cp libroothider/libroothider-stub.dylib .build/libroothider.dylib
+
+libjailbreak: libroothider-stub
+
+libroothider: .build .include ChOma XPF libjailbreak
+	$(MAKE) -C libroothider
+	@cp libroothider/libroothider.dylib .build
+
+jailbreakd: .build .include libjailbreak libroothider
 	$(MAKE) -C jailbreakd
 	@cp jailbreakd/jailbreakd .build
+
+dopamine: .build .include libjailbreak XPF ChOma
+# 	$(MAKE) -C dopamine
+# 	@cp dopamine/dopamine .build
 
 .build:
 	rm -rf .build
 	mkdir -p .build
 	cp -r _external/basebin/* .build
 	cp _external/basebin/.version .build
+	cp _external/basebin/.version-roothide .build
 	date +%s > .build/.build_id
+	cp _external/basebin/prebuilt/* .build || true
 
 .include:
 	rm -rf .include
@@ -101,13 +126,7 @@ ifneq (,$(wildcard $(shell xcrun --sdk iphoneos --show-sdk-path)/usr/include/xpc
 endif
 
 basebin.tc: subprojects
-	@if [ -z "$(TRUSTCACHE)" ]; then \
-		echo "error: trustcache binary not found. Expected one of:" >&2; \
-		echo "  1. $(CURDIR)/trustcache" >&2; \
-		echo "  2. $(CURDIR)/../../Opamine-dopamine/BaseBin/trustcache" >&2; \
-		echo "  3. trustcache in PATH" >&2; \
-		exit 1; \
-	fi
+	@test -n "$(TRUSTCACHE)" || { echo "error: trustcache build tool is missing" >&2; exit 1; }
 	"$(TRUSTCACHE)" create .build/basebin.tc .build
 	cp .build/basebin.tc basebin.tc
 
@@ -133,13 +152,17 @@ clean:
 	@$(MAKE) -C jbctl $@
 	@$(MAKE) -C idownloadd $@
 	@$(MAKE) -C watchdoghook $@
+	@$(MAKE) -C rootlesshooks $@
 	@$(MAKE) -C roothidehooks $@
 	@$(MAKE) -C bootstrapper $@
+	@$(MAKE) -C libroothider $@
 	@$(MAKE) -C jailbreakd $@
 	@$(MAKE) -C dyldhook $@
+	@$(MAKE) -C dopamine $@
+	@$(MAKE) -C hookd $@
 	@rm -rf .build
 	@rm -rf .include
 	@rm -rf basebin.tar
 	@rm -rf basebin.tc
 
-.PHONY: clean .build .include ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook boomerang jbctl idownloadd watchdoghook roothidehooks basebin.tc dyldhook basebin.tar jailbreakd bootstrapper
+.PHONY: clean .build .include ChOma XPF MachOMerger opainject libjailbreak systemhook forkfix launchdhook hookd boomerang jbctl idownloadd watchdoghook rootlesshooks roothidehooks libroothider libroothider-stub jailbreakd bootstrapper dopamine subprojects basebin.tc dyldhook basebin.tar

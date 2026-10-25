@@ -1,8 +1,9 @@
 #include <sandbox.h>
 #include <substrate.h>
+#include <litehook.h>
 
 #include <libjailbreak/libjailbreak.h>
-#include <libjailbreak/roothider.h>
+#include <libroothider/libroothider.h>
 
 int (*sandbox_check_by_audit_token_orig)(audit_token_t au, const char *operation, int sandbox_filter_type, ...);
 int sandbox_check_by_audit_token_hook(audit_token_t au, const char *operation, int sandbox_filter_type, ...)
@@ -43,5 +44,6 @@ if(isBlacklistedToken(&au)) {
 
 void initIPCHooks(void)
 {
-	MSHookFunction(&sandbox_check_by_audit_token, (void *)sandbox_check_by_audit_token_hook, (void **)&sandbox_check_by_audit_token_orig);
+	sandbox_check_by_audit_token_orig = sandbox_check_by_audit_token;
+	litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, sandbox_check_by_audit_token, (void *)sandbox_check_by_audit_token_hook, NULL);
 }

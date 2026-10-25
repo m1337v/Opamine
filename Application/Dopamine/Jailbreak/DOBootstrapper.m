@@ -6,7 +6,10 @@
 //
 
 #import "DOBootstrapper.h"
+#import "DOBootstrapper+RootHide.h"
+#import "DOBootstrapper+zstd.h"
 #import "DOEnvironmentManager.h"
+#import "DOEnvironmentManager+RootHide.h"
 #import "DOUIManager.h"
 #import <libjailbreak/info.h>
 #import <libjailbreak/util.h>
@@ -46,15 +49,6 @@ struct hfs_mount_args {
 };
 
 NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
-typedef NS_ENUM(NSInteger, JBErrorCode) {
-    BootstrapErrorCodeFailedToGetURL            = -1,
-    BootstrapErrorCodeFailedToDownload          = -2,
-    BootstrapErrorCodeFailedDecompressing       = -3,
-    BootstrapErrorCodeFailedExtracting          = -4,
-    BootstrapErrorCodeFailedRemount             = -5,
-    BootstrapErrorCodeFailedFinalising          = -6,
-    BootstrapErrorCodeFailedReplacing           = -7,
-};
 
 #define BUFFER_SIZE 8192
 
@@ -74,7 +68,9 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     return self;
 }
 
-- (NSError *)decompressZstd:(NSString *)zstdPath toTar:(NSString *)tarPath
+// Kept only as a historical fallback reference. The upstream category is the
+// single live implementation of `decompressZstd:toTar:`.
+- (NSError *)legacyDecompressZstd:(NSString *)zstdPath toTar:(NSString *)tarPath
 {
     // Open the input file for reading
     FILE *input_file = fopen(zstdPath.fileSystemRepresentation, "rb");
@@ -1947,6 +1943,9 @@ rollback:
     
     BOOL shouldInstallLibkrw = [self shouldInstallPackage:@"libkrw0-dopamine"];
     BOOL shouldInstallBasebinLink = [self shouldInstallPackage:@"dopamine-basebin-link"];
+    // The 3.x bootstrap still records upstream RootHide 0.1.0. Retain the
+    // forked package revision so a source update cannot silently replace the
+    // policy-bearing core with the unqualified package.
     BOOL shouldInstallRoothideCore = [self shouldInstallPackage:@"roothide"];
     // Respect the package-manager choice: update Sileo only when it is already installed.
     BOOL sileoInstalled = [self installedVersionForPackageWithIdentifier:@"org.coolstar.sileo"] != nil;

@@ -8,6 +8,21 @@
 
 #include "../src/rhi_rebind.c"
 
+/* The host fixture exercises metadata and ledger code only. Keep the iOS 19+
+ * provider symbol linkable, but fail the harness if a metadata-only case ever
+ * reaches the production slot writer. */
+static unsigned int g_hookd_hook_calls;
+
+kern_return_t hookd_hook(mach_port_t task_port, uint64_t address, uint8_t *data, size_t size)
+{
+	(void)task_port;
+	(void)address;
+	(void)data;
+	(void)size;
+	g_hookd_hook_calls++;
+	return KERN_FAILURE;
+}
+
 static void put32(uint8_t *p, uint32_t value)
 {
 	memcpy(p, &value, sizeof(value));
@@ -325,6 +340,10 @@ int main(void)
 	}
 	if (run_slot_attestation_fixture() != 0) return 1;
 	if (run_public_attestation_fixture() != 0) return 1;
+	if (g_hookd_hook_calls != 0) {
+		fputs("metadata-only fixture unexpectedly reached the hookd writer\n", stderr);
+		return 1;
+	}
 	puts("rhi_rebind_metadata_host: PASS");
 	return 0;
 }

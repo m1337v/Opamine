@@ -4,6 +4,12 @@
 #include <libjailbreak/codesign.h>
 #include <libjailbreak/libjailbreak.h>
 
+
+#include <libroothider/libroothider.h>
+
+extern int roothide_unsupport_request();
+
+
 extern void systemwide_domain_set_enabled(bool enabled);
 
 static bool platform_domain_allowed(audit_token_t clientToken)

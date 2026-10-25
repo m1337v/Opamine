@@ -106,9 +106,14 @@ int physrw_handoff(pid_t pid)
 			ret = -6;
 			break;
 		}
-		// On iOS 26+ SPTM systems physBase can exceed the user L1 addressable range.
+		// In iOS 26+ on SPTM devices, physBase is higher than what can be mapped into userspace processes
+		// E.g. gPhysBase is 0x10002458000 but userspace level 1 pages only have 8 entries so only cover an address space from 0x0 to 0x8000000000
+		// In order to fix this, we need to mask out any part of the address that can't be reflected in the userspace process
+		// In the example this would be 0x10000000000
+		// We substract (gPaUaStartOffset) this both here and in physrw_phystouaddr to fix this problem
 		uint64_t paUaStartOffset = kconstant(physBase) & ~(arm_tt_level[1].indexMask | (arm_tt_level[1].indexMask - 1));
-		// Map the kernel physical address space into the handoff process.
+
+		// Map the entire kernel physical address space into the userland process, starting at PPLRW_USER_MAPPING_OFFSET
 		int mapInRet = pmap_map_in(pmap, kconstant(physBase) - paUaStartOffset + PPLRW_USER_MAPPING_OFFSET, kconstant(physBase), kconstant(physSize));
 		if (mapInRet != 0) ret = -10 + mapInRet;
 	} while (0);

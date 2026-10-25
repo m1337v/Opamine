@@ -12,6 +12,22 @@
 #import "NSString+Version.h"
 #import <pthread.h>
 
+static BOOL DOIsThreeComponentNumericVersion(NSString *version)
+{
+    NSArray<NSString *> *components = [version componentsSeparatedByString:@"."];
+    if (components.count != 3) {
+        return NO;
+    }
+
+    NSCharacterSet *nonDigits = NSCharacterSet.decimalDigitCharacterSet.invertedSet;
+    for (NSString *component in components) {
+        if (component.length == 0 || [component rangeOfCharacterFromSet:nonDigits].location != NSNotFound) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
 @implementation DOUIManager
 
 + (instancetype)sharedInstance
@@ -71,28 +87,45 @@
     static dispatch_once_t onceToken;
     static NSArray *releases;
     dispatch_once(&onceToken, ^{
-        NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/roothide/Dopamine2-roothide/releases"];
+        // Never offer an upstream Dopamine IPA as an in-app Opamine update.
+        // The fork currently uses a rolling rhinject tag, so an empty/non-
+        // semver feed must simply result in no advertised app update.
+        NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/m1337v/Opamine/releases"];
         NSData *data = [NSData dataWithContentsOfURL:url];
         if (data) {
             NSError *error;
-            releases = [NSJSONSerialization JSONObjectWithData:data options:kNilOptions error:&error];
-            if (error)
-            {
-                onceToken = 0;
+            id parsedReleases = [NSJSONSerialization JSONObjectWithData:data options:kNilOptions error:&error];
+            if (!error && [parsedReleases isKindOfClass:NSArray.class]) {
+                NSMutableArray *validReleases = [NSMutableArray array];
+                for (id candidate in (NSArray *)parsedReleases) {
+                    if ([candidate isKindOfClass:NSDictionary.class] &&
+                        [candidate[@"tag_name"] isKindOfClass:NSString.class]) {
+                        [validReleases addObject:candidate];
+                    }
+                }
+                releases = [validReleases copy];
+            }
+            else {
+                // GitHub can return an error dictionary (for example on rate
+                // limits). Do not let it reach release-array consumers.
                 releases = @[];
             }
         }
+        if (!releases) releases = @[];
     });
     return releases;
 }
 
 - (BOOL)environmentUpdateAvailable
 {
-    if (![[DOEnvironmentManager sharedManager] jailbrokenVersion])
+    DOEnvironmentManager *environmentManager = [DOEnvironmentManager sharedManager];
+    if (!environmentManager.isJailbroken)
         return NO;
 
-    NSString *jailbrokenBasebinMD5 = [[DOEnvironmentManager sharedManager] jailbrokenBasebinMD5];
-    NSString *launchedBasebinMD5 = [[DOEnvironmentManager sharedManager] launchedBasebinMD5];
+    // Basebin identity is authoritative: matching semantic versions can still
+    // contain different RootHide policy or build payloads.
+    NSString *jailbrokenBasebinMD5 = environmentManager.jailbrokenBasebinMD5;
+    NSString *launchedBasebinMD5 = environmentManager.launchedBasebinMD5;
     if (launchedBasebinMD5.length > 0) {
         if (jailbrokenBasebinMD5.length == 0) {
             return YES;
@@ -100,15 +133,32 @@
         return ![jailbrokenBasebinMD5 isEqualToString:launchedBasebinMD5];
     }
 
-    NSString *jailbrokenBuildID = [[DOEnvironmentManager sharedManager] jailbrokenBuildID];
-    NSString *launchedBuildID = [[DOEnvironmentManager sharedManager] launchedBuildID];
+    NSString *jailbrokenBuildID = environmentManager.jailbrokenBuildID;
+    NSString *launchedBuildID = environmentManager.launchedBuildID;
     if (launchedBuildID.length > 0) {
         if (jailbrokenBuildID.length == 0) {
             return YES;
         }
         return ![jailbrokenBuildID isEqualToString:launchedBuildID];
     }
-    return NO;
+
+    // Older artifacts without identity fields retain a numeric fallback. The
+    // RootHide metadata is only a revision (for example, 28+opamine1), so it
+    // must be joined to the installed three-component base version before
+    // comparing it to CFBundleShortVersionString.
+    NSString *jailbrokenBaseVersion = environmentManager.jailbrokenVersion;
+    NSString *jailbrokenRootHideRevision = [environmentManager.jailbrokenVersionRootHide stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSString *launchedVersion = [self getLaunchedReleaseTag];
+    if (!DOIsThreeComponentNumericVersion(jailbrokenBaseVersion) ||
+        jailbrokenRootHideRevision.length == 0 ||
+        launchedVersion.length == 0) {
+        // With neither a package identity nor comparable version metadata, do
+        // not silently claim that this app bundle matches the live bootstrap.
+        return YES;
+    }
+
+    NSString *jailbrokenVersion = [NSString stringWithFormat:@"%@-%@", jailbrokenBaseVersion, jailbrokenRootHideRevision];
+    return [launchedVersion numericalVersionRepresentation] > [jailbrokenVersion numericalVersionRepresentation];
 }
 
 - (bool)launchedReleaseNeedsManualUpdate
@@ -141,7 +191,7 @@
 
 - (NSString*)getLaunchedReleaseTag
 {
-    return [[[[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] componentsSeparatedByString:@"."] lastObject];
+    return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
 }
 
 - (NSArray*)availablePackageManagers

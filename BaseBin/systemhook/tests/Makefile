@@ -7,7 +7,7 @@ MAKEFLAGS += --no-print-directory
 test: host
 	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) characterize.py
 
-host: host-rebind host-path-policy host-environment-policy
+host: host-rebind host-path-policy host-environment-policy host-persona host-hookd-protection
 
 host-rebind:
 	@RHI_HOST_BIN="$$(mktemp -t rhi-rebind-metadata.XXXXXX)"; \
@@ -30,10 +30,16 @@ host-environment-policy:
 		hider_environment_policy_host.c ../src/hider_environment_policy.c -o "$$RHI_HOST_BIN"; \
 	"$$RHI_HOST_BIN"
 
+host-persona:
+	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) persona_spawn_contract.py
+
+host-hookd-protection:
+	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) hookd_protection_contract.py
+
 json:
 	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) characterize.py --json
 
 artifact:
 	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) characterize.py --artifact ../systemhook.dylib
 
-.PHONY: test host host-rebind host-path-policy host-environment-policy json artifact
+.PHONY: test host host-rebind host-path-policy host-environment-policy host-persona host-hookd-protection json artifact

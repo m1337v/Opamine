@@ -1,24 +1,34 @@
 #import <Foundation/Foundation.h>
 
-#include <spawn.h>
-#include <substrate.h>
-#include <sys/sysctl.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <dlfcn.h>
-#include <IOKit/IOKitLib.h>
+#include <spawn.h>
+#include <unistd.h>
+#include <libgen.h>
+#include <substrate.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+
+#include <libroothider/libroothider.h>
 #include <libjailbreak/libjailbreak.h>
-#include <libjailbreak/roothider.h>
+#include <libjailbreak/trustcache_fs.h>
+#include <libjailbreak/jbserver.h>
 
-#include "../systemhook/src/common.h"
-#include "../systemhook/src/envbuf.h"
+#include "../systemhook/src/common/common.h"
+#include "../systemhook/src/common/envbuf.h"
 
+int roothider_inline_version = 0;
+bool launchdhookFirstLoad = false;
 const char* HOOK_DYLIB_PATH = NULL;
+mach_port_t gJBServerAlternativePort = MACH_PORT_NULL;
+
+/* RootHide's persisted selected-tweak policy is intentionally resolved from
+ * launchd's authoritative spawn identity before the child starts. */
 static NSString * const kRootHideHiddenWhitelistTweaksRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.hiddenwhitelist.tweaks.plist";
 static NSString * const kRootHideInjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.plist";
 static NSInteger const kRootHideHiddenTweakAllowMode = 1;
 static NSInteger const kRootHideHiddenTweakDenyMode = 2;
 
-extern bool gInEarlyBoot;
 
 static void RootHideInjectionLaunchdLog(NSString *format, ...)
 {
@@ -441,6 +451,10 @@ static BOOL RootHideShouldEnableHiddenWhitelistBootstrap(const char *path, char 
 	return entry != nil && RootHideHiddenWhitelistEntryHasSelection(entry);
 }
 
+
+extern void roothider_launchd_postinit(bool);
+extern mach_port_t startAlternativeJBServer(void(^message_handler)(xpc_object_t));
+
 #define POSIX_SPAWN_PROC_TYPE_DRIVER 0x700
 extern int posix_spawnattr_getprocesstype_np(const posix_spawnattr_t *__restrict, int *__restrict) __API_AVAILABLE(macos(10.8), ios(6.0));
 extern int posix_spawnattr_setexceptionports_np(posix_spawnattr_t *__restrict, exception_mask_t, mach_port_t, exception_behavior_t, thread_state_flavor_t) __OSX_AVAILABLE_STARTING(__MAC_10_5, __IPHONE_2_0);
@@ -450,6 +464,9 @@ extern int systemwide_trust_file_by_path(const char *path);
 extern int platform_set_process_debugged(uint64_t pid, bool fullyDebugged);
 extern int __posix_spawn_hook(pid_t *restrict pid, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict]);
 extern int __posix_spawn_orig_wrapper(pid_t *restrict pid, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict]);
+
+extern int systemwide_process_checkin(audit_token_t *processToken, char **rootPathOut, char **bootUUIDOut, char **sandboxExtensionsOut, bool *fullyDebuggedOut, bool *forceCSAdhocOut);
+extern int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray);
 
 //from systemhook/roothide_common.c
 int __sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);
@@ -468,58 +485,26 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 }
 */
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-int (*orig_bind)(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-int new_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
-{
-    if (addr->sa_family == AF_INET && addrlen >= sizeof(struct sockaddr_in)) {
-        struct sockaddr_in addr_in = *(struct sockaddr_in*)addr;
-        in_port_t port = ntohs(addr_in.sin_port);
-        if (port == 0) {
-			int ret = -1;
-			for(port=IPPORT_HIFIRSTAUTO; port<=IPPORT_HILASTAUTO; port++)
-			{
-				addr_in.sin_port = htons(port);
-				ret = orig_bind(sockfd, (struct sockaddr*)&addr_in, addrlen);
-				if(ret==0 || errno!=EADDRINUSE) {
-					break;
-				}
-			}
-			return ret;
-        }
-    } else if (addr->sa_family == AF_INET6 && addrlen >= sizeof(struct sockaddr_in6)) {
-        struct sockaddr_in6 addr_in6 = *(struct sockaddr_in6*)addr;
-        in_port_t port = ntohs(addr_in6.sin6_port);
-        if (port == 0) {
-			int ret = -1;
-			for(port=IPPORT_HIFIRSTAUTO; port<=IPPORT_HILASTAUTO; port++)
-			{
-				addr_in6.sin6_port = htons(port);
-				ret = orig_bind(sockfd, (struct sockaddr*)&addr_in6, addrlen);
-				if(ret==0 || errno!=EADDRINUSE) {
-					break;
-				}
-			}
-			return ret;
-        }
-    }
-    return orig_bind(sockfd, addr, addrlen);
-}
-
-extern xpc_object_t (*orig_xpc_dictionary_create_reply)(xpc_object_t original);
-extern xpc_object_t new_xpc_dictionary_create_reply(xpc_object_t original);
-extern int (*orig_xpc_pipe_routine_reply)(xpc_object_t reply);
-extern int new_xpc_pipe_routine_reply(xpc_object_t reply);
-
 void roothide_launchd_preinit()
 {
-	JBLogDebug("roothide_launchd_preinit");
-
 #ifdef ENABLE_LOGS
+	redirectLogDir();
 	enableJBDLog(JBLogDebugFunction, JBLogErrorFunction);
 #endif
+
+	if (__builtin_available(iOS 19.0, *)) {
+		// Boomerang uses task_resume because other processes cannot signal PID 1.
+		// That releases the Mach suspension but leaves p_stat as SSTOP. A signal
+		// from launchd to itself is allowed and completes the BSD SIGCONT handling.
+		if (kill(getpid(), SIGCONT) != 0) {
+			launchd_panic("Failed to clear launchd stopped state (errno %d).", errno);
+			return;
+		}
+	}
+
+	JBLogDebug("roothide_launchd_preinit");
+
+	roothider_inline_version = [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion;
 
 	exec_set_patch(false);
 }
@@ -535,15 +520,6 @@ void roothide_launchd_postinit(bool firstLoad)
 	if(firstLoad)
 	{
 		HOOK_DYLIB_PATH = "";
-		
-		if (__builtin_available(iOS 16.0, *))
-		{
-			int hideDeveloperModeResult = hideDeveloperMode();
-			if (hideDeveloperModeResult != 0) {
-				launchd_panic("hideDeveloperMode failed: %d", hideDeveloperModeResult);
-				return;
-			}
-		}
 		
 #ifdef __arm64e__
 		if (!__builtin_available(iOS 16.0, *))
@@ -567,14 +543,8 @@ void roothide_launchd_postinit(bool firstLoad)
 		
 		assert(unsandbox("/usr/lib", systemhookFilePath.fileSystemRepresentation) == 0);
 
-		// New real path. Keep the existing first-load literal untouched: it may
-		// not be heap allocated, so only publish a fully allocated replacement.
-		char *hookDylibPath = NULL;
-		if (asprintf(&hookDylibPath, "/usr/lib/systemhook-%016llX.dylib", jbinfo(jbrand)) < 0 || !hookDylibPath) {
-			launchd_panic("failed to allocate systemhook path");
-			return;
-		}
-		HOOK_DYLIB_PATH = hookDylibPath;
+		//new "real path"
+		asprintf(&HOOK_DYLIB_PATH, "/usr/lib/systemhook-%016llX.dylib", jbinfo(jbrand));
 	}
 
 	if (__builtin_available(iOS 16.0, *))
@@ -583,7 +553,6 @@ void roothide_launchd_postinit(bool firstLoad)
 		void* __sysctlbyname_orig = NULL;
 		MSHookFunction(&__sysctl, (void *) __sysctl_hook, &__sysctl_orig);
 		MSHookFunction(&__sysctlbyname, (void *) __sysctlbyname_hook, &__sysctlbyname_orig);
-		MSHookFunction(&bind, (void*)new_bind, &orig_bind); //fix network issues on iOS16+
 	}
 #ifdef __arm64e__
 	else 
@@ -601,49 +570,20 @@ void roothide_launchd_postinit(bool firstLoad)
 			return;
 		}
 	}
+	
+	roothider_launchd_postinit(firstLoad);
 
-	loadAppStoredIdentifiers();
-
-	MSHookFunction(&xpc_dictionary_create_reply, (void*)new_xpc_dictionary_create_reply, &orig_xpc_dictionary_create_reply);
-	MSHookFunction(&xpc_pipe_routine_reply, (void*)new_xpc_pipe_routine_reply, &orig_xpc_pipe_routine_reply);
-
+	id jbserver_msg_handler = ^(xpc_object_t xmsg) {
+		jbserver_received_xpc_message(&gGlobalServer, xmsg);
+		// xpc_release(xdict);
+	};
+	
 	// load jailbreakd after applying hooks
-	assert(initJailbreakd(firstLoad) == 0);
+	assert(initJailbreakd(firstLoad, jbserver_msg_handler) == 0);
+	
+	gJBServerAlternativePort = startAlternativeJBServer(jbserver_msg_handler);
 }
 
-static void RootHideRefreshLaunchdIOSurfaceConnectForAppSpawn(void)
-{
-	MSImageRef iosurfaceImage = MSGetImageByName("/System/Library/Frameworks/IOSurface.framework/IOSurface");
-	if (!iosurfaceImage) {
-		return;
-	}
-
-	io_service_t *iosService = MSFindSymbol(iosurfaceImage, "__iosService");
-	io_connect_t *iosConnect = MSFindSymbol(iosurfaceImage, "__iosConnect");
-	if (!iosService || !iosConnect || *iosService == IO_OBJECT_NULL || *iosConnect == IO_OBJECT_NULL) {
-		return;
-	}
-
-	kern_return_t (*ioServiceOpen)(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t *connect) = NULL;
-	kern_return_t (*ioServiceClose)(io_connect_t connect) = NULL;
-	*(void **)&ioServiceOpen = dlsym(RTLD_DEFAULT, "IOServiceOpen");
-	*(void **)&ioServiceClose = dlsym(RTLD_DEFAULT, "IOServiceClose");
-	if (!ioServiceOpen || !ioServiceClose) {
-		return;
-	}
-
-	io_connect_t oldConnect = *iosConnect;
-	io_connect_t newConnect = IO_OBJECT_NULL;
-	kern_return_t kr = ioServiceOpen(*iosService, mach_task_self(), 0, &newConnect);
-	if (kr != KERN_SUCCESS || newConnect == IO_OBJECT_NULL) {
-		return;
-	}
-
-	*iosConnect = newConnect;
-	ioServiceClose(oldConnect);
-}
-
-int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray);
 int roothide_launchd_trust_executable(const char* path)
 {
 	return dyld_patch_enabled() ? systemwide_trust_file_by_path(path) : roothide_trust_executable_recurse(path, "/", NULL);
@@ -669,77 +609,145 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 
 	// on some devices dyldhook may fail due to vm_protect(VM_PROT_READ|VM_PROT_WRITE), 2, (os/kern) protection failure in dsc::__DATA_CONST:__const, 
 	// so we need to disable dyld-in-cache here. (or we can use VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)
-	const bool needsDyldInCacheMutation = envbuf_getenv((const char **)envp, "DYLD_INSERT_LIBRARIES") != NULL;
-	bool needsSpinlockFixMutation = false;
-#ifdef __arm64e__
-	if (!__builtin_available(iOS 16.0, *)) {
-		needsSpinlockFixMutation = !dyld_patch_enabled() && process_force_dyld_patch(path, (const char **)argv);
-	}
-#endif
 	char **envc = envbuf_mutcopy((const char **)envp);
-	bool ownsEnvc = envc != NULL;
-	if (!envc) {
-		if (needsDyldInCacheMutation || needsSpinlockFixMutation) {
-			posix_spawnattr_setflags(attrp, flags);
-			return ENOMEM;
-		}
-		envc = (char **)envp;
-	}
-	if (needsDyldInCacheMutation && !envbuf_setenv(&envc, "DYLD_IN_CACHE", "0")) {
-		if (ownsEnvc) envbuf_free(envc);
-		posix_spawnattr_setflags(attrp, flags);
-		return ENOMEM;
+	if(envbuf_getenv(envc, "DYLD_INSERT_LIBRARIES")) {
+		envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
+		envbuf_setenv(&envc, "DYLD_SHARED_REGION", "use");
 	}
 
 #ifdef __arm64e__
-	if (needsSpinlockFixMutation) {
-		if (!envbuf_setenv(&envc, "SPINLOCK_FIX_DISABLED", "1")) {
-			if (ownsEnvc) envbuf_free(envc);
-			posix_spawnattr_setflags(attrp, flags);
-			return ENOMEM;
+	if (!__builtin_available(iOS 16.0, *))
+	{
+		if(!dyld_patch_enabled() && process_force_dyld_patch(path, argv)) {
+			envbuf_setenv(&envc, "SPINLOCK_FIX_DISABLED", "1");
 		}
 	}
 #endif
 
 	pid_t pidval = 0;
 	if (!pidp) pidp = &pidval;
-	// Diagnostic: log ROOTHIDE_* env vars right before the actual syscall
-	if (strstr(path, ".app/")) {
-		const char *hi_val = envbuf_getenv((const char **)envc, "ROOTHIDE_HIDDEN_INJECTION");
-		const char *ht_val = envbuf_getenv((const char **)envc, "ROOTHIDE_ENABLE_HIDDEN_TWEAKS");
-		const char *dil_val = envbuf_getenv((const char **)envc, "DYLD_INSERT_LIBRARIES");
-		RootHideInjectionLaunchdLog(@"posthook PRE-SYSCALL path=%s HI=%s HT=%s DYLD=%s", path, hi_val ?: "(null)", ht_val ?: "(null)", dil_val ?: "(null)");
-	}
 	int ret = __posix_spawn_orig_wrapper(pidp, path, desc, argv, envc);
 	pid_t pid = *pidp;
 
-	if (ownsEnvc) envbuf_free(envc);
+	envbuf_free(envc);
 	
 	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
 
 	if (ret == 0 && pid > 0) {
 		if(should_suspend) {
-			int patchResult = jbdSpawnPatchChild(pid, should_resume);
-			if (strstr(path, ".app/")) {
-				RootHideInjectionLaunchdLog(@"posthook PATCH pid=%d path=%s patchResult=%d should_resume=%d proctype=0x%x", pid, path, patchResult, should_resume, proctype);
-			}
-			if(patchResult != 0) {
+			if(jbdSpawnPatchChild(pid, should_resume) != 0) {
 				JBLogError("Failed to patch spawned process (%d) %s", pid, path);
 				//just kill it instead of letting it hang forever so that launchd can respawn it later
 				kill(pid, SIGQUIT); //core dump
 				kill(pid, SIGKILL);
 				ret = 202;
 			}
-		} else {
-			if (strstr(path, ".app/")) {
-				RootHideInjectionLaunchdLog(@"posthook SKIP-PATCH pid=%d path=%s should_suspend=%d proctype=0x%x", pid, path, should_suspend, proctype);
-			}
 		}
 	} else {
 		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
-		if (strstr(path, ".app/")) {
-			RootHideInjectionLaunchdLog(@"posthook SPAWN-FAILED ret=%d path=%s pid=%d", ret, path, pid);
+	}
+
+	return ret;
+}
+
+void trust_tslite_app_bundle(const char* executable)
+{
+	//this comes from spawn_prehook so the main executable has not been trusted when spawn a ts app first time
+
+	int fd = open(executable, O_RDONLY);
+	if(fd < 0) {
+		JBLogError("Failed to open tslite app bundle: err=%d,path=%s", errno, executable);
+		return;
+	}
+
+	struct fgetsigsinfo siginfo = {0, GETSIGSINFO_PLATFORM_BINARY, 0};
+	int sigret = fcntl(fd, F_GETSIGSINFO, &siginfo);
+	int sigerr = errno;
+	close(fd);
+
+	if(sigret != 0 && sigerr != ENOENT) {
+		JBLogError("Failed to get signature for tslite app: err=%d,path=%s", sigerr, executable);
+		return;
+	}
+
+	if (siginfo.fg_sig_is_platform != 0) {
+		JBLogDebug("tslite app has already been trusted: %s", executable);
+		return;
+	}
+
+	NSString* bundlePath = getAppBundlePathFromSpawnPath(executable);
+	if (!bundlePath) {
+		JBLogError("Failed to find tslite app bundle for %s", executable ? executable : "(null)");
+		return;
+	}
+
+	if(jb_trustcache_add_directory(bundlePath.fileSystemRepresentation, true) != 0) {
+		JBLogError("Failed to add tslite app bundle to trust cache: %s", bundlePath.fileSystemRepresentation);
+	}
+}
+
+int __blacklisted_posix_spawn_orig_wrapper(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict])
+{
+	if(!path || !hasTrollstoreLiteMarker(path))
+	{
+		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
+	}
+
+	trust_tslite_app_bundle(path);
+
+	//spawn_prehook ensure this is always available
+	posix_spawnattr_t attrp = &desc->attrp;
+
+	short flags = 0;
+	posix_spawnattr_getflags(attrp, &flags);
+
+	int proctype = 0;
+	posix_spawnattr_getprocesstype_np(attrp, &proctype);
+
+	bool should_suspend = (proctype != POSIX_SPAWN_PROC_TYPE_DRIVER);
+	bool should_resume = should_suspend && (flags & POSIX_SPAWN_START_SUSPENDED)==0;
+
+	if (should_suspend) {
+		posix_spawnattr_setflags(attrp, flags | POSIX_SPAWN_START_SUSPENDED);
+	}
+
+	pid_t pidval = 0;
+	if (!pidp) pidp = &pidval;
+	int ret = __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
+	pid_t pid = *pidp;
+
+	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
+
+	if (ret == 0 && pid > 0)
+	{
+		audit_token_t token = {0};
+		mach_port_t task = MACH_PORT_NULL;
+		kern_return_t kr = task_name_for_pid(mach_task_self(), pid, &task);
+		if (kr == KERN_SUCCESS)
+		{
+			mach_msg_type_number_t count = TASK_AUDIT_TOKEN_COUNT;
+			kr = task_info(task, TASK_AUDIT_TOKEN, (task_info_t)&token, &count);
+			mach_port_deallocate(mach_task_self(), task);
+
+			if (kr == KERN_SUCCESS)
+			{
+				char *rootPathOut = NULL;
+				char *bootUUIDOut = NULL;
+				bool forceCSAdhocOut = false;
+				bool fullyDebuggedOut = false;
+				systemwide_process_checkin(&token, &rootPathOut, &bootUUIDOut, NULL, &fullyDebuggedOut, &forceCSAdhocOut);
+				free(rootPathOut);
+				free(bootUUIDOut);
+			}
 		}
+		if (kr != KERN_SUCCESS) {
+			JBLogError("Failed to get audit token for pid %d: %d", pid, kr);
+		}
+	}
+
+	if (ret == 0 && pid > 0) {
+		if(should_resume)
+			kill(pid, SIGCONT);
 	}
 
 	return ret;
@@ -759,7 +767,7 @@ int roothide_launchd___posix_spawn__spinlock_fix_only(pid_t *restrict pidp, cons
 
 	pid_t pidval = 0;
 	if (!pidp) pidp = &pidval;
-	int ret = __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
+	int ret = __blacklisted_posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
 	pid_t pid = *pidp;
 	
 	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
@@ -795,9 +803,10 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	}
 
 	if(isRemovableBundlePath(path)) {
-		static dispatch_once_t onceToken = 0;
+		static dispatch_once_t onceToken = {0};
 		dispatch_once(&onceToken, ^{
-			RootHideRefreshLaunchdIOSurfaceConnectForAppSpawn();
+			extern void fix__iosConnect();
+			fix__iosConnect();
 		});
 	}
 
@@ -839,7 +848,7 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	if (!__builtin_available(iOS 16.0, *))
 	{
 		iOS15Arm64e = true;
-		if(envbuf_getenv((const char * const *)envp, "_SafeMode") || envbuf_getenv((const char * const *)envp, "_MSSafeMode")) {
+		if(envbuf_getenv(envp, "_SafeMode") || envbuf_getenv(envp, "_MSSafeMode")) {
 			if(path && isRemovableBundlePath(path) && !hasTrollstoreMarker(path)) {
 				choicyBlocked = true;
 			}
@@ -980,14 +989,8 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 	if(launchdhookFirstLoad) 
 	{
 		//we should not enable system-wide injection until the jailbreak is finalized (userspace reboot).
-		if (RootHideShouldTraceSpawnPath(path)) {
-			RootHideInjectionLaunchdLog(@"taking first-load passthrough path=%s bundle=%@", path ?: "(null)", hiddenWhitelistBundleIdentifier ?: @"(null)");
-		}
 		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
 	}
-
-	if (RootHideShouldTraceSpawnPath(path)) {
-		RootHideInjectionLaunchdLog(@"taking normal inject branch path=%s bundle=%@", path ?: "(null)", hiddenWhitelistBundleIdentifier ?: @"(null)");
-	}
+	
 	return __posix_spawn_hook(pidp, path, desc, argv, envp);
 }

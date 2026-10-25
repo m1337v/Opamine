@@ -1,12 +1,13 @@
 #ifndef LJB_UTIL_H
 #define LJB_UTIL_H
 
+#include <libroothider/libroothider.h>
+
 #include "info.h"
 #include "jbclient_xpc.h"
 #include "jbroot.h"
 #include <spawn.h>
-
-#include "roothider.h"
+#include <libunwind.h>
 
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
 extern int posix_spawnattr_set_persona_np(const posix_spawnattr_t* __restrict, uid_t, uint32_t);
@@ -77,15 +78,12 @@ int exec_cmd_env(char **envp, const char *binary, ...);
 
 int jbctl_earlyboot(mach_port_t earlyBootServer, ...);
 
+void walk_backtrace(bool (^block)(int frame_index, unw_word_t pc, unw_word_t offset, const char *symbol_name));
+
 #define exec_cmd_trusted(x, args ...) ({ \
+    jbclient_trust_file_by_path(x); \
     int retval; \
-    if (jbclient_trust_file_by_path(x) == 0) { \
-		retval = exec_cmd(x, args); \
-	} else { \
-		fprintf(stderr, "exec_cmd_trusted: Failed to trust binary %s\\n", x); \
-		JBLogError("exec_cmd_trusted: Failed to trust binary %s", x); \
-		retval = -1; \
-	} \
+    retval = exec_cmd(x, args); \
     retval; \
 })
 

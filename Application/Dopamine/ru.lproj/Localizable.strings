@@ -53,7 +53,7 @@
 
 // Settings Hints
 "Hint_Hide_Jailbreak" = "\"Скрыть джейлбрейк\" временно удаляет файлы, связанные с джейлбрейком, до следующего джейлбрейка";
-"Hint_Hide_Jailbreak_Jailbroken" = "\"Скрыть джейлбрейк\" частично отключает джейлбрейк и стремится сделать обнаружение более сложным. Однако это не совсем эффективно и скрывает не всё.";
+/*Hint_Hide_Jailbreak_Jailbroken*/
 "Section_Jailbreak_Settings" = "Настройки джейлбрейка";
 "Section_Actions" = "Действия";
 "Section_Customization" = "Кастомизация";
@@ -84,9 +84,17 @@
 "Theme" = "Темы";
 "Kernel Exploit" = "Эксплоит Ядра";
 "PPL Bypass" = "Обход PPL";
+"SPTM Bypass" = "Обход SPTM";
 "PAC Bypass" = "Обход PAC";
 /*None*/
 /*Recommended*/
+
+// DarkSword Workaround
+/*Respring_Required*/
+/*Respring_Required_Message*/
+/*Respring_Required_Notice_A8*/
+/*Apply_Workaround*/
+/*Respring_Cancel*/
 
 // Credits
 "Credits_Button_Discord" = "Discord";
@@ -98,6 +106,7 @@
 "Initializing Protection" = "Инициализация защиты";
 "Loading BaseBin TrustCache" = "Получение кэша доверия BaseBin";
 "Applying Bind Mount" = "Применение монтирования с привязкой";
+/*Rebuilding Icon Cache*/
 "Removing Jailbreak" = "Удаление джейлбрейка";
 "Elevating Privileges" = "Повышение прав";
 "Cleaning Up Exploits" = "Очистка эксплоитов";
@@ -107,6 +116,7 @@
 "Exploiting Kernel (%@)" = "Эксплуатация ядра (%@)";
 "Bypassing PAC (%@)" = "Обход PAC (%@)";
 "Bypassing PPL (%@)" = "Обход PPL (%@)";
+"Bypassing SPTM (%@)" = "Обход SPTM (%@)";
 
 // Package Manager selection
 "Status_Title_Select_Package_Managers" = "Выберите менеджер(ы) пакетов";

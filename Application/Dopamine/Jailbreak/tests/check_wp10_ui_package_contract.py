@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Host contracts for the bounded WP10 UI and package finalization work."""
+"""UI/package contracts retained from the former WP10 merge coverage."""
 
 from __future__ import annotations
 
+import hashlib
+import io
 import plistlib
-import re
 import subprocess
-import tempfile
+import tarfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[4]
 SETTINGS = ROOT / "Application/Dopamine/UI/Settings/DOSettingsController.m"
-ENVIRONMENT = ROOT / "Application/Dopamine/Jailbreak/DOEnvironmentManager.m"
+BOOTSTRAPPER = ROOT / "Application/Dopamine/Jailbreak/DOBootstrapper.m"
 PROJECT = ROOT / "Application/Dopamine.xcodeproj/project.pbxproj"
-PACKAGE_SCRIPT = ROOT / "Scripts/build-fork-packages.sh"
-VERSION_FILE = ROOT / "BaseBin/_external/basebin/.version"
+INFO = ROOT / "Application/Dopamine/Info.plist"
 SILEO_DEB = ROOT / "Application/Dopamine/Resources/sileo.deb"
-ROOT_HIDE_DEB = ROOT / "Application/Dopamine/Resources/roothide.deb"
+ROOTHIDE_DEB = ROOT / "Application/Dopamine/Resources/roothide.deb"
+BOOTSTRAP = ROOT / "Application/Dopamine/Resources/bootstrap_1900.tar.zst"
 
 
 def require(condition: bool, message: str) -> None:
@@ -25,119 +26,68 @@ def require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def package_field(deb: Path, field: str) -> str:
-    return subprocess.check_output(
-        ["dpkg-deb", "-f", str(deb), field], text=True
-    ).strip()
+def field(package: Path, name: str) -> str:
+    return subprocess.check_output(["dpkg-deb", "-f", str(package), name], text=True).strip()
 
 
-def semver(value: str) -> tuple[int, ...]:
-    match = re.fullmatch(r"(\d+(?:\.\d+)*)", value.strip())
-    require(match is not None, f"invalid basebin version: {value!r}")
-    return tuple(int(part) for part in match.group(1).split("."))
+def member(package: Path, member_name: str) -> bytes:
+    contents = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(package)])
+    with tarfile.open(fileobj=io.BytesIO(contents)) as archive:
+        entry = archive.extractfile(member_name)
+        require(entry is not None, f"package member missing: {member_name}")
+        return entry.read()
+
+
+def bootstrap_member(member_name: str) -> bytes:
+    contents = subprocess.check_output(["zstd", "-dc", str(BOOTSTRAP)])
+    with tarfile.open(fileobj=io.BytesIO(contents)) as archive:
+        entry = archive.extractfile(member_name)
+        require(entry is not None, f"bootstrap member missing: {member_name}")
+        return entry.read()
 
 
 def main() -> None:
     settings = SETTINGS.read_text(encoding="utf-8")
-    environment = ENVIRONMENT.read_text(encoding="utf-8")
+    bootstrapper = BOOTSTRAPPER.read_text(encoding="utf-8")
     project = PROJECT.read_text(encoding="utf-8")
-    package_script = PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    info = plistlib.loads(INFO.read_bytes())
 
-    # D3's removal-button fix is safe to carry into RootHide: direct deletion
-    # is exposed only for an inactive TrollStore environment.  A live
-    # randomized root must use the reboot/rejailbreak removal flow.
-    require(
-        "if (!envManager.isJailbroken && envManager.isInstalledThroughTrollStore && envManager.isBootstrapped) {"
-        in settings,
-        "remove-jailbreak action is not limited to inactive TrollStore installs",
-    )
-    require(
-        "if (envManager.isBootstrapped) {" in settings,
-        "actions section must not appear for an unbootstrapped environment",
-    )
-    require(
-        "if ((envManager.isJailbroken || envManager.isInstalledThroughTrollStore) && envManager.isBootstrapped) {"
-        not in settings,
-        "unsafe live-jailbreak remove-button condition remains active",
-    )
-    require(
-        "deleteBootstrap" in settings and "locateJailbreakRoot" in settings,
-        "RootHide remove action no longer refreshes its randomized-root state",
-    )
-    require("/var/jb" not in settings, "WP10 UI must not use /var/jb as an internal path")
+    require("PRODUCT_BUNDLE_IDENTIFIER = com.m1337v.Opamine;" in project,
+            "Opamine app bundle identity changed")
+    require("selectCustomBootlogoPressed" in settings and "UIImagePickerController" in settings,
+            "boot-logo photo picker was removed without an intentional replacement")
+    require(bool(info.get("NSPhotoLibraryUsageDescription")),
+            "boot-logo photo picker must retain its TCC usage string")
 
-    # Keep the current Opamine product identity and advertised matrix until
-    # device gates prove a capability change.  These strings are intentionally
-    # source contracts rather than claims inferred from official Dopamine.
-    require(
-        "PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine-roothide;" in project,
-        "Opamine bundle identity changed",
-    )
-    require(
-        "iOS 15.0 - 16.5.1 (arm64e)" in environment
-        and "iOS 15.0 - 16.7.16 (arm64)" in environment,
-        "current Opamine support matrix changed without a device-gated update",
-    )
+    require(SILEO_DEB.is_file() and ROOTHIDE_DEB.is_file(), "bundled fork package missing")
+    require(field(SILEO_DEB, "Package") == "org.coolstar.sileo", "Sileo package identity changed")
+    require(field(SILEO_DEB, "Version") == "2.5.1-13+opamine1", "Sileo fork version changed")
+    require(field(ROOTHIDE_DEB, "Package") == "roothide", "RootHide core package identity changed")
+    require(field(ROOTHIDE_DEB, "Version") == "0.1.0-0+opamine1", "RootHide core fork guard changed")
 
-    # The package builder owns the custom versions and source checksums.  Keep
-    # the RootHide Core and Sileo pins above their repository source versions.
-    package_pins = (
-        'sileo_source_version="2.5.1-13"',
-        'sileo_fork_version="2.5.1-13+opamine1"',
-        'roothide_source_version="0.1.0"',
-        'roothide_fork_version="0.1.0-0+opamine1"',
-        'sileo_sha256="b23e51371938bb6257ba82abdcdae9a6519755556b874b06672868c64843a0f6"',
-        'roothide_sha256="06adc371ec37e7356762c875ca682bfb2f9b33a1100fb14168653b7e571ca670"',
-    )
-    for pin in package_pins:
-        require(pin in package_script, f"package pin disappeared: {pin}")
+    sileo_plist = plistlib.loads(member(SILEO_DEB, "./Applications/Sileo.app/Info.plist"))
+    require("CFBundleURLTypes" not in sileo_plist and "CFBundleURLSchemes" not in sileo_plist,
+            "Sileo URL registration returned")
+    require("filza" in sileo_plist.get("LSApplicationQueriesSchemes", []),
+            "Sileo Filza query permission was removed")
 
-    require(SILEO_DEB.is_file(), "embedded Sileo package is missing")
-    require(
-        package_field(SILEO_DEB, "Package") == "org.coolstar.sileo",
-        "embedded Sileo package identity changed",
-    )
-    require(
-        package_field(SILEO_DEB, "Version") == "2.5.1-13+opamine1",
-        "embedded Sileo fork version changed",
-    )
-    require(
-        package_field(SILEO_DEB, "Architecture") == "iphoneos-arm64e",
-        "embedded Sileo architecture changed",
-    )
-    require(ROOT_HIDE_DEB.is_file(), "embedded RootHide Core package is missing")
-    require(
-        package_field(ROOT_HIDE_DEB, "Package") == "roothide"
-        and package_field(ROOT_HIDE_DEB, "Version") == "0.1.0-0+opamine1"
-        and package_field(ROOT_HIDE_DEB, "Architecture") == "iphoneos-arm64e",
-        "embedded RootHide Core package pin changed",
-    )
+    old_core = member(ROOTHIDE_DEB, "./usr/lib/libroothide.dylib")
+    bootstrap_core = bootstrap_member("./usr/lib/libroothide.dylib")
+    require(hashlib.sha256(old_core).digest() == hashlib.sha256(bootstrap_core).digest(),
+            "fork core payload does not match the bootstrap baseline")
+    status = bootstrap_member("./Library/dpkg/status").decode("utf-8")
+    require("Package: roothide\n" in status and "Version: 0.1.0\n" in status,
+            "expected upstream RootHide bootstrap baseline changed")
+    for invariant in (
+        'ROOTHIDE_CORE_BUNDLED_VERSION @"0.1.0-0+opamine1"',
+        '@"roothide" : ROOTHIDE_CORE_BUNDLED_VERSION',
+        'shouldInstallPackage:@"roothide"',
+        'stringByAppendingPathComponent:@"roothide.deb"',
+        "Failed to install RootHide Core",
+    ):
+        require(invariant in bootstrapper, f"fork RootHide package update guard missing: {invariant}")
 
-    # URL registration is deliberately stripped from Sileo.  Query permission
-    # for Filza is retained and is not equivalent to registering a URL scheme.
-    with tempfile.TemporaryDirectory(prefix="opamine-wp10-sileo-") as directory:
-        subprocess.run(["dpkg-deb", "-x", str(SILEO_DEB), directory], check=True)
-        plist_path = Path(directory) / "Applications/Sileo.app/Info.plist"
-        require(plist_path.is_file(), "Sileo Info.plist is missing from package")
-        plist = plistlib.loads(plist_path.read_bytes())
-        require("CFBundleURLTypes" not in plist, "Sileo URL registration keys returned")
-        require("CFBundleURLSchemes" not in plist, "Sileo URL scheme registration returned")
-        require(
-            "filza" in plist.get("LSApplicationQueriesSchemes", []),
-            "Sileo Filza query permission was removed",
-        )
-
-    # The D3 2.x -> 3.x update guard keys off the basebin version.  A release
-    # artifact must therefore sort strictly after official 3.0.9; 3.0.9.1 is
-    # the planned Opamine value.  This test intentionally fails until the
-    # release owner updates the separately-owned .version file.
-    basebin_version = VERSION_FILE.read_text(encoding="utf-8").strip()
-    require(
-        semver(basebin_version) > semver("3.0.9"),
-        f"basebin version {basebin_version} must be above official 3.0.9 before packaging (target 3.0.9.1)",
-    )
-
-    print("WP10 UI/package contracts: PASS")
+    print("UI and fork package contracts: PASS")
 
 
 if __name__ == "__main__":

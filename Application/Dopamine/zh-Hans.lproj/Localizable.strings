@@ -54,7 +54,7 @@
 
 // Settings Hints
 "Hint_Hide_Jailbreak" = "“隐藏越狱” 将在下次越狱前移除部分可能导致越狱检测的文件。";
-"Hint_Hide_Jailbreak_Jailbroken" = "“隐藏越狱” 将禁用部分越狱功能以提升检测越狱的难度，不过这并不能完全防止应用检测到越狱。";
+/*Hint_Hide_Jailbreak_Jailbroken*/
 "Section_Jailbreak_Settings" = "越狱设置";
 "Section_Actions" = "操作";
 "Section_Customization" = "自定义";
@@ -86,9 +86,17 @@
 "Theme" = "主题";
 "Kernel Exploit" = "内核漏洞";
 "PPL Bypass" = "PPL 绕过";
+"SPTM Bypass" = "SPTM 绕过";
 "PAC Bypass" = "PAC 绕过";
 "None" = "无";
 "Recommended" = "推荐";
+
+// DarkSword Workaround
+/*Respring_Required*/
+/*Respring_Required_Message*/
+/*Respring_Required_Notice_A8*/
+/*Apply_Workaround*/
+/*Respring_Cancel*/
 
 // Credits
 "Credits_Button_Discord" = "Discord";
@@ -100,6 +108,7 @@
 "Initializing Protection" = "初始化保护";
 "Loading BaseBin TrustCache" = "将基础套件加载至信任缓存（TrustCache）";
 "Applying Bind Mount" = "应用绑定挂载";
+/*Rebuilding Icon Cache*/
 "Removing Jailbreak" = "移除越狱";
 "Elevating Privileges" = "提升权限";
 "Cleaning Up Exploits" = "清理环境";
@@ -109,11 +118,9 @@
 "Exploiting Kernel (%@)" = "正在利用内核 (%@)";
 "Bypassing PAC (%@)" = "正在绕过 PAC (%@)";
 "Bypassing PPL (%@)" = "正在绕过 PPL (%@)";
+"Bypassing SPTM (%@)" = "正在绕过 SPTM (%@)";
 
 // Package Manager selection
 "Status_Title_Select_Package_Managers" = "请选择包管理器";
 "Select_Package_Managers_Install_Message" = "如果你不确定选择哪一个比较好，请选择 Sileo";
 "Continue" = "继续";
-
-"Enable dyld patch" = "启用 dyld 补丁";
-"When spinlock fix is ​​enabled, app extensions of blacklisted apps will be disabled and may also cause spinlock panics when the blacklisted app is in foreground/background.\n\nYou can first try disabling tweak injection for the app in Choicy (spinlock fix still works), and only blacklist the app if that doesn't work." = "启用 spinlock 修复后，黑名单应用的应用扩展将被禁用，并且当黑名单应用处于 前台/后台 时，还可能导致 spinlock 崩溃。\n\n你可以先尝试在 Choicy 中为该应用禁用 tweak 注入（spinlock 修复仍然有效），如果无效，再将该应用加入黑名单。";

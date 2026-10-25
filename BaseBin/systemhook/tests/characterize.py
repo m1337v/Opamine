@@ -31,7 +31,9 @@ HIDER_IDENTITY_HEADER = ROOT / "BaseBin/systemhook/src/hider_identity.h"
 HIDER_CALLER_POLICY = ROOT / "BaseBin/systemhook/src/hider_caller_policy.c"
 HIDER_CALLER_POLICY_HEADER = ROOT / "BaseBin/systemhook/src/hider_caller_policy.h"
 HIDER_INTERNAL = ROOT / "BaseBin/systemhook/src/hider_internal.h"
-COMMON = ROOT / "BaseBin/systemhook/src/common.c"
+COMMON = ROOT / "BaseBin/systemhook/src/common/common.c"
+COMMON_FORWARDER = ROOT / "BaseBin/systemhook/src/common.h"
+COMMON_HEADER = ROOT / "BaseBin/systemhook/src/common/common.h"
 MAIN = ROOT / "BaseBin/systemhook/src/main.c"
 ROOTHIDER_COMMON = ROOT / "BaseBin/systemhook/src/roothider_common.c"
 ROOTHIDER_MAIN = ROOT / "BaseBin/systemhook/src/roothider_main.c"
@@ -1025,6 +1027,8 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     caller_policy_header = production_text(HIDER_CALLER_POLICY_HEADER)
     hider_internal = production_text(HIDER_INTERNAL)
     common = production_text(COMMON)
+    common_forwarder = production_text(COMMON_FORWARDER)
+    common_header = production_text(COMMON_HEADER)
     main = production_text(MAIN)
     roothider_common = production_text(ROOTHIDER_COMMON)
     roothider_main = production_text(ROOTHIDER_MAIN)
@@ -1653,8 +1657,24 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         ):
             require(suffix in source, f"bounded loader diagnostics missing {suffix}")
 
-        require(source.count("roothidehooks_load_or_abort();") == 2,
-                "both roothidehooks direct load sites must use the shared helper")
+        require(source.count("roothidehooks_load_or_abort();") == 3,
+                "all three roothidehooks load sites must use the shared helper")
+        runningboard_signature = 'if(strcmp(executable, "/usr/libexec/runningboardd")==0)'
+        runningboard_start = source.index(runningboard_signature)
+        runningboard_brace = source.index("{", runningboard_start)
+        runningboard_depth = 0
+        runningboard_end = -1
+        for index in range(runningboard_brace, len(source)):
+            if source[index] == "{":
+                runningboard_depth += 1
+            elif source[index] == "}":
+                runningboard_depth -= 1
+                if runningboard_depth == 0:
+                    runningboard_end = index + 1
+                    break
+        require(runningboard_end > runningboard_start and
+                "roothidehooks_load_or_abort();" in source[runningboard_start:runningboard_end],
+                "runningboardd must load roothidehooks through the shared diagnostic helper")
         require("dlopen(JBROOT_PATH(\"/basebin/roothidehooks.dylib\")" not in source,
                 "direct roothidehooks dlopen calls must not bypass diagnostics")
 
@@ -1716,6 +1736,67 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
         require("rhi_rebind_transaction_all_hooks_prepared" in hider_hook_session and "rhi_rebind_transaction_all_hooks_active" in hider_hook_session, "required session must demand every hook at prepare and ready time")
 
     check("result_aware_rebind_production_contract", check_result_aware_rebind_contract)
+
+    def check_hookd_rebind_route_contract() -> None:
+        signature = "static rhi_rebind_result_t rhi_write_slot(const rhi_rebind_slot_t *slot)"
+        start = rhi_rebind.index(signature)
+        brace = rhi_rebind.index("{", start)
+        depth = 0
+        end = -1
+        for index in range(brace, len(rhi_rebind)):
+            if rhi_rebind[index] == "{":
+                depth += 1
+            elif rhi_rebind[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        require(end > start, "rhi_write_slot must have a complete body")
+        writer = rhi_rebind[start:end]
+        route_start = writer.index("if (__builtin_available(iOS 19.0, *))")
+        route_brace = writer.index("{", route_start)
+        route_depth = 0
+        route_end = -1
+        for index in range(route_brace, len(writer)):
+            if writer[index] == "{":
+                route_depth += 1
+            elif writer[index] == "}":
+                route_depth -= 1
+                if route_depth == 0:
+                    route_end = index + 1
+                    break
+        require(route_end > route_start, "iOS 19+ hookd route must have a complete body")
+        hookd_route = writer[route_start:route_end]
+        legacy_route = writer[route_end:]
+
+        require("hookd_hook(" in hookd_route, "iOS 19+ slot writes must use the hookd provider")
+        require("result == KERN_SUCCESS && observed == replacement && protection_verified" in hookd_route,
+                "hookd writes must be reported complete only after provider success, exact readback, and protection restoration")
+        require("return observed == slot->original_raw ? RHI_REBIND_NONE : RHI_REBIND_UNKNOWN;" in hookd_route,
+                "hookd provider failure or unverifiable readback must terminate without retry")
+        require("__atomic_store_n" not in hookd_route and "mach_vm_protect" not in hookd_route,
+                "iOS 19+ provider failure must not fall through to direct store or direct protection changes")
+        hookd_code = re.sub(r"/\*.*?\*/|//[^\n]*", "", hookd_route, flags=re.S)
+        direct_pointer_store = re.search(
+            r"\*\s*(?:\([^)]*\)\s*)?[A-Za-z_]\w*(?:(?:->|\.)[A-Za-z_]\w*|\[[^\]]+\])*\s*=",
+            hookd_code,
+        )
+        require("memcpy(" not in hookd_route and direct_pointer_store is None,
+                "iOS 19+ provider failure must not fall back to memcpy or a direct pointer assignment")
+        require("mach_vm_protect" in legacy_route and "__atomic_store_n" in legacy_route,
+                "pre-iOS 19 fallback must retain the protected direct-store implementation")
+
+    check("ios19_hookd_slot_write_contract", check_hookd_rebind_route_contract)
+
+    def check_common_source_layout_contract() -> None:
+        require('#include "common/common.h"' in common_forwarder,
+                "legacy common.h path must forward to common/common.h")
+        require("root_hide_injection_mode_is_hidden_whitelist" in common_header and
+                "root_hide_injection_mode_is_blacklist_allowlist" in common_header and
+                "root_hide_injection_mode_uses_whitelist_rules" in common_header,
+                "forwarded common API declarations must remain available")
+
+    check("common_source_forwarding_layout", check_common_source_layout_contract)
 
     def check_dlsym_fixture() -> None:
         dlsym = DlsymDouble()
@@ -2487,7 +2568,7 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
     def check_owner_symbols() -> None:
         matrix = json.loads(OWNERSHIP.read_text(encoding="utf-8"))
         texts = {
-            "BaseBin/systemhook/src/common.c": common,
+            "BaseBin/systemhook/src/common/common.c": common,
             "BaseBin/systemhook/src/hider_identity.c": identity,
             "BaseBin/systemhook/src/hider_caller_policy.c": caller_policy,
             "BaseBin/systemhook/src/main.c": main,

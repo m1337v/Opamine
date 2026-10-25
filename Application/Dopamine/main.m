@@ -7,6 +7,7 @@
 
 #import <UIKit/UIKit.h>
 #import "DOAppDelegate.h"
+#import <libroothider/log.h>
 
 #import "DOEnvironmentManager.h"
 #import <libjailbreak/info.h>
@@ -36,9 +37,14 @@ int main(int argc, char * argv[]) {
         }
     }
     
-    // If systemhook isn't loaded and we are already jailbroken, we need to do the checkin ourselves
-    // This can happen when the jailbreak is hidden or when tweak injection into the Dopamine app is disabled via Choicy
-    jbclient_process_checkin(NULL, NULL, NULL, NULL);
+// Make Dopamine's <Documents> directory visible in the Files app.
+NSString* documentsPath = [@(getenv("HOME")) stringByAppendingPathComponent:@"Documents"];
+[@"" writeToFile:[documentsPath stringByAppendingPathComponent:@".keep"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+#ifdef ENABLE_LOGS
+if(@available(iOS 17.0.1, *)) {
+    JBLogSetLogDir([documentsPath stringByAppendingPathComponent:@"logs"].fileSystemRepresentation);
+}
+#endif
     
     if ([DOEnvironmentManager sharedManager].isJailbroken) {
         setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/rootfs/sbin:/rootfs/bin:/rootfs/usr/sbin:/rootfs/usr/bin", 1);

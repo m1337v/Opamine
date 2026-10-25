@@ -53,7 +53,7 @@
 
 // Settings Hints
 "Hint_Hide_Jailbreak" = "\"ซ่อนเจลเบรค\" ซ่อนไฟล์ที่เกี่ยวกับเจลเบรคต่างๆจนกว่าจะทำการเจลเบรคใหม่";
-"Hint_Hide_Jailbreak_Jailbroken" = "\"ซ่อนเจลเบรค\" ปิดการทำงานของเจลเบรคบางส่วนเพื่อทำให้การตรวจจับยากขึ้น แต่อาจจะมีประสิทธิภาพไม่เต็มที่";
+/*Hint_Hide_Jailbreak_Jailbroken*/
 "Section_Jailbreak_Settings" = "ตั้งค่าเจลเบรค";
 "Section_Actions" = "Actions";
 "Section_Customization" = "การปรับแต่ง";
@@ -84,9 +84,17 @@
 "Theme" = "ธีม";
 "Kernel Exploit" = "Kernel Exploit";
 "PPL Bypass" = "PPL Bypass";
+"SPTM Bypass" = "SPTM Bypass";
 "PAC Bypass" = "PAC Bypass";
 /*None*/
 /*Recommended*/
+
+// DarkSword Workaround
+/*Respring_Required*/
+/*Respring_Required_Message*/
+/*Respring_Required_Notice_A8*/
+/*Apply_Workaround*/
+/*Respring_Cancel*/
 
 // Credits
 "Credits_Button_Discord" = "Discord";
@@ -98,6 +106,7 @@
 /*Initializing Protection*/
 "Loading BaseBin TrustCache" = "Loading BaseBin TrustCache";
 "Applying Bind Mount" = "Applying Bind Mount";
+/*Rebuilding Icon Cache*/
 "Removing Jailbreak" = "Removing Jailbreak";
 "Elevating Privileges" = "Elevating Privileges";
 "Cleaning Up Exploits" = "Cleaning Up Exploits";
@@ -107,6 +116,7 @@
 "Exploiting Kernel (%@)" = "Exploiting Kernel (%@)";
 "Bypassing PAC (%@)" = "Bypassing PAC (%@)";
 "Bypassing PPL (%@)" = "Bypassing PPL (%@)";
+"Bypassing SPTM (%@)" = "Bypassing SPTM (%@)";
 
 // Package Manager selection
 "Status_Title_Select_Package_Managers" = "เลือก Package Manager(s) ที่ต้องการ";

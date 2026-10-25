@@ -155,7 +155,6 @@ uint64_t pa_to_sptm_root_frame(uint64_t user_root_pt)
 	}
 	free(ranges);
 	return result;
-
 }
 
 uint64_t pa_to_sptm_frame(uint64_t pa)
@@ -293,7 +292,7 @@ void kauth_cred_drop(uint64_t ucred)
 {
 	if (gSystemInfo.kernelStruct.ucred_rw.exists) {
 		uint64_t refcntPtr = ucred + koffsetof(ucred, ref);
-
+		
 		kaccess_mapped(refcntPtr, sizeof(uint64_t), ^(void *ptr){
 			_Atomic(uint64_t) *uintPtr = ptr;
 			atomic_fetch_sub(uintPtr, 1);

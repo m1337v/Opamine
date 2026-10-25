@@ -2,10 +2,11 @@
 #include <kern_memorystatus.h>
 #include <mach-o/dyld.h>
 #include <libproc.h>
+#include <libgen.h>
 #include <spawn.h>
 
 #include <libjailbreak/libjailbreak.h>
-#include <libjailbreak/roothider.h>
+#include <libroothider/libroothider.h>
 
 extern char **environ;
 
@@ -25,14 +26,15 @@ void enableXPCLog(void* debugLog, void* errorLog);
 
 int main(int argc, char* argv[])
 {
-	crashreporter_start();
-
-	setJetsamLimit(50, false);
-
 #ifdef ENABLE_LOGS
+	redirectLogDir();
 	enableXPCLog(JBLogDebugFunction, JBLogErrorFunction);
 	enableJBDLog(JBLogDebugFunction, JBLogErrorFunction);
 #endif
+
+	crashreporter_start();
+
+	setJetsamLimit(50, false);
 
 	JBLogDebug("Hello from jailbrakd! uid=%d pid=%d ppid=%d", getuid(), getpid(), getppid());
 
