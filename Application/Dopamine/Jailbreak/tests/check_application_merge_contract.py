@@ -30,6 +30,28 @@ def package_field(package: Path, field: str) -> str:
     return subprocess.check_output(["dpkg-deb", "-f", str(package), field], text=True).strip()
 
 
+def check_category_header_registration(project_path: Path) -> None:
+    project = plistlib.loads(subprocess.check_output([
+        "plutil", "-convert", "xml1", "-o", "-", str(project_path)
+    ]))
+    objects = project["objects"]
+    groups = [item for item in objects.values()
+              if item.get("isa") == "PBXGroup" and item.get("path") == "Jailbreak"]
+    require(len(groups) == 1, "expected one Jailbreak project group")
+    for header in ("DOBootstrapper+RootHide.h", "DOEnvironmentManager+RootHide.h"):
+        references = [(key, item) for key, item in objects.items()
+                      if item.get("isa") == "PBXFileReference" and item.get("path") == header]
+        require(len(references) == 1, f"Xcode must register {header} exactly once")
+        reference, item = references[0]
+        require(item.get("sourceTree") == "<group>" and
+                item.get("lastKnownFileType") == "sourcecode.c.h",
+                f"invalid Xcode header reference for {header}")
+        require(groups[0].get("children", []).count(reference) == 1,
+                f"{header} must belong to the Jailbreak group for header-map resolution")
+        require((project_path.parent.parent / "Dopamine/Jailbreak" / header).is_file(),
+                f"registered header is absent: {header}")
+
+
 def sileo_info_plist(package: Path) -> dict:
     payload = subprocess.check_output(["dpkg-deb", "--fsys-tarfile", str(package)])
     with tarfile.open(fileobj=io.BytesIO(payload)) as archive:
@@ -49,6 +71,7 @@ def main() -> None:
     environment = ENVIRONMENT.read_text(encoding="utf-8")
     settings = SETTINGS.read_text(encoding="utf-8")
     info_plist = plistlib.loads(INFO_PLIST.read_bytes())
+    check_category_header_registration(PROJECT)
 
     require(
         'plutil -replace CFBundleIdentifier -string "com.m1337v.Opamine"' in makefile,

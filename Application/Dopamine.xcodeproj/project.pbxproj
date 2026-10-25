@@ -520,6 +520,8 @@
 		7CD8FC393022AADF00AF864E /* momentarius_a13.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = momentarius_a13.c; sourceTree = "<group>"; };
 		7CD8FC3A3022AADF00AF864E /* utils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = utils.h; sourceTree = "<group>"; };
 		7CD8FC3B3022AADF00AF864E /* utils.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = utils.c; sourceTree = "<group>"; };
+		A07610D1A27E4F1BB89C3101 /* DOBootstrapper+RootHide.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DOBootstrapper+RootHide.h"; sourceTree = "<group>"; };
+		A07610D2A27E4F1BB89C3102 /* DOEnvironmentManager+RootHide.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DOEnvironmentManager+RootHide.h"; sourceTree = "<group>"; };
 		8614E355301AB63E00B1B88C /* DOBootstrapper+zstd.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DOBootstrapper+zstd.h"; sourceTree = "<group>"; };
 		8614E356301AB63E00B1B88C /* DOBootstrapper+zstd.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = "DOBootstrapper+zstd.m"; sourceTree = "<group>"; };
 		8C029F412B4DFD5D0071DE58 /* DOExploitManager.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = DOExploitManager.h; sourceTree = "<group>"; };
@@ -1073,6 +1075,7 @@
 				8CB4087C301FFB050097E18B /* clock_alarm.c */,
 				8C029F442B4DFD910071DE58 /* DOBootstrapper.h */,
 				8C029F452B4DFD910071DE58 /* DOBootstrapper.m */,
+				A07610D1A27E4F1BB89C3101 /* DOBootstrapper+RootHide.h */,
 				8614E355301AB63E00B1B88C /* DOBootstrapper+zstd.h */,
 				8614E356301AB63E00B1B88C /* DOBootstrapper+zstd.m */,
 				8C029F612B4E2E140071DE58 /* DOJailbreaker.h */,
@@ -1083,6 +1086,7 @@
 				8C029F422B4DFD5D0071DE58 /* DOExploitManager.m */,
 				8C029F5E2B4E25350071DE58 /* DOEnvironmentManager.h */,
 				8C029F5F2B4E25350071DE58 /* DOEnvironmentManager.m */,
+				A07610D2A27E4F1BB89C3102 /* DOEnvironmentManager+RootHide.h */,
 				8C4ABEBC2B52274300B43C9B /* DOPreferenceManager.h */,
 				8C4ABEBD2B52274300B43C9B /* DOPreferenceManager.m */,
 			);
