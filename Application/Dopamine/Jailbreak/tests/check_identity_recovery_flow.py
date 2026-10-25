@@ -122,6 +122,35 @@ def replace_link_atomically(path: Path, target: str) -> None:
     os.replace(temporary, path)
 
 
+def nested_root_links(primary: Path, secondary: Path) -> list[tuple[str, Path, str]]:
+    result: list[tuple[str, Path, str]] = []
+    for role, root in (("primary", primary), ("secondary", secondary)):
+        for current, directories, files in os.walk(root, followlinks=False):
+            entries = [*directories, *files]
+            directories[:] = [name for name in directories if not (Path(current) / name).is_symlink()]
+            for name in entries:
+                path = Path(current) / name
+                if name != ".jbroot" or (role == "secondary" and path == secondary / ".jbroot"):
+                    continue
+                if not path.is_symlink():
+                    raise ValueError(f"unexpected nested root link: {path}")
+                raw_target = os.readlink(path)
+                target = Path(raw_target)
+                if not target.is_absolute():
+                    target = path.parent / target
+                target = Path(os.path.normpath(target))
+                points_to_active = target == primary
+                points_to_missing_historical = (
+                    target.parent == primary.parent
+                    and is_branded(target.name)
+                    and not os.path.lexists(target)
+                )
+                if not points_to_active and not points_to_missing_historical:
+                    raise ValueError(f"unexpected nested root link: {path}")
+                result.append((role, path.relative_to(root), raw_target))
+    return result
+
+
 def model_rerandomize(primary: Path, secondary_base: Path, new_name: str, fail_stage: str | None = None) -> bool:
     """Model the paired move and rollback contract, with deterministic faults."""
     old_primary = primary
@@ -129,6 +158,11 @@ def model_rerandomize(primary: Path, secondary_base: Path, new_name: str, fail_s
     new_primary = primary.with_name(new_name)
     new_secondary = secondary_base / new_name
     moved_primary = moved_secondary = rewrote_private = rewrote_secondary = False
+    try:
+        nested = nested_root_links(old_primary, old_secondary)
+    except ValueError:
+        return False
+    rewritten_nested: list[tuple[str, Path, str]] = []
 
     old_primary.rename(new_primary)
     moved_primary = True
@@ -141,12 +175,25 @@ def model_rerandomize(primary: Path, secondary_base: Path, new_name: str, fail_s
     rewrote_private = True
     replace_link_atomically(new_secondary / ".jbroot", str(new_primary))
     rewrote_secondary = True
+    for role, relative, old_target in nested:
+        root = new_primary if role == "primary" else new_secondary
+        path = root / relative
+        if (
+            not Path(old_target).is_absolute()
+            and Path(os.path.realpath(path)) == Path(os.path.realpath(new_primary))
+        ):
+            continue
+        replace_link_atomically(path, str(new_primary))
+        rewritten_nested.append((role, relative, old_target))
 
     if fail_stage != "validation":
         return True
 
     # Reverse links before moving either root back, preserving a complete old
     # pair after the injected final-validation failure.
+    for role, relative, old_target in reversed(rewritten_nested):
+        root = new_primary if role == "primary" else new_secondary
+        replace_link_atomically(root / relative, old_target)
     if rewrote_secondary:
         replace_link_atomically(new_secondary / ".jbroot", str(old_primary))
     if rewrote_private:
@@ -172,6 +219,15 @@ def create_owned_pair(primary_base: Path, secondary_base: Path, seed: int, ident
     (primary / "private/var").symlink_to(secondary / "var")
     (secondary / ".jbroot").symlink_to(primary)
     return primary, secondary
+
+
+def create_critical_loader_links(primary: Path, use_relative_targets: bool = False) -> None:
+    for relative, root_link in (("basebin", ".."), ("usr/lib", "../.."), ("usr/libexec", "../..")):
+        directory = primary / relative
+        directory.mkdir(parents=True, exist_ok=True)
+        link = directory / ".jbroot"
+        if not os.path.lexists(link):
+            link.symlink_to(root_link if use_relative_targets else primary)
 
 
 class IdentityRecoveryTests(unittest.TestCase):
@@ -233,12 +289,74 @@ class IdentityRecoveryTests(unittest.TestCase):
 
     def test_failed_final_validation_restores_the_original_complete_pair(self) -> None:
         primary, secondary = create_owned_pair(self.primary_base, self.secondary_base, 0x2122232425262700)
+        create_critical_loader_links(primary)
         new_name = branded_name(0x3132333435363700)
         self.assertFalse(model_rerandomize(primary, self.secondary_base, new_name, fail_stage="validation"))
         self.assertTrue(primary.exists())
         self.assertTrue(secondary.exists())
         self.assertEqual(model_state(primary, self.secondary_base), "ready")
         self.assertFalse((self.primary_base / new_name).exists())
+        for relative in ("basebin/.jbroot", "usr/lib/.jbroot", "usr/libexec/.jbroot"):
+            self.assertEqual(os.readlink(primary / relative), str(primary))
+
+    def test_rerandomization_updates_every_nested_loader_root_link(self) -> None:
+        primary, _ = create_owned_pair(self.primary_base, self.secondary_base, 0x4142434445464700)
+        create_critical_loader_links(primary)
+        new_name = branded_name(0x5152535455565700)
+        self.assertTrue(model_rerandomize(primary, self.secondary_base, new_name))
+        new_primary = self.primary_base / new_name
+        for relative in ("basebin/.jbroot", "usr/lib/.jbroot", "usr/libexec/.jbroot"):
+            self.assertEqual(os.readlink(new_primary / relative), str(new_primary))
+
+    def test_rerandomization_preserves_relocation_safe_relative_loader_links(self) -> None:
+        primary, _ = create_owned_pair(self.primary_base, self.secondary_base, 0xB1B2B3B4B5B6B700)
+        create_critical_loader_links(primary, use_relative_targets=True)
+        new_name = branded_name(0xC1C2C3C4C5C6C700)
+        self.assertTrue(model_rerandomize(primary, self.secondary_base, new_name))
+        new_primary = self.primary_base / new_name
+        expected = {
+            "basebin/.jbroot": "..",
+            "usr/lib/.jbroot": "../..",
+            "usr/libexec/.jbroot": "../..",
+        }
+        for relative, raw_target in expected.items():
+            self.assertEqual(os.readlink(new_primary / relative), raw_target)
+
+    def test_relative_loader_link_embedding_old_root_name_is_rewritten(self) -> None:
+        primary, _ = create_owned_pair(self.primary_base, self.secondary_base, 0xD1D2D3D4D5D6D700)
+        create_critical_loader_links(primary, use_relative_targets=True)
+        embedded = primary / "usr/lib/.jbroot"
+        embedded.unlink()
+        embedded.symlink_to(f"../../../{primary.name}")
+        self.assertEqual(Path(os.path.realpath(embedded)), Path(os.path.realpath(primary)))
+        new_name = branded_name(0xE1E2E3E4E5E6E700)
+        self.assertTrue(model_rerandomize(primary, self.secondary_base, new_name))
+        new_primary = self.primary_base / new_name
+        self.assertEqual(os.readlink(new_primary / "usr/lib/.jbroot"), str(new_primary))
+
+    def test_unexpected_nested_loader_link_fails_before_moving_roots(self) -> None:
+        primary, secondary = create_owned_pair(self.primary_base, self.secondary_base, 0x6162636465666700)
+        create_critical_loader_links(primary)
+        bad_link = primary / "basebin/.jbroot"
+        bad_link.unlink()
+        bad_link.symlink_to("/unrelated/root")
+        new_name = branded_name(0x7172737475767700)
+        self.assertFalse(model_rerandomize(primary, self.secondary_base, new_name))
+        self.assertTrue(primary.exists())
+        self.assertTrue(secondary.exists())
+        self.assertEqual(os.readlink(bad_link), "/unrelated/root")
+
+    def test_missing_historical_loader_link_is_repaired_during_rerandomization(self) -> None:
+        primary, _ = create_owned_pair(self.primary_base, self.secondary_base, 0x8182838485868700)
+        create_critical_loader_links(primary)
+        stale_root = self.primary_base / branded_name(0x9192939495969700)
+        stale_link = primary / "basebin/.jbroot"
+        stale_link.unlink()
+        stale_link.symlink_to(stale_root)
+        new_name = branded_name(0xA1A2A3A4A5A6A700)
+        self.assertTrue(model_rerandomize(primary, self.secondary_base, new_name))
+        new_primary = self.primary_base / new_name
+        self.assertEqual(os.readlink(new_primary / "basebin/.jbroot"), str(new_primary))
 
     def test_cache_is_not_seeded_until_bootstrap_extraction_succeeds(self) -> None:
         source = SOURCE.read_text()
@@ -287,6 +405,11 @@ class IdentityRecoveryTests(unittest.TestCase):
             "RootHideReplaceExpectedSymlink",
             "RootHideFindOwnedJailbreakRoot",
             "RootHideWriteCurrentAppIdentifier",
+            "RootHideCollectNestedRootLinks",
+            "RootHideEnsureCriticalLoaderLinks",
+            "RootHideIsMissingHistoricalPrimaryRoot",
+            "relative path that embeds the now-missing old randomized name",
+            "rewrittenNestedLinks.reverseObjectEnumerator",
             "Multiple owned RootHide/Opamine randomized roots",
             "Never remove a directory just because it has a valid randomized-root",
             "goto rollback",

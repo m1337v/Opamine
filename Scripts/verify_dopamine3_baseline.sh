@@ -203,7 +203,8 @@ source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m 'createSymbolicL
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m 'return [@"/rootfs/" stringByAppendingPathComponent:path];'
 
 source_contains BaseBin/libjailbreak/src/roothider/common.m 'int randomizeAndLoadBasebinTrustcache(const char* basebinPath)'
-source_contains BaseBin/libjailbreak/src/roothider/common.m 'ensure_randomized_cdhash(fileURL.path.fileSystemRepresentation, cdhash)'
+source_contains BaseBin/libjailbreak/src/roothider/common.m 'file_collect_untrusted_cdhashes_by_path_status('
+source_contains BaseBin/libjailbreak/src/roothider/common.m 'collect_current_basebin_mappable_cdhashes('
 source_contains BaseBin/libjailbreak/src/roothider/common.m 'trustcache_file_upload_with_uuid(basebinTcFile, BASEBIN_TRUSTCACHE_UUID)'
 source_contains Application/Dopamine/Jailbreak/DOJailbreaker.m 'randomizeAndLoadBasebinTrustcache(JBROOT_PATH("/basebin/"))'
 if grep -Fq 'if (tcSize > 0x4000) return -1;' "$repo_root/BaseBin/libjailbreak/src/trustcache.c" ||

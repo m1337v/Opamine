@@ -15,6 +15,7 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 - (id)initWithTitle:(NSString*)title;
+- (id)initWithTitle:(NSString*)title rebootRequired:(BOOL)rebootRequired;
 
 @end
 

@@ -46,6 +46,8 @@ CFDictionaryRef _CFPreferencesCopyMultipleWithContainer(CFArrayRef keysToFetch, 
 //char *_dirhelper(int a, char *dst, size_t size);
 
 NSString *const JBErrorDomain = @"JBErrorDomain";
+NSString * const DOJailbreakerErrorRequiresFullRebootKey = @"DOJailbreakerErrorRequiresFullReboot";
+NSString * const DOJailbreakerErrorActivationPhaseKey = @"DOJailbreakerErrorActivationPhase";
 typedef NS_ENUM(NSInteger, JBErrorCode) {
     JBErrorCodeFailedToFindKernel            = -1,
     JBErrorCodeFailedKernelPatchfinding      = -2,
@@ -70,6 +72,8 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 static const NSUInteger kDOContiguousMappingMaximumAttempts = 512;
 static const uint64_t kDOContiguousMappingMaximumNanoseconds = 180ULL * NSEC_PER_MSEC;
 
+static NSString * const DOJailbreakerFullRebootRequiredReason = @"Jailbreak activation modified launchd but did not complete. A full device reboot is required before Dopamine can be opened again.";
+
 static NSError *DOJailbreakerContiguousMappingError(JBErrorCode code, NSString *description)
 {
     return [NSError errorWithDomain:JBErrorDomain
@@ -88,7 +92,36 @@ static bool DOJailbreakerAppendXPFSet(const char *sets[], size_t capacity, size_
     return true;
 }
 
+@interface DOJailbreaker ()
+
+@property (nonatomic, readwrite) DOJailbreakActivationPhase activationPhase;
+
+@end
+
 @implementation DOJailbreaker
+
+- (NSError *)errorRequiringFullRebootIfNeeded:(NSError *)error
+{
+    if (!error || self.activationPhase < DOJailbreakActivationPhaseLaunchdFirstLoad ||
+        self.activationPhase == DOJailbreakActivationPhaseUserspaceRebooting) {
+        return error;
+    }
+
+    if ([error.userInfo[DOJailbreakerErrorRequiresFullRebootKey] boolValue]) {
+        return error;
+    }
+
+    NSMutableDictionary *userInfo = [error.userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+    userInfo[DOJailbreakerErrorRequiresFullRebootKey] = @YES;
+    userInfo[DOJailbreakerErrorActivationPhaseKey] = @(self.activationPhase);
+    userInfo[NSLocalizedFailureReasonErrorKey] = DOJailbreakerFullRebootRequiredReason;
+    if (!userInfo[NSUnderlyingErrorKey]) {
+        userInfo[NSUnderlyingErrorKey] = error;
+    }
+
+    [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"Jailbreak failed after launchd first-load (phase %ld). %@", (long)self.activationPhase, DOJailbreakerFullRebootRequiredReason] debug:NO];
+    return [NSError errorWithDomain:error.domain code:error.code userInfo:userInfo];
+}
 
 - (NSError *)gatherSystemInformation
 {
@@ -606,6 +639,10 @@ void *boomerang_server(struct boomerang_info *info)
 
 - (NSError *)cleanUpPostExploitation
 {
+    // This is deliberately limited to the proven iOS 17+ process-credential
+    // restoration below. It cannot undo a rerandomized root, uploaded trust
+    // cache, or injected launchd, and therefore must never be presented as a
+    // rollback on iOS 16 or after launchd first-load.
     if (@available(iOS 17.0, *)) {
         uint64_t proc = proc_self();
         uint64_t ucred = proc_ucred(proc);
@@ -624,6 +661,8 @@ void *boomerang_server(struct boomerang_info *info)
 
 - (void)runWithError:(NSError **)errOut didRemoveJailbreak:(BOOL*)didRemove showLogs:(BOOL *)showLogs
 {
+
+    self.activationPhase = DOJailbreakActivationPhasePreInjection;
 
 /****************** roothide specific ****************/
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -744,6 +783,9 @@ void *boomerang_server(struct boomerang_info *info)
         [self cleanUpPostExploitation];
         return;
     }
+    // From here onward launchd intentionally prevents a new Dopamine process
+    // until reboot. Any error must be surfaced as reboot-required, not retry.
+    self.activationPhase = DOJailbreakActivationPhaseLaunchdFirstLoad;
     
 /*
     // Now that we can, protect important system files by bind mounting on top of them
@@ -764,14 +806,18 @@ void *boomerang_server(struct boomerang_info *info)
 int ret = basebin_generate(false);
 if (ret != 0) {
     *errOut = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedInitFakeLib userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Creating fakelib failed with error: %d", ret]}];
-    [self cleanUpPostExploitation];
+    *errOut = [self errorRequiringFullRebootIfNeeded:*errOut];
+    // Keep the already-elevated process available for the direct full reboot
+    // action. No rollback is safe after launchd first-load has begun.
     return;
 }
 
 ret = ensure_dyld_trustcache(JBROOT_PATH("/basebin/.fakelib/dyld"));
 if (ret != 0) {
     *errOut = [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedInitFakeLib userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to upload dyld trustcache: %d", ret]}];
-    [self cleanUpPostExploitation];
+    *errOut = [self errorRequiringFullRebootIfNeeded:*errOut];
+    // Keep the already-elevated process available for the direct full reboot
+    // action. No rollback is safe after launchd first-load has begun.
     return;
 }
 
@@ -793,9 +839,12 @@ setenv("DYLD_INSERT_LIBRARIES", JBROOT_PATH("/basebin/systemhook.dylib"), 1);
     
     *errOut = [self finalizeBootstrapIfNeeded];
     if (*errOut) {
-        [self cleanUpPostExploitation];
+        *errOut = [self errorRequiringFullRebootIfNeeded:*errOut];
+        // See the RootHide-stage failures above: the recovery UI needs this
+        // process to remain capable of issuing a direct full reboot.
         return;
     }
+    self.activationPhase = DOJailbreakActivationPhaseFinalized;
     
     [[DOEnvironmentManager sharedManager] setIDownloadEnabled:idownloadEnabled needsUnsandbox:NO];
     
@@ -815,13 +864,17 @@ setenv("DYLD_INSERT_LIBRARIES", JBROOT_PATH("/basebin/systemhook.dylib"), 1);
     // It's only neccessary when we don't immediately userspace reboot
     
     *errOut = [self cleanUpPostExploitation];
-    if (*errOut) return;
+    if (*errOut) {
+        *errOut = [self errorRequiringFullRebootIfNeeded:*errOut];
+        return;
+    }
 
     printf("Done!\n");
 }
 
 - (void)finalize
 {
+    self.activationPhase = DOJailbreakActivationPhaseUserspaceRebooting;
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Rebooting Userspace") debug:NO];
     [[DOEnvironmentManager sharedManager] rebootUserspace];
 }

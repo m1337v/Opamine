@@ -7,8 +7,13 @@
 #include <string.h>
 #include <dirent.h>
 #include <stdint.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/sysctl.h>
 #include <sys/proc_info.h>
+#include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/fat.h>
 #include <mach/machine.h>
@@ -27,6 +32,7 @@
 #include "roothider.h"
 
 const char* HOOK_DYLIB_PATH = NULL;
+extern char *JB_RootPath;
 
 bool dyld_patch_fallback_enabled = false;
 /*
@@ -1447,6 +1453,174 @@ static uid_t _CFGetSVUID(bool *successful) {
     return uid;
 }
 
+typedef struct {
+	const char *label;
+	const char *suffix;
+} RoothideHooksDiagnosticPath;
+
+/* Keep this list deliberately small.  These are the paths needed to
+ * distinguish a missing root/link from a dyld dependency or trust failure;
+ * walking the whole randomized root from an injected process is both noisy
+ * and capable of perturbing the very state being diagnosed. */
+static const RoothideHooksDiagnosticPath kRoothideHooksDiagnosticPaths[] = {
+	{ "active-root", "" },
+	{ "roothidehooks", "/basebin/roothidehooks.dylib" },
+	{ "libjailbreak", "/basebin/libjailbreak.dylib" },
+	{ "basebin-jbroot", "/basebin/.jbroot" },
+	{ "usr-lib-jbroot", "/usr/lib/.jbroot" },
+	{ "libroothide", "/usr/lib/libroothide.dylib" },
+	{ "roothideinit", "/usr/lib/roothideinit.dylib" },
+	{ "basebin-present", "/basebin/present" },
+	{ "substrate-fallback", "/basebin/fallback/CydiaSubstrate.framework/CydiaSubstrate" },
+};
+
+static const char *roothidehooks_architecture(void)
+{
+#if defined(__arm64e__)
+	return "arm64e";
+#elif defined(__arm64__)
+	return "arm64";
+#else
+	return "unknown";
+#endif
+}
+
+static bool roothidehooks_join_path(const char *root, const char *suffix,
+	char *output, size_t outputSize)
+{
+	if (!root || !root[0] || !suffix || !output || outputSize == 0) {
+		return false;
+	}
+
+	const bool rootHasTrailingSlash = root[strlen(root) - 1] == '/';
+	const char *effectiveSuffix = (rootHasTrailingSlash && suffix[0] == '/') ?
+		suffix + 1 : suffix;
+	int written = snprintf(output, outputSize, "%s%s", root, effectiveSuffix);
+	return written >= 0 && (size_t)written < outputSize;
+}
+
+static void roothidehooks_log_path_state(const RoothideHooksDiagnosticPath *entry,
+	const char *root)
+{
+	char path[PATH_MAX];
+	if (!roothidehooks_join_path(root, entry->suffix, path, sizeof(path))) {
+		fprintf(stderr, "[RHI] roothidehooks loader path=%s label=%s unavailable root=%s\n",
+			entry->suffix ?: "(null)", entry->label ?: "(null)", root ?: "(null)");
+		return;
+	}
+
+	struct stat state = {0};
+	int lstatResult = lstat(path, &state);
+	int lstatErrno = errno;
+	char linkTarget[PATH_MAX];
+	ssize_t linkLength = readlink(path, linkTarget, sizeof(linkTarget) - 1);
+	int readlinkErrno = errno;
+	if (linkLength >= 0) {
+		linkTarget[linkLength] = '\0';
+	}
+	char resolved[PATH_MAX];
+	char *resolvedPath = realpath(path, resolved);
+	int realpathErrno = errno;
+
+	if (lstatResult == 0) {
+		fprintf(stderr,
+			"[RHI] roothidehooks loader path=%s label=%s lstat=ok mode=%#o uid=%u gid=%u size=%lld",
+			path, entry->label ?: "(null)", (unsigned int)state.st_mode,
+			(unsigned int)state.st_uid, (unsigned int)state.st_gid,
+			(long long)state.st_size);
+	} else {
+		fprintf(stderr,
+			"[RHI] roothidehooks loader path=%s label=%s lstat=error errno=%d(%s)",
+			path, entry->label ?: "(null)", lstatErrno, strerror(lstatErrno));
+	}
+
+	if (linkLength >= 0) {
+		fprintf(stderr, " readlink=%s", linkTarget);
+	} else {
+		fprintf(stderr, " readlink=error errno=%d(%s)", readlinkErrno, strerror(readlinkErrno));
+	}
+	if (resolvedPath) {
+		fprintf(stderr, " realpath=%s\n", resolvedPath);
+	} else {
+		fprintf(stderr, " realpath=error errno=%d(%s)\n", realpathErrno, strerror(realpathErrno));
+	}
+}
+
+static void roothidehooks_log_loader_failure(const char *requestedPath,
+	const char *loaderError, int loaderErrno, int callerErrno)
+{
+	char executablePath[PATH_MAX] = {0};
+	uint32_t executablePathSize = sizeof(executablePath);
+	if (_NSGetExecutablePath(executablePath, &executablePathSize) != 0) {
+		strlcpy(executablePath, "(unavailable)", sizeof(executablePath));
+	}
+
+	const char *activeRoot = JB_RootPath;
+	const char *reportedRoot = get_jbroot();
+	const char *program = getprogname();
+	const char *bundleIdentifier = getenv("CFBundleIdentifier");
+	const char *bundleIdentifierFallback = getenv("BUNDLE_IDENTIFIER");
+	const char *xpcService = getenv("XPC_SERVICE_NAME");
+	fprintf(stderr,
+		"[RHI] roothidehooks loader failure path=%s dyld_error=%s loader_errno=%d(%s) "
+		"caller_errno=%d(%s) root=%s get_jbroot=%s executable=%s program=%s "
+		"identity=%s identity_fallback=%s xpc_service=%s arch=%s pid=%d ppid=%d euid=%u\n",
+		requestedPath ?: "(null)", loaderError ?: "(null)", loaderErrno,
+		strerror(loaderErrno), callerErrno, strerror(callerErrno),
+		activeRoot ?: "(null)", reportedRoot ?: "(null)", executablePath,
+		program ?: "(null)", bundleIdentifier ?: "(null)",
+		bundleIdentifierFallback ?: "(null)", xpcService ?: "(null)",
+		roothidehooks_architecture(), getpid(), getppid(), (unsigned int)geteuid());
+
+	for (size_t i = 0; i < sizeof(kRoothideHooksDiagnosticPaths) /
+		sizeof(kRoothideHooksDiagnosticPaths[0]); i++) {
+		roothidehooks_log_path_state(&kRoothideHooksDiagnosticPaths[i], reportedRoot ?: activeRoot);
+	}
+}
+
+static void *roothidehooks_load_or_abort(void)
+{
+	int callerErrno = errno;
+	const char *root = get_jbroot();
+	char requestedPath[PATH_MAX];
+	bool pathAvailable = roothidehooks_join_path(root,
+		"/basebin/roothidehooks.dylib", requestedPath, sizeof(requestedPath));
+	char loaderError[512] = "jbroot path unavailable";
+	int loaderErrno = EINVAL;
+	void *handle = NULL;
+
+	/* Clear stale state before dlopen and consume the failure immediately.  No
+	 * diagnostic operation between these calls is allowed to touch dlerror. */
+	(void)dlerror();
+	if (pathAvailable) {
+		handle = dlopen(requestedPath, RTLD_NOW);
+		loaderErrno = errno;
+		if (handle) {
+			errno = callerErrno;
+			return handle;
+		}
+		const char *error = dlerror();
+		if (error && error[0]) {
+			strlcpy(loaderError, error, sizeof(loaderError));
+		}
+	} else {
+		loaderErrno = EINVAL;
+	}
+
+	const char *displayPath = pathAvailable ? requestedPath : "(jbroot unavailable)";
+	roothidehooks_log_loader_failure(displayPath, loaderError, loaderErrno, callerErrno);
+	char reason[PATH_MAX];
+	int reasonLength = snprintf(reason, sizeof(reason),
+		"roothidehooks dlopen failed path=%s dyld_error=%s errno=%d(%s)",
+		displayPath, loaderError, loaderErrno, strerror(loaderErrno));
+	if (reasonLength < 0) {
+		strlcpy(reason, "roothidehooks dlopen failed", sizeof(reason));
+	}
+	errno = callerErrno;
+	abort_with_reason(OS_REASON_DYLD, DYLD_EXIT_REASON_OTHER, reason, 0);
+	abort();
+}
+
 bool _CFCanChangeEUIDs(void) {
     static bool canChangeEUIDs;
     static dispatch_once_t onceToken;
@@ -1464,8 +1638,7 @@ void loadPathHook()
 {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-		void* roothidehooks = dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
-		ASSERT(roothidehooks != NULL);
+		void* roothidehooks = roothidehooks_load_or_abort();
 		void (*pathhook)() = dlsym(roothidehooks, "pathhook");
 		ASSERT(pathhook != NULL);
 		pathhook();
@@ -2157,8 +2330,7 @@ void roothide_init_with_executable(const char* executable)
 	|| strcmp(executable, "/usr/libexec/keybagd")==0) {
 		if(jbclient_palehide_present())
 		{
-			void* roothidehooks = dlopen(JBROOT_PATH("/basebin/roothidehooks.dylib"), RTLD_NOW);
-			ASSERT(roothidehooks != NULL);
+			void* roothidehooks = roothidehooks_load_or_abort();
 			void (*palera1n)() = dlsym(roothidehooks, "palera1n");
 			palera1n();
 		}

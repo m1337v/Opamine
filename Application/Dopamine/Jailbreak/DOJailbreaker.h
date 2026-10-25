@@ -11,10 +11,25 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+typedef NS_ENUM(NSInteger, DOJailbreakActivationPhase) {
+    DOJailbreakActivationPhasePreInjection = 0,
+    DOJailbreakActivationPhaseLaunchdFirstLoad,
+    DOJailbreakActivationPhaseFinalized,
+    DOJailbreakActivationPhaseUserspaceRebooting,
+};
+
+// Errors raised after launchd has entered first-load mode cannot be retried in
+// this boot. The launchd hook deliberately rejects a new Dopamine process
+// until a full device reboot has restored a known-good state.
+FOUNDATION_EXPORT NSString * const DOJailbreakerErrorRequiresFullRebootKey;
+FOUNDATION_EXPORT NSString * const DOJailbreakerErrorActivationPhaseKey;
+
 @interface DOJailbreaker : NSObject
 {
     xpc_object_t _systemInfoXdict;
 }
+
+@property (nonatomic, readonly) DOJailbreakActivationPhase activationPhase;
 
 - (void)runWithError:(NSError **)errOut didRemoveJailbreak:(BOOL*)didRemove showLogs:(BOOL *)showLogs;
 - (void)finalize;

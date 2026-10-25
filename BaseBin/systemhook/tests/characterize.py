@@ -1606,6 +1606,60 @@ def run_checks(artifact: Path | None = None) -> dict[str, Any]:
 
     check("phase_attestation_checkpoints_and_no_hot_path_static_contract", check_phase_attestation_source_contract)
 
+    def check_roothidehooks_loader_source_contract() -> None:
+        source = roothider_main
+        helper_signature = "static void *roothidehooks_load_or_abort(void)"
+        helper_start = source.index(helper_signature)
+        helper_brace = source.index("{", helper_start)
+        depth = 0
+        helper_end = -1
+        for index in range(helper_brace, len(source)):
+            if source[index] == "{":
+                depth += 1
+            elif source[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    helper_end = index + 1
+                    break
+        require(helper_end > helper_start, "roothidehooks loader helper must have a complete body")
+        helper = source[helper_start:helper_end]
+
+        clear_error = helper.index("(void)dlerror();")
+        open_call = helper.index("handle = dlopen(requestedPath, RTLD_NOW);")
+        capture_error = helper.index("const char *error = dlerror();")
+        require(clear_error < open_call < capture_error,
+                "loader must clear dlerror before dlopen and capture it immediately on failure")
+        require("int callerErrno = errno;" in helper and "loaderErrno = errno;" in helper,
+                "loader must retain caller and dlopen errno values")
+        require("errno = callerErrno;" in helper,
+                "successful and failing loader paths must restore caller errno")
+        require("abort_with_reason" in helper and "dyld_error=%s" in helper,
+                "fail-closed abort reason must include the captured dyld error")
+
+        for token in ("lstat(", "readlink(", "realpath(",
+                      "pid=%d", "ppid=%d", "euid=%u", "get_jbroot",
+                      "_NSGetExecutablePath", "roothidehooks_architecture"):
+            require(token in helper or token in source,
+                    f"loader diagnostics missing bounded context {token}")
+        for suffix in (
+            "/basebin/roothidehooks.dylib",
+            "/basebin/libjailbreak.dylib",
+            "/basebin/.jbroot",
+            "/usr/lib/.jbroot",
+            "/usr/lib/libroothide.dylib",
+            "/usr/lib/roothideinit.dylib",
+            "/basebin/present",
+            "/basebin/fallback/CydiaSubstrate.framework/CydiaSubstrate",
+        ):
+            require(suffix in source, f"bounded loader diagnostics missing {suffix}")
+
+        require(source.count("roothidehooks_load_or_abort();") == 2,
+                "both roothidehooks direct load sites must use the shared helper")
+        require("dlopen(JBROOT_PATH(\"/basebin/roothidehooks.dylib\")" not in source,
+                "direct roothidehooks dlopen calls must not bypass diagnostics")
+
+    check("roothidehooks_loader_diagnostics_static_contract", check_roothidehooks_loader_source_contract)
+
     def check_remap_source_contract() -> None:
         require("hidden_dylib_hider_dlsym_remap" in hider, "remap entry point missing")
         for symbol in ("_dyld_image_count", "dlsym", "dladdr", "getenv", "opendir", "sysctlbyname"):

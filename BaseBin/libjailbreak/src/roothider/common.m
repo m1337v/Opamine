@@ -14,6 +14,7 @@
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "../libjailbreak.h"
 #include "../codesign.h"
@@ -980,46 +981,321 @@ rollback:
     return result;
 }
 
+extern NSString *dyldhook_dylib_for_platform(void);
+extern bool macho_parse_code_signature(MachO *macho, cdhash_t cdhashOut);
+
+static int append_unique_basebin_cdhash(cdhash_t **hashes, uint32_t *count, const cdhash_t cdhash)
+{
+    if (!hashes || !count || !cdhash) return -EINVAL;
+
+    for (uint32_t i = 0; i < *count; i++) {
+        if (memcmp((*hashes)[i], cdhash, sizeof(cdhash_t)) == 0) return 0;
+    }
+
+    if (*count == UINT32_MAX || (size_t)(*count + 1) > SIZE_MAX / sizeof(cdhash_t)) {
+        return -EOVERFLOW;
+    }
+
+    cdhash_t *grown = realloc(*hashes, (size_t)(*count + 1) * sizeof(cdhash_t));
+    if (!grown) return -ENOMEM;
+    memcpy(grown[*count], cdhash, sizeof(cdhash_t));
+    *hashes = grown;
+    (*count)++;
+    return 0;
+}
+
+enum { BASEBIN_REQUIRED_IMAGE_COUNT = 5 };
+
+struct basebin_required_image {
+    cdhash_t *cdhashes;
+    uint32_t cdhashCount;
+    bool seen;
+};
+
+/* file_collect_untrusted_cdhashes_by_path_status() performs the one mutation
+ * pass for every mappable slice.  This helper deliberately only parses the
+ * resulting signatures: it does not call ensure_randomized_cdhash_for_slice a
+ * second time, so fixed-UUID replacement can aggregate already-trusted hashes
+ * without rewriting a slice twice. */
+static int collect_current_basebin_mappable_cdhashes(const char *path,
+                                                     cdhash_t **hashesOut,
+                                                     uint32_t *countOut)
+{
+    if (hashesOut) *hashesOut = NULL;
+    if (countOut) *countOut = 0;
+    if (!path || !hashesOut || !countOut) return -EINVAL;
+
+    Fat *fat = fat_init_from_path(path);
+    if (!fat) return -EINVAL;
+
+    __block cdhash_t *hashes = NULL;
+    __block uint32_t hashCount = 0;
+    __block int collectionError = 0;
+    __block bool sawSlice = false;
+    __block bool sawMappableSlice = false;
+    fat_enumerate_slices(fat, ^(MachO *macho, bool *stop) {
+        sawSlice = true;
+        if (!macho_is_mappable(macho)) return;
+        sawMappableSlice = true;
+
+        cdhash_t cdhash = {0};
+        if (!macho_parse_code_signature(macho, cdhash)) {
+            collectionError = -EINVAL;
+            *stop = true;
+            return;
+        }
+
+        collectionError = append_unique_basebin_cdhash(&hashes, &hashCount, cdhash);
+        if (collectionError != 0) *stop = true;
+    });
+    fat_free(fat);
+
+    if (collectionError != 0) {
+        free(hashes);
+        return collectionError;
+    }
+    if (!sawMappableSlice) {
+        free(hashes);
+        /* A valid Mach-O for another architecture is a benign skip.  A
+         * parser that produced no slice at all is malformed and must fail. */
+        return sawSlice ? FILE_CDHASH_COLLECTION_SKIPPED : -EINVAL;
+    }
+
+    *hashesOut = hashes;
+    *countOut = hashCount;
+    return 0;
+}
+
+static void free_required_basebin_images(struct basebin_required_image *images, NSUInteger count)
+{
+    if (!images) return;
+    for (NSUInteger i = 0; i < count; i++) {
+        free(images[i].cdhashes);
+        images[i].cdhashes = NULL;
+        images[i].cdhashCount = 0;
+        images[i].seen = false;
+    }
+}
+
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
 {
-    cdhash_t* basebins_cdhashes=NULL;
-    uint32_t basebins_cdhashesCount=0;
+    if (!basebinPath || basebinPath[0] == '\0') return -EINVAL;
 
-    NSDirectoryEnumerator<NSURL *> *directoryEnumerator = [[NSFileManager defaultManager] enumeratorAtURL:[NSURL fileURLWithPath:@(basebinPath)] includingPropertiesForKeys:nil options:0 errorHandler:nil];
+    NSString *basebinRoot = [@(basebinPath) stringByStandardizingPath];
+    NSString *selectedDyldhook = dyldhook_dylib_for_platform();
+    if (!selectedDyldhook || selectedDyldhook.length == 0 ||
+        selectedDyldhook.isAbsolutePath ||
+        [selectedDyldhook rangeOfString:@"/"].location != NSNotFound ||
+        [selectedDyldhook isEqualToString:@"."] ||
+        [selectedDyldhook isEqualToString:@".."]) {
+        JBLogError("Failed to select the device dyldhook image");
+        return -EINVAL;
+    }
+
+    /* These images are loaded before or during first-load finalization.  Keep
+     * their randomized hashes independently of the directory aggregate so a
+     * successful upload can never hide a missing required image. */
+    NSArray<NSString *> *requiredPaths = @[
+        [basebinRoot stringByAppendingPathComponent:@"roothidehooks.dylib"],
+        [basebinRoot stringByAppendingPathComponent:@"systemhook.dylib"],
+        [basebinRoot stringByAppendingPathComponent:@"libjailbreak.dylib"],
+        [basebinRoot stringByAppendingPathComponent:@"launchdhook.dylib"],
+        [basebinRoot stringByAppendingPathComponent:selectedDyldhook],
+    ];
+    const NSUInteger requiredPathCount = requiredPaths.count;
+    if (requiredPathCount != BASEBIN_REQUIRED_IMAGE_COUNT) return -EINVAL;
+    struct basebin_required_image requiredImages[BASEBIN_REQUIRED_IMAGE_COUNT] = {};
+
+    cdhash_t *basebins_cdhashes = NULL;
+    uint32_t basebins_cdhashesCount = 0;
+    __block int enumerationError = 0;
+
+    NSDirectoryEnumerator<NSURL *> *directoryEnumerator = [[NSFileManager defaultManager]
+        enumeratorAtURL:[NSURL fileURLWithPath:basebinRoot]
+        includingPropertiesForKeys:@[NSURLIsRegularFileKey]
+        options:0
+        errorHandler:^BOOL(NSURL *url, NSError *error) {
+            (void)url;
+            enumerationError = error.code != 0 ? -(int)error.code : -EIO;
+            JBLogError("Failed to enumerate BaseBin: %d", enumerationError);
+            return NO;
+        }];
     if(!directoryEnumerator) {
-        return -1;
+        return -ENOENT;
     }
     for(NSURL* fileURL in directoryEnumerator)
     {
+        NSString *filePath = [fileURL.path stringByStandardizingPath];
         NSNumber* isFile = nil;
-        [fileURL getResourceValue:&isFile forKey:NSURLIsRegularFileKey error:nil];
+        NSError *resourceError = nil;
+        if (![fileURL getResourceValue:&isFile forKey:NSURLIsRegularFileKey error:&resourceError]) {
+            enumerationError = resourceError.code != 0 ? -(int)resourceError.code : -EIO;
+            [directoryEnumerator skipDescendants];
+            break;
+        }
         if(!isFile || !isFile.boolValue) continue;
 
-        cdhash_t cdhash={0};
-        if(ensure_randomized_cdhash(fileURL.path.fileSystemRepresentation, cdhash) == 0) {
-            basebins_cdhashes = realloc(basebins_cdhashes, (basebins_cdhashesCount+1) * sizeof(cdhash_t));
-            memcpy(&basebins_cdhashes[basebins_cdhashesCount], cdhash, sizeof(cdhash_t));
-            basebins_cdhashesCount++;
+        cdhash_t *fileCdHashes = NULL;
+        uint32_t fileCdHashCount = 0;
+        cdhash_t *currentFileCdHashes = NULL;
+        uint32_t currentFileCdHashCount = 0;
+        int collectionStatus = file_collect_untrusted_cdhashes_by_path_status(
+            filePath.fileSystemRepresentation, &fileCdHashes, &fileCdHashCount);
+        NSUInteger requiredIndex = [requiredPaths indexOfObject:filePath];
+
+        if (collectionStatus < 0) {
+            JBLogError("Failed to collect BaseBin CDHashes for %s: %d",
+                       filePath.fileSystemRepresentation, collectionStatus);
+            free(fileCdHashes);
+            enumerationError = collectionStatus;
+            break;
+        }
+        if (collectionStatus == FILE_CDHASH_COLLECTION_SKIPPED) {
+            /* Non-Mach files and RootHide policy exclusions are benign for the
+             * aggregate, but a required runtime image may never be skipped. */
+            if (requiredIndex != NSNotFound) {
+                JBLogError("Required BaseBin image was skipped: %s", filePath.fileSystemRepresentation);
+                free(fileCdHashes);
+                enumerationError = -EIO;
+                break;
+            }
+            free(fileCdHashes);
+            continue;
+        }
+        if (collectionStatus != FILE_CDHASH_COLLECTION_COMPLETED) {
+            free(fileCdHashes);
+            enumerationError = -EIO;
+            break;
+        }
+
+        for (uint32_t i = 0; i < fileCdHashCount; i++) {
+            int appendResult = append_unique_basebin_cdhash(&basebins_cdhashes,
+                                                            &basebins_cdhashesCount,
+                                                            fileCdHashes[i]);
+            if (appendResult != 0) {
+                enumerationError = appendResult;
+                break;
+            }
+        }
+        if (enumerationError != 0) {
+            free(fileCdHashes);
+            break;
+        }
+
+        /* The fixed BASEBIN UUID is replaced in place.  Rebuild from every
+         * current mappable slice, including hashes that the status collector
+         * omitted because they were trusted by the old cache. */
+        int currentCollectionStatus = collect_current_basebin_mappable_cdhashes(
+            filePath.fileSystemRepresentation,
+            &currentFileCdHashes,
+            &currentFileCdHashCount);
+        if (currentCollectionStatus < 0) {
+            JBLogError("Failed to collect current BaseBin CDHashes for %s: %d",
+                       filePath.fileSystemRepresentation, currentCollectionStatus);
+            free(currentFileCdHashes);
+            free(fileCdHashes);
+            enumerationError = currentCollectionStatus;
+            break;
+        }
+        if (currentCollectionStatus == FILE_CDHASH_COLLECTION_SKIPPED) {
+            if (requiredIndex != NSNotFound) {
+                JBLogError("Required BaseBin image has no mappable slice: %s",
+                           filePath.fileSystemRepresentation);
+                free(currentFileCdHashes);
+                free(fileCdHashes);
+                enumerationError = -EIO;
+                break;
+            }
+            free(currentFileCdHashes);
+            free(fileCdHashes);
+            continue;
+        }
+        if (currentCollectionStatus != FILE_CDHASH_COLLECTION_COMPLETED) {
+            free(currentFileCdHashes);
+            free(fileCdHashes);
+            enumerationError = -EIO;
+            break;
+        }
+
+        for (uint32_t i = 0; i < currentFileCdHashCount; i++) {
+            int appendResult = append_unique_basebin_cdhash(
+                &basebins_cdhashes,
+                &basebins_cdhashesCount,
+                currentFileCdHashes[i]);
+            if (appendResult != 0) {
+                enumerationError = appendResult;
+                break;
+            }
+        }
+        if (enumerationError != 0) {
+            free(currentFileCdHashes);
+            free(fileCdHashes);
+            break;
+        }
+
+        if (requiredIndex != NSNotFound) {
+            if (requiredIndex >= BASEBIN_REQUIRED_IMAGE_COUNT) {
+                free(currentFileCdHashes);
+                free(fileCdHashes);
+                enumerationError = -EINVAL;
+                break;
+            }
+            requiredImages[requiredIndex].cdhashes = currentFileCdHashes;
+            requiredImages[requiredIndex].cdhashCount = currentFileCdHashCount;
+            requiredImages[requiredIndex].seen = true;
+            currentFileCdHashes = NULL;
+        }
+        free(currentFileCdHashes);
+        free(fileCdHashes);
+    }
+
+    if (enumerationError != 0) {
+        free(basebins_cdhashes);
+        free_required_basebin_images(requiredImages, requiredPathCount);
+        return enumerationError;
+    }
+
+    for (NSUInteger i = 0; i < requiredPathCount; i++) {
+        if (!requiredImages[i].seen) {
+            JBLogError("Required BaseBin image is missing: %s", requiredPaths[i].fileSystemRepresentation);
+            free(basebins_cdhashes);
+            free_required_basebin_images(requiredImages, requiredPathCount);
+            return -ENOENT;
         }
     }
 
-    if(!basebins_cdhashes) {
-        return -2;
+    if (!basebins_cdhashes || basebins_cdhashesCount == 0) {
+        free(basebins_cdhashes);
+        free_required_basebin_images(requiredImages, requiredPathCount);
+        return -EIO;
     }
 
     trustcache_file_v1 *basebinTcFile = NULL;
     int r1 = trustcache_file_build_from_cdhashes(basebins_cdhashes, basebins_cdhashesCount, &basebinTcFile);
     free(basebins_cdhashes);
     if (r1 != 0) {
+        free_required_basebin_images(requiredImages, requiredPathCount);
         return -3;
     }
 
     int r2 = trustcache_file_upload_with_uuid(basebinTcFile, BASEBIN_TRUSTCACHE_UUID);
     free(basebinTcFile);
     if (r2 != 0) {
+        free_required_basebin_images(requiredImages, requiredPathCount);
         return -4;
     }
 
+    for (NSUInteger i = 0; i < requiredPathCount; i++) {
+        for (uint32_t j = 0; j < requiredImages[i].cdhashCount; j++) {
+            if (is_cdhash_trustcached(requiredImages[i].cdhashes[j])) continue;
+            JBLogError("Required BaseBin image is not trustcached: %s",
+                       requiredPaths[i].fileSystemRepresentation);
+            free_required_basebin_images(requiredImages, requiredPathCount);
+            return -EIO;
+        }
+    }
+
+    free_required_basebin_images(requiredImages, requiredPathCount);
     return 0;
 }
 

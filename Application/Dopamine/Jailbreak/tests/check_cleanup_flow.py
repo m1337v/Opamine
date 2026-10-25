@@ -51,7 +51,7 @@ def main() -> None:
         "failed privilege elevation must retain the upstream direct-return boundary",
     )
 
-    post_exploitation_anchors = (
+    pre_launchd_failure_anchors = (
         "*errOut = [self showNonDefaultSystemApps];",
         "*errOut = [self ensureDevModeEnabled];",
         "*errOut = [[DOEnvironmentManager sharedManager] ensureJailbreakRootExists];",
@@ -59,12 +59,29 @@ def main() -> None:
         "*errOut = [[DOEnvironmentManager sharedManager] updateBootLogo];",
         "*errOut = [self loadBasebinTrustcache];",
         "*errOut = [self injectLaunchdHook];",
+    )
+    for anchor in pre_launchd_failure_anchors:
+        require_cleanup_after(run, anchor, "[self cleanUpPostExploitation];")
+
+    # Once launchd first-load succeeds, this process is intentionally retained
+    # for the direct reboot action. Process-local credential cleanup is not a
+    # rollback and can remove the only safe recovery path on iOS 17+.
+    for anchor in (
         'NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Creating fakelib failed',
         'NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Failed to upload dyld trustcache',
         "*errOut = [self finalizeBootstrapIfNeeded];",
-    )
-    for anchor in post_exploitation_anchors:
-        require_cleanup_after(run, anchor, "[self cleanUpPostExploitation];")
+    ):
+        anchor_offset = run.index(anchor)
+        next_return = run.index("return;", anchor_offset)
+        segment = run[anchor_offset:next_return]
+        require(
+            "[self errorRequiringFullRebootIfNeeded:*errOut]" in segment,
+            f"{anchor} must mark the post-launchd error reboot-required",
+        )
+        require(
+            "[self cleanUpPostExploitation];" not in segment,
+            f"{anchor} must preserve the elevated process for direct reboot",
+        )
 
     remove_branch = slice_between(
         run,

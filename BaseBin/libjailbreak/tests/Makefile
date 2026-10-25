@@ -16,6 +16,8 @@ test:
 	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) trustcache_transaction_model.py
 	@echo "== filesystem trustcache status contract =="
 	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) trustcache_fs_status_contract.py
+	@echo "== BaseBin trustcache contract =="
+	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) basebin_trustcache_contract.py
 
 json:
 	@PYTHONDONTWRITEBYTECODE=1 $(PYTHON) characterize.py --json

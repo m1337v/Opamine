@@ -266,15 +266,21 @@
         BOOL showLogs = YES;
         [jailbreaker runWithError:&error didRemoveJailbreak:&didRemove showLogs:&showLogs];
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (error && showLogs) {
+            BOOL rebootRequired = [error.userInfo[DOJailbreakerErrorRequiresFullRebootKey] boolValue];
+            // A post-launchd failure always has a log and must remain on the
+            // recovery screen even if a future caller suppresses generic logs.
+            if (error && (showLogs || rebootRequired)) {
                 [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:@"Jailbreak failed with error: %@", error] debug:NO];
-                [self.navigationController pushViewController:[[DOLogCrashViewController alloc] initWithTitle:[error localizedDescription]] animated:YES];
+                [self.navigationController pushViewController:[[DOLogCrashViewController alloc] initWithTitle:[error localizedDescription] rebootRequired:rebootRequired] animated:YES];
             }
             else if (error && !showLogs) {
                 // Used when there is an error that is explainable in such detail that additional logs are not needed
                 UIAlertController *alertController = [UIAlertController alertControllerWithTitle:DOLocalizedString(@"Log_Error") message:[error localizedDescription] preferredStyle:UIAlertControllerStyleAlert];
                 UIAlertAction *rebootAction = [UIAlertAction actionWithTitle:DOLocalizedString(@"Button_Reboot") style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                    exec_cmd_trusted(JBROOT_PATH("/sbin/reboot"), NULL);
+                    // DOEnvironmentManager uses the direct reboot3 syscall.
+                    // Do not spawn a BaseBin helper here: systemhook may be
+                    // the component that just failed to load.
+                    [[DOEnvironmentManager sharedManager] reboot];
                 }];
                 [alertController addAction:rebootAction];
                 [self presentViewController:alertController animated:YES completion:nil];

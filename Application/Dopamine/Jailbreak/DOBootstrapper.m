@@ -1064,6 +1064,178 @@ static BOOL RootHideReplaceExpectedSymlink(NSString *path, NSString *expectedDes
     return YES;
 }
 
+static BOOL RootHideIsMissingHistoricalPrimaryRoot(NSString *candidatePath)
+{
+    if (candidatePath.length == 0 || ![candidatePath hasPrefix:@"/"] ||
+        !is_jbroot_name(candidatePath.lastPathComponent.UTF8String)) {
+        return NO;
+    }
+
+    NSString *candidateParent = candidatePath.stringByDeletingLastPathComponent.stringByResolvingSymlinksInPath;
+    NSString *expectedParent = RootHidePrimaryJailbreakRootDirectory.stringByResolvingSymlinksInPath;
+    if (![candidateParent isEqualToString:expectedParent]) {
+        return NO;
+    }
+
+    struct stat st = {0};
+    if (lstat(candidatePath.fileSystemRepresentation, &st) == 0) {
+        // Never reinterpret a link to another existing root as ours.
+        return NO;
+    }
+    return errno == ENOENT;
+}
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *RootHideCollectNestedRootLinks(NSString *primaryPath, NSString *secondaryPath, NSError **errorOut)
+{
+    if (errorOut) {
+        *errorOut = nil;
+    }
+
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *links = [NSMutableArray array];
+    NSArray<NSDictionary<NSString *, NSString *> *> *roots = @[
+        @{ @"role" : @"primary", @"path" : primaryPath },
+        @{ @"role" : @"secondary", @"path" : secondaryPath },
+    ];
+
+    for (NSDictionary<NSString *, NSString *> *root in roots) {
+        NSString *rootPath = root[@"path"];
+        NSURL *rootURL = [NSURL fileURLWithPath:rootPath isDirectory:YES];
+        __block NSError *enumerationFailure = nil;
+        NSDirectoryEnumerator<NSURL *> *enumerator = [NSFileManager.defaultManager
+            enumeratorAtURL:rootURL
+            includingPropertiesForKeys:nil
+            options:0
+            errorHandler:^BOOL(NSURL *url, NSError *error) {
+                enumerationFailure = error ?: RootHideRootError([NSString stringWithFormat:@"Unable to enumerate nested RootHide links below %@.", url.path ?: rootPath]);
+                return NO;
+            }];
+        if (!enumerator) {
+            if (errorOut) {
+                *errorOut = RootHideRootError([NSString stringWithFormat:@"Unable to enumerate nested RootHide links below %@.", rootPath]);
+            }
+            return nil;
+        }
+
+        NSString *rootPrefix = [rootPath stringByAppendingString:@"/"];
+        for (NSURL *entryURL in enumerator) {
+            NSString *path = entryURL.path;
+            if (![path hasPrefix:rootPrefix]) {
+                if (errorOut) {
+                    *errorOut = RootHideRootError([NSString stringWithFormat:@"Nested RootHide enumeration escaped its owned root: %@.", path]);
+                }
+                return nil;
+            }
+            NSString *relativePath = [path substringFromIndex:rootPrefix.length];
+            struct stat st = {0};
+            if (lstat(path.fileSystemRepresentation, &st) != 0) {
+                if (errorOut) {
+                    *errorOut = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Unable to inspect nested RootHide path %@.", path]}];
+                }
+                return nil;
+            }
+            if (S_ISLNK(st.st_mode)) {
+                // Never cross a symlink while inventorying an owned root.
+                [enumerator skipDescendants];
+            }
+            if (![relativePath.lastPathComponent isEqualToString:@".jbroot"] ||
+                ([root[@"role"] isEqualToString:@"secondary"] && [relativePath isEqualToString:@".jbroot"])) {
+                continue;
+            }
+            if (!S_ISLNK(st.st_mode)) {
+                if (errorOut) {
+                    *errorOut = RootHideRootError([NSString stringWithFormat:@"Refusing to re-randomize because nested RootHide node %@ is not a symbolic link.", path]);
+                }
+                return nil;
+            }
+
+            NSError *linkError = nil;
+            NSString *destination = [NSFileManager.defaultManager destinationOfSymbolicLinkAtPath:path error:&linkError];
+            NSString *destinationCandidate = destination;
+            if (destination && ![destination hasPrefix:@"/"]) {
+                destinationCandidate = [path.stringByDeletingLastPathComponent stringByAppendingPathComponent:destination];
+            }
+            NSString *resolvedDestination = destinationCandidate.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+            NSString *resolvedPrimary = primaryPath.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+            BOOL pointsToActiveRoot = destination && [resolvedDestination isEqualToString:resolvedPrimary];
+            BOOL pointsToMissingHistoricalRoot = destination && RootHideIsMissingHistoricalPrimaryRoot(destinationCandidate.stringByStandardizingPath);
+            if (!pointsToActiveRoot && !pointsToMissingHistoricalRoot) {
+                if (errorOut) {
+                    *errorOut = linkError ?: RootHideRootError([NSString stringWithFormat:@"Refusing to re-randomize because nested RootHide link %@ does not refer to the active randomized root.", path]);
+                }
+                return nil;
+            }
+            [links addObject:@{ @"role" : root[@"role"], @"relativePath" : relativePath, @"oldDestination" : destination }];
+        }
+        if (enumerationFailure) {
+            if (errorOut) {
+                *errorOut = enumerationFailure;
+            }
+            return nil;
+        }
+    }
+    return links;
+}
+
+static NSString *RootHideNestedLinkPath(NSDictionary<NSString *, NSString *> *record, NSString *primaryPath, NSString *secondaryPath)
+{
+    NSString *rootPath = [record[@"role"] isEqualToString:@"primary"] ? primaryPath : secondaryPath;
+    return [rootPath stringByAppendingPathComponent:record[@"relativePath"]];
+}
+
+static BOOL RootHideEnsureExpectedSymlink(NSString *path, NSString *destination, NSString *missingDestination, NSError **errorOut)
+{
+    RootHideLinkState state = RootHideLinkStateAtPath(path, destination);
+    if (state == RootHideLinkStateExpected) {
+        return YES;
+    }
+    if (state == RootHideLinkStateUnexpected) {
+        NSError *linkError = nil;
+        NSString *rawDestination = [NSFileManager.defaultManager destinationOfSymbolicLinkAtPath:path error:&linkError];
+        if (rawDestination) {
+            NSString *candidate = [rawDestination hasPrefix:@"/"]
+                ? rawDestination
+                : [path.stringByDeletingLastPathComponent stringByAppendingPathComponent:rawDestination];
+            NSString *resolvedCandidate = candidate.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+            NSString *resolvedExpected = destination.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+            if ([resolvedCandidate isEqualToString:resolvedExpected]) {
+                return YES;
+            }
+        }
+        if (errorOut) {
+            *errorOut = RootHideRootError([NSString stringWithFormat:@"Refusing to replace unexpected critical RootHide loader link %@.", path]);
+        }
+        return NO;
+    }
+    return [NSFileManager.defaultManager createSymbolicLinkAtPath:path withDestinationPath:missingDestination error:errorOut];
+}
+
+static BOOL RootHideEnsureCriticalLoaderLinks(NSString *primaryPath, NSError **errorOut)
+{
+    if (errorOut) {
+        *errorOut = nil;
+    }
+    NSArray<NSDictionary<NSString *, NSString *> *> *relativeDirectories = @[
+        @{ @"path" : @"basebin", @"rootLink" : @".." },
+        @{ @"path" : @"usr/lib", @"rootLink" : @"../.." },
+        @{ @"path" : @"usr/libexec", @"rootLink" : @"../.." },
+    ];
+    for (NSDictionary<NSString *, NSString *> *entry in relativeDirectories) {
+        NSString *relativeDirectory = entry[@"path"];
+        NSString *directory = [primaryPath stringByAppendingPathComponent:relativeDirectory];
+        if (!RootHideDirectoryExists(directory)) {
+            if (errorOut) {
+                *errorOut = RootHideRootError([NSString stringWithFormat:@"Critical RootHide loader directory %@ is missing.", directory]);
+            }
+            return NO;
+        }
+        NSString *linkPath = [directory stringByAppendingPathComponent:@".jbroot"];
+        if (!RootHideEnsureExpectedSymlink(linkPath, primaryPath, entry[@"rootLink"], errorOut)) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
 static NSString *RootHideDiscoverAndRecoverOwnedJailbreakRoot(NSError **errorOut)
 {
     NSError *discoveryError = nil;
@@ -1416,6 +1588,13 @@ int getCFMajorVersion(void)
     BOOL movedSecondary = NO;
     BOOL rewrotePrimaryPrivateVar = NO;
     BOOL rewroteSecondaryRoot = NO;
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *rewrittenNestedLinks = [NSMutableArray array];
+
+    NSArray<NSDictionary<NSString *, NSString *> *> *nestedRootLinks = RootHideCollectNestedRootLinks(oldPrimaryPath, oldSecondaryPath, &operationError);
+    if (!nestedRootLinks) {
+        completion(operationError ?: RootHideRootError(@"Unable to inventory nested RootHide links before re-randomization."));
+        return -1;
+    }
 
     if (![fileManager moveItemAtPath:oldPrimaryPath toPath:newPrimaryPath error:&operationError]) {
         completion(operationError);
@@ -1441,6 +1620,31 @@ int getCFMajorVersion(void)
     }
     rewroteSecondaryRoot = YES;
 
+    for (NSDictionary<NSString *, NSString *> *record in nestedRootLinks) {
+        NSString *path = RootHideNestedLinkPath(record, newPrimaryPath, newSecondaryPath);
+        NSString *oldDestination = record[@"oldDestination"];
+        if (RootHideLinkStateAtPath(path, oldDestination) != RootHideLinkStateExpected) {
+            operationError = RootHideRootError([NSString stringWithFormat:@"Nested RootHide link changed during re-randomization: %@.", path]);
+            goto rollback;
+        }
+        if (![oldDestination hasPrefix:@"/"]) {
+            // Preserve a relative bootstrap link only after proving it still
+            // resolves to the new primary root in the moved pair. This keeps
+            // portable links such as ../.. intact without accepting a
+            // relative path that embeds the now-missing old randomized name.
+            NSString *candidate = [path.stringByDeletingLastPathComponent stringByAppendingPathComponent:oldDestination];
+            NSString *resolvedCandidate = candidate.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+            NSString *resolvedNewPrimary = newPrimaryPath.stringByStandardizingPath.stringByResolvingSymlinksInPath;
+            if ([resolvedCandidate isEqualToString:resolvedNewPrimary]) {
+                continue;
+            }
+        }
+        if (!RootHideReplaceExpectedSymlink(path, oldDestination, newPrimaryPath, &operationError)) {
+            goto rollback;
+        }
+        [rewrittenNestedLinks addObject:record];
+    }
+
     RootHideSetCachedJailbreakRoot(newPrimaryPath);
     if (!find_jbroot(YES)) {
         operationError = RootHideRootError(@"Re-randomized RootHide root failed paired-root validation.");
@@ -1454,6 +1658,13 @@ rollback:
     // Restore the old link destinations before moving either root back. Every
     // replacement is guarded by its expected destination, so rollback cannot
     // overwrite a path that changed outside this transaction.
+    for (NSDictionary<NSString *, NSString *> *record in rewrittenNestedLinks.reverseObjectEnumerator) {
+        NSError *rollbackLinkError = nil;
+        NSString *path = RootHideNestedLinkPath(record, newPrimaryPath, newSecondaryPath);
+        if (!RootHideReplaceExpectedSymlink(path, newPrimaryPath, record[@"oldDestination"], &rollbackLinkError) && !operationError) {
+            operationError = rollbackLinkError;
+        }
+    }
     if (rewroteSecondaryRoot) {
         NSError *rollbackLinkError = nil;
         if (!RootHideReplaceExpectedSymlink([newSecondaryPath stringByAppendingPathComponent:@".jbroot"], newPrimaryPath, oldPrimaryPath, &rollbackLinkError) && !operationError) {
@@ -1635,6 +1846,12 @@ rollback:
         }
         [self patchBasebinDaemonPlists];
         [[NSFileManager defaultManager] removeItemAtPath:jbrootPrefix(@"/basebin/basebin.tc") error:nil];
+
+        NSError *loaderLinkError = nil;
+        if (!RootHideEnsureCriticalLoaderLinks(jbrootPrefix(@"/"), &loaderLinkError)) {
+            completion(loaderLinkError ?: RootHideRootError(@"Failed to establish critical RootHide loader links."));
+            return;
+        }
 
         NSError *identityError = RootHideWriteCurrentAppIdentifier(jbrootPrefix(@"/"));
         if (identityError) {
