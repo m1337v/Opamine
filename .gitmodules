@@ -13,6 +13,3 @@
 [submodule "BaseBin/_external/modules/litehook"]
 	path = BaseBin/_external/modules/litehook
 	url = https://github.com/opa334/litehook
-[submodule "Vendor/Sileo"]
-	path = Vendor/Sileo
-	url = https://github.com/m1337v/Sileo-roothide.git

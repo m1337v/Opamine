@@ -10,7 +10,6 @@ cd /Users/a1337/Downloads/dev/_JB/roothide/Resources/Opamine-rh-refresh
 
 - Xcode 16.4 with the iOS 18.5 SDK and an installed iOS device platform.
 - `xcodebuild`, `clang`, and Procursus `ldid`.
-- `python3` and initialized Git submodules for the pinned Sileo source build.
 - A `trustcache` executable. `BaseBin/Makefile` searches `BaseBin/trustcache`, the sibling `Opamine-dopamine/BaseBin/trustcache`, then `$PATH`.
 - `libarchive` for `libjailbreak` and `dpkg-deb` for the package targets.
 - Theos for `rootlesshooks`, `roothidehooks`, and the bundled `palera1n` framework. `opainject` is a standalone clang target and does not use Theos.
@@ -44,22 +43,24 @@ make -C Application   # Dopamine.ipa and a copy named Dopamine.tipa
 
 There are no root targets named `full`, `basebin`, `packages`, or `tipa`; use the component-directory commands above. `make clean` cleans BaseBin, Packages, and Application outputs.
 
-## Vendored Sileo
+## Bundled Sileo
 
-Sileo is built from the `Vendor/Sileo` submodule at fork revision `d69f8cf26219a0af195460d5282d8fd524adf7c9`, with RootHide upstream pinned at `84645de5fee6edeb2a1ce5c4f8a97abf9755c5d1`. `Vendor/sileo.lock.json` records the source revisions, package identity, architecture, and package version. Initialize and validate the pinned checkout with:
+`Application/Dopamine/Resources/sileo.deb` is a committed release binary from
+[m1337v/Sileo-roothide nightly](https://github.com/m1337v/Sileo-roothide/releases/tag/nightly),
+using the `iphoneos-arm64e` (RootHide) asset. Opamine embeds it directly; its build
+never builds Sileo. The fork is updated to RootHide Sileo 2.5.1-14 and removes
+`CFBundleURLTypes` from `Info.plist`, preserving query schemes such as `filza`.
 
-```sh
-git submodule update --init --recursive
-python3 Scripts/build_vendored_sileo.py --verify-source
-```
+Current package: `2.5.1-14+opamine1`, fork commit
+`d69f8cf26219a0af195460d5282d8fd524adf7c9` (RootHide upstream
+`84645de5fee6edeb2a1ce5c4f8a97abf9755c5d1`). SHA-256:
+`0ab49a080239999fc756110bd3e39096f1d696c3b30222f2031244bb6b1d176e`.
+The fork also has a per-file compiler flag to avoid an unavailable `memrchr`
+symbol; upstream C/Swift application logic is unchanged.
 
-The Sileo builder exports the pinned source to an isolated build directory, resolves its locked Swift package dependencies, builds the `iphoneos-arm64e` package, and verifies it before copying it to `Application/Dopamine/Resources/sileo.deb`. It does not download a prebuilt Sileo package. `make -C Application` generates this file before Xcode builds the Dopamine app; the generated `.deb` is ignored by Git. The source check permits the URL-registration removal while requiring the upstream `LSApplicationQueriesSchemes` value to remain unchanged.
-
-The expected Sileo Debian package is `org.coolstar.sileo` version `2.5.1-14+opamine1` for `iphoneos-arm64e`; its app marketing version remains `2.5.1-14`. Verify the generated package with:
-
-```sh
-python3 Scripts/build_vendored_sileo.py --verify-package Application/Dopamine/Resources/sileo.deb
-```
+To update it, download the fork's RootHide nightly `.deb`, replace the committed
+resource, and align `SILEO_BUNDLED_VERSION`, the package checks, and the pinned
+URL/checksum in `Scripts/build-fork-packages.sh`.
 
 ## RootHide 3 BaseBin layout
 

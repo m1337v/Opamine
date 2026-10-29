@@ -92,7 +92,6 @@ require_tool dpkg-deb
 require_tool ar
 require_tool gtar
 require_tool perl
-require_tool python3
 require_tool shasum
 require_tool zstd
 
@@ -154,7 +153,15 @@ require_package "$roothide_output" roothide "$roothide_fork_version"
 
 mv "$roothide_output" "$resource_dir/roothide.deb"
 
-python3 "$repo_root/Scripts/build_vendored_sileo.py"
+# Refresh the vendored RootHide package directly from our Sileo fork.
+sileo_input="$work_dir/sileo.deb"
+curl -fsSL 'https://github.com/m1337v/Sileo-roothide/releases/download/nightly/org.coolstar.sileo_2.5.1-14%2Bopamine1_iphoneos-arm64e.deb' -o "$sileo_input"
+[ "$(sha256_file "$sileo_input")" = '0ab49a080239999fc756110bd3e39096f1d696c3b30222f2031244bb6b1d176e' ] || {
+	echo "Sileo fork release checksum mismatch" >&2
+	exit 1
+}
+require_package "$sileo_input" org.coolstar.sileo '2.5.1-14+opamine1'
+mv "$sileo_input" "$resource_dir/sileo.deb"
 
 echo "Sileo: $(dpkg-deb -f "$resource_dir/sileo.deb" Version) $(sha256_file "$resource_dir/sileo.deb")"
 echo "RootHide Core: $(dpkg-deb -f "$resource_dir/roothide.deb" Version) $(sha256_file "$resource_dir/roothide.deb")"

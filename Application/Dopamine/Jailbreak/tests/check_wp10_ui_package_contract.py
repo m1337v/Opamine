@@ -5,11 +5,8 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import plistlib
-import re
 import subprocess
-import sys
 import tarfile
 from pathlib import Path
 
@@ -20,8 +17,6 @@ BOOTSTRAPPER = ROOT / "Application/Dopamine/Jailbreak/DOBootstrapper.m"
 PROJECT = ROOT / "Application/Dopamine.xcodeproj/project.pbxproj"
 INFO = ROOT / "Application/Dopamine/Info.plist"
 SILEO_DEB = ROOT / "Application/Dopamine/Resources/sileo.deb"
-SILEO_LOCK = ROOT / "Vendor/sileo.lock.json"
-SILEO_BUILDER = ROOT / "Scripts/build_vendored_sileo.py"
 ROOTHIDE_DEB = ROOT / "Application/Dopamine/Resources/roothide.deb"
 BOOTSTRAP = ROOT / "Application/Dopamine/Resources/bootstrap_1900.tar.zst"
 
@@ -51,25 +46,11 @@ def bootstrap_member(member_name: str) -> bytes:
         return entry.read()
 
 
-def verify_vendored_sileo(mode: str, package: Path | None = None) -> None:
-    command = [sys.executable, str(SILEO_BUILDER), mode]
-    if package is not None:
-        command.append(str(package))
-    result = subprocess.run(command, text=True, capture_output=True)
-    require(result.returncode == 0,
-            f"vendored Sileo verification failed ({mode}): {(result.stdout + result.stderr).strip()}")
-
-
 def main() -> None:
     settings = SETTINGS.read_text(encoding="utf-8")
     bootstrapper = BOOTSTRAPPER.read_text(encoding="utf-8")
     project = PROJECT.read_text(encoding="utf-8")
     info = plistlib.loads(INFO.read_bytes())
-    sileo_lock = json.loads(SILEO_LOCK.read_text(encoding="utf-8"))
-
-    sileo_macro = re.search(r'(?m)^#define SILEO_BUNDLED_VERSION @"([^\"]+)"', bootstrapper)
-    require(sileo_macro is not None and sileo_macro.group(1) == sileo_lock["package_version"],
-            "Sileo bundled-version macro must match the pinned vendor manifest")
 
     require("PRODUCT_BUNDLE_IDENTIFIER = com.m1337v.Opamine;" in project,
             "Opamine app bundle identity changed")
@@ -79,11 +60,8 @@ def main() -> None:
             "boot-logo photo picker must retain its TCC usage string")
 
     require(SILEO_DEB.is_file() and ROOTHIDE_DEB.is_file(), "bundled fork package missing")
-    verify_vendored_sileo("--verify-source")
-    verify_vendored_sileo("--verify-package", SILEO_DEB)
-    require(field(SILEO_DEB, "Package") == sileo_lock["package_id"], "Sileo package identity changed")
-    require(field(SILEO_DEB, "Version") == sileo_lock["package_version"], "Sileo fork version changed")
-    require(field(SILEO_DEB, "Architecture") == sileo_lock["architecture"], "Sileo package architecture changed")
+    require(field(SILEO_DEB, "Package") == "org.coolstar.sileo", "Sileo package identity changed")
+    require(field(SILEO_DEB, "Version") == "2.5.1-14+opamine1", "Sileo fork version changed")
     require(field(ROOTHIDE_DEB, "Package") == "roothide", "RootHide core package identity changed")
     require(field(ROOTHIDE_DEB, "Version") == "0.1.0-0+opamine1", "RootHide core fork guard changed")
 

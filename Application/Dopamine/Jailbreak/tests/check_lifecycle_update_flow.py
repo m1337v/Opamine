@@ -5,7 +5,6 @@ BaseBin internals moved to the separate libroothider implementation and are
 tested by its owner. This keeps the app contracts at that boundary explicit.
 """
 
-import json
 from pathlib import Path
 import re
 
@@ -21,7 +20,6 @@ UI_MANAGER = ROOT / "Application/Dopamine/UI/DOUIManager.m"
 UPDATE_VIEW = ROOT / "Application/Dopamine/UI/Update/DOUpdateViewController.m"
 VERSION = ROOT / "BaseBin/_external/basebin/.version"
 ROOTHIDE_VERSION = ROOT / "BaseBin/_external/basebin/.version-roothide"
-SILEO_LOCK = ROOT / "Vendor/sileo.lock.json"
 
 
 def require(condition: bool, message: str) -> None:
@@ -47,13 +45,9 @@ def main() -> None:
     bootstrapper = BOOTSTRAPPER.read_text(encoding="utf-8")
     ui_manager = UI_MANAGER.read_text(encoding="utf-8")
     update_view = UPDATE_VIEW.read_text(encoding="utf-8")
-    sileo_package_version = json.loads(SILEO_LOCK.read_text(encoding="utf-8"))["package_version"]
 
     require(VERSION.read_text(encoding="utf-8").strip() == "3.0.12", "unexpected 3.x basebin version")
     require(ROOTHIDE_VERSION.read_text(encoding="utf-8").strip() == "29+opamine1", "RootHide fork revision lost")
-    sileo_macro = re.search(r'(?m)^#define SILEO_BUNDLED_VERSION @"([^\"]+)"', bootstrapper)
-    require(sileo_macro is not None and sileo_macro.group(1) == sileo_package_version,
-            "Sileo package identity version must match the pinned vendor manifest")
     require('JBROOT_PATH(@"/basebin/.version-roothide")' in environment,
             "app must read the RootHide revision from the active randomized root")
 
