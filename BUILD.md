@@ -46,7 +46,7 @@ There are no root targets named `full`, `basebin`, `packages`, or `tipa`; use th
 
 ## Vendored Sileo
 
-Sileo is built from the `Vendor/Sileo` submodule at fork revision `cac1f2bde2ee6bb2b984a1cf99857ec79037fa0f`, with RootHide upstream pinned at `84645de5fee6edeb2a1ce5c4f8a97abf9755c5d1`. `Vendor/sileo.lock.json` records the source revisions, package identity, architecture, and package version. Initialize and validate the pinned checkout with:
+Sileo is built from the `Vendor/Sileo` submodule at fork revision `d69f8cf26219a0af195460d5282d8fd524adf7c9`, with RootHide upstream pinned at `84645de5fee6edeb2a1ce5c4f8a97abf9755c5d1`. `Vendor/sileo.lock.json` records the source revisions, package identity, architecture, and package version. Initialize and validate the pinned checkout with:
 
 ```sh
 git submodule update --init --recursive

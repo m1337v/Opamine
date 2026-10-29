@@ -26,6 +26,7 @@ SOURCE_ROOT = REPO_ROOT / "Vendor/Sileo"
 MANIFEST_PATH = REPO_ROOT / "Vendor/sileo.lock.json"
 SOURCE_INFO_PATH = Path("Sileo/Info.plist")
 SOURCE_INFO = SOURCE_ROOT / SOURCE_INFO_PATH
+SOURCE_PROJECT_PATH = Path("Sileo.xcodeproj/project.pbxproj")
 DESTINATION = REPO_ROOT / "Application/Dopamine/Resources/sileo.deb"
 BUILD_ROOT = REPO_ROOT / ".build"
 BUILD_TMP = BUILD_ROOT / "sileo"
@@ -135,11 +136,24 @@ def verify_source(lock: dict[str, str]) -> dict[str, Any]:
         ".",
         ":(exclude).github",
     ).splitlines()
-    if source_delta != [SOURCE_INFO_PATH.as_posix()]:
+    if set(source_delta) != {SOURCE_INFO_PATH.as_posix(), SOURCE_PROJECT_PATH.as_posix()}:
         raise fail(
             "pinned Sileo fork has unexpected source changes outside .github; "
-            f"expected only {SOURCE_INFO_PATH.as_posix()}, got {source_delta}"
+            f"expected only its Info.plist and checked compiler compatibility flag, got {source_delta}"
         )
+
+    upstream_project = run_checked_bytes(
+        ["git", "-C", str(SOURCE_ROOT), "show", f"{lock['upstream_revision']}:{SOURCE_PROJECT_PATH.as_posix()}"]
+    )
+    # Preserve the upstream comparator's C behavior. Clang otherwise optimizes
+    # its strrchr call into an unavailable memrchr symbol for iOS. Permit only
+    # this exact per-file compiler setting, never arbitrary project changes.
+    pattern = rb"(?m)^(\s*[A-F0-9]{24} /\* dpkgversion\.c in Sources \*/ = \{isa = PBXBuildFile; fileRef = [A-F0-9]{24} /\* dpkgversion\.c \*/; )\};$"
+    expected_project, count = re.subn(
+        pattern, rb'\1settings = {COMPILER_FLAGS = "-fno-builtin-strrchr"; }; };', upstream_project
+    )
+    if count != 3 or (SOURCE_ROOT / SOURCE_PROJECT_PATH).read_bytes() != expected_project:
+        raise fail("Sileo Xcode project differs beyond the checked dpkgversion.c compiler flag")
 
     status = run_git("status", "--porcelain", "--untracked-files=no")
     if status:

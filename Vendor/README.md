@@ -13,12 +13,16 @@ upstream Sileo build intentionally produces an arm64 iOS executable.
 
 ## Intended difference
 
-Outside the fork's GitHub workflows, the only source-tree difference from the
-pinned upstream commit is `Sileo/Info.plist`. Structurally, that plist differs
+The only application-code difference from the pinned upstream commit is
+`Sileo/Info.plist`. Structurally, that plist differs
 only by removal of URL registration keys (`CFBundleURLTypes`, including its
 nested `sileo` scheme). `LSApplicationQueriesSchemes`, including `filza`, document
 types, bundle identity, and all other settings remain unchanged. The builder
-checks this invariant against the actual pinned Git objects.
+checks this invariant against the actual pinned Git objects. A separate,
+exactly checked Xcode per-file flag disables the `strrchr` builtin for
+`dpkgversion.c`: optimized builds otherwise reference an unavailable `memrchr`
+symbol. The upstream C comparator and its behavior remain unchanged. No other
+source or project differences are permitted outside GitHub workflows.
 
 The updated fork replaces its stale build workarounds with upstream's versions
 and removes an obsolete generated `data.tar.xz`. Fork workflows retain their own

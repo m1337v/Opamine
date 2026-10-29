@@ -224,6 +224,20 @@ raise SystemExit(module.main())
             "failed CLI build replaced the existing temporary destination")
 
 
+def test_comparator_link_compatibility(temp: Path) -> None:
+    sdk = subprocess.check_output(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], text=True).strip()
+    output = temp / "dpkgversion.o"
+    source = BUILDER.SOURCE_ROOT / "Sileo/Backend/C Contrib/dpkgversion.c"
+    subprocess.run([
+        "xcrun", "--sdk", "iphoneos", "clang", "-O3", "-fno-builtin-strrchr",
+        "-arch", "arm64", "-target", "arm64-apple-ios15.0", "-isysroot", sdk,
+        "-c", str(source), "-o", str(output),
+    ], check=True)
+    symbols = subprocess.check_output(["nm", "-u", str(output)], text=True).split()
+    require("_memrchr" not in symbols and "_strrchr" in symbols,
+            "the optimized comparator must use the available strrchr function")
+
+
 def main() -> int:
     lock = BUILDER.load_lock()
     with tempfile.TemporaryDirectory(prefix="sileo-vendor-contract-") as directory:
@@ -233,6 +247,7 @@ def main() -> int:
         test_macho_platforms()
         test_ios_adapter(temp)
         test_packages(temp, lock, source_info)
+        test_comparator_link_compatibility(temp)
         with tempfile.TemporaryDirectory(prefix="sileo-vendor-cli-") as cli_directory:
             test_cli_failure(Path(cli_directory))
     print(f"PASS: Sileo vendor builder contract ({CHECKS} checks)")
