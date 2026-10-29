@@ -252,9 +252,11 @@ def test_parent_build_flavor(temp: Path, lock: dict[str, str]) -> None:
         BUILDER.run_checked, BUILDER.BUILD_TMP = original_run, original_tmp
     overrides = [argument for argument in command if "=" in argument]
     goal = 'print-vendor-config: ; @printf "%s\\n" "$(SILEO_ID)|$(SILEO_APP)|$(BUILD_CONFIG)|$(PREFIX)|$(ARCH)"'
+    probe = temp / "vendor-config.mk"
+    probe.write_text(goal + "\n")
     actual = subprocess.check_output(
         ["make", "-s", "--no-print-directory", "-C", str(BUILDER.SOURCE_ROOT),
-         "--eval", goal, "print-vendor-config", *overrides],
+         "-f", "Makefile", "-f", str(probe), "print-vendor-config", *overrides],
         env=dict(os.environ, NIGHTLY="1", BETA="1", DEBUG="1"), text=True,
     ).strip()
     require(actual == "org.coolstar.sileo|Sileo.app|Release||arm64",
