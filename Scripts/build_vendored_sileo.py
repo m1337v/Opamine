@@ -528,6 +528,10 @@ def build_package(lock: dict[str, str], source_root: Path) -> Path:
         *make_command,
         "package",
         "SILEO_PLATFORM=iphoneos-arm64e",
+        # Opamine exports NIGHTLY. Its build flavor must not change the
+        # identity, layout, or configuration of this stable dependency.
+        "NIGHTLY=0", "BETA=0", "AUTOMATION=0", "DEBUG=0", "MAC=0",
+        "ARCH=arm64", "PREFIX=", "ALL_BOOTSTRAPS=1",
         f"SILEO_VERSION={lock['package_version']}",
         f"SILEOTMP={BUILD_TMP}",
     ]

@@ -238,6 +238,29 @@ def test_comparator_link_compatibility(temp: Path) -> None:
             "the optimized comparator must use the available strrchr function")
 
 
+def test_parent_build_flavor(temp: Path, lock: dict[str, str]) -> None:
+    command = []
+    original_run, original_tmp = BUILDER.run_checked, BUILDER.BUILD_TMP
+    def capture(arguments, **options):
+        command.extend(arguments)
+        return subprocess.CompletedProcess(arguments, 0)
+    try:
+        BUILDER.run_checked = capture
+        BUILDER.BUILD_TMP = temp / "flavor-cache"
+        BUILDER.build_package(lock, BUILDER.SOURCE_ROOT)
+    finally:
+        BUILDER.run_checked, BUILDER.BUILD_TMP = original_run, original_tmp
+    overrides = [argument for argument in command if "=" in argument]
+    goal = 'print-vendor-config: ; @printf "%s\\n" "$(SILEO_ID)|$(SILEO_APP)|$(BUILD_CONFIG)|$(PREFIX)|$(ARCH)"'
+    actual = subprocess.check_output(
+        ["make", "-s", "--no-print-directory", "-C", str(BUILDER.SOURCE_ROOT),
+         "--eval", goal, "print-vendor-config", *overrides],
+        env=dict(os.environ, NIGHTLY="1", BETA="1", DEBUG="1"), text=True,
+    ).strip()
+    require(actual == "org.coolstar.sileo|Sileo.app|Release||arm64",
+            f"parent build flavor changed the stable Sileo configuration: {actual}")
+
+
 def main() -> int:
     lock = BUILDER.load_lock()
     with tempfile.TemporaryDirectory(prefix="sileo-vendor-contract-") as directory:
@@ -248,6 +271,7 @@ def main() -> int:
         test_ios_adapter(temp)
         test_packages(temp, lock, source_info)
         test_comparator_link_compatibility(temp)
+        test_parent_build_flavor(temp, lock)
         with tempfile.TemporaryDirectory(prefix="sileo-vendor-cli-") as cli_directory:
             test_cli_failure(Path(cli_directory))
     print(f"PASS: Sileo vendor builder contract ({CHECKS} checks)")
