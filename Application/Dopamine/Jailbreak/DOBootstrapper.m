@@ -25,7 +25,7 @@
 #define LIBROOT_DOPAMINE_BUNDLED_VERSION @"1.0.1"
 #define BASEBIN_LINK_BUNDLED_VERSION @"1.0.0"
 #define ROOTHIDE_CORE_BUNDLED_VERSION @"0.1.0-0+opamine1"
-#define SILEO_BUNDLED_VERSION @"2.5.1-13+opamine1"
+#define SILEO_BUNDLED_VERSION @"2.5.1-14+opamine1"
 
 static NSDictionary *gBundledPackages = @{
     @"libkrw0-dopamine" : LIBKRW_DOPAMINE_BUNDLED_VERSION,

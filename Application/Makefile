@@ -1,8 +1,8 @@
-.PHONY: all clean build_clean
+.PHONY: all clean build_clean FORCE
 
 all: Dopamine.ipa
 
-Dopamine.ipa: ../BaseBin/basebin.tar build/Build/Products/Debug-iphoneos/Dopamine.app
+Dopamine.ipa: ../BaseBin/basebin.tar Dopamine/Resources/sileo.deb build/Build/Products/Debug-iphoneos/Dopamine.app
 	@echo Ad-Hoc signing Dopamine
 	xattr -rc build/Build/Products/Debug-iphoneos/Dopamine.app
 	ldid -SDopamine/Dopamine.entitlements build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine
@@ -15,11 +15,14 @@ Dopamine.ipa: ../BaseBin/basebin.tar build/Build/Products/Debug-iphoneos/Dopamin
 	rm -rf Dopamine.tipa
 	cp Dopamine.ipa Dopamine.tipa
 
+Dopamine/Resources/sileo.deb: FORCE
+	python3 ../Scripts/build_vendored_sileo.py
+
 ifeq ($(NIGHTLY), 1)
-build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar FORCE
+build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar Dopamine/Resources/sileo.deb FORCE
 	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO GCC_PREPROCESSOR_DEFINITIONS='NIGHTLY=1 COMMIT_HASH=\"$(COMMIT_HASH)\"'
 else
-build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar FORCE
+build/Build/Products/Debug-iphoneos/Dopamine.app: ../BaseBin/basebin.tar Dopamine/Resources/sileo.deb FORCE
 	xcodebuild -scheme Dopamine -derivedDataPath build -destination 'generic/platform=iOS' CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
 endif
 	touch build/Build/Products/Debug-iphoneos/Dopamine.app/Dopamine.roothide

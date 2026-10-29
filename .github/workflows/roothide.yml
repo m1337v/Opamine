@@ -107,6 +107,18 @@ jobs:
           mv ./Application/Dopamine.tipa "./Application/${asset_name}"
           echo "version=${VERSION}" >> $GITHUB_ENV
 
+      - name: Verify vendored Sileo and integration contracts
+        run: |
+          set -euo pipefail
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 Scripts/build_vendored_sileo.py --verify-source
+          python3 Scripts/build_vendored_sileo.py --verify-package Application/Dopamine/Resources/sileo.deb
+          python3 Scripts/tests/test_sileo_vendor.py
+          for contract in Application/Dopamine/Jailbreak/tests/check_*.py; do
+            python3 "$contract"
+          done
+          python3 BaseBin/libroothider/tests/process_force_dyld_patch_contract.py
+
       - name: Create or Update Release and Upload Asset
         id: create_release
         uses: softprops/action-gh-release@v1

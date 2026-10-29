@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "fork_repository": "https://github.com/m1337v/Sileo-roothide.git",
+  "fork_revision": "cac1f2bde2ee6bb2b984a1cf99857ec79037fa0f",
+  "upstream_repository": "https://github.com/roothide/Sileo-roothide.git",
+  "upstream_revision": "84645de5fee6edeb2a1ce5c4f8a97abf9755c5d1",
+  "package_id": "org.coolstar.sileo",
+  "package_version": "2.5.1-14+opamine1",
+  "marketing_version": "2.5.1-14",
+  "bundle_identifier": "org.coolstar.SileoStore",
+  "architecture": "iphoneos-arm64e",
+  "runtime_change": "Remove CFBundleURLTypes from Sileo/Info.plist; preserve LSApplicationQueriesSchemes"
+}

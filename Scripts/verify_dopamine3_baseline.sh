@@ -88,7 +88,23 @@ check_deb() {
 	fi
 }
 
-for tool in git awk grep shasum stat od plutil xcodebuild xcrun dpkg-deb tar make; do require_tool "$tool"; done
+check_vendored_sileo() {
+	sileo_deb="$repo_root/Application/Dopamine/Resources/sileo.deb"
+	if python3 "$repo_root/Scripts/build_vendored_sileo.py" --verify-source; then
+		pass "vendored Sileo source and upstream-only Info.plist delta"
+	else
+		fail "vendored Sileo source verification"
+	fi
+	if [ ! -f "$sileo_deb" ]; then
+		fail "missing generated Sileo package artifact: $sileo_deb"
+	elif python3 "$repo_root/Scripts/build_vendored_sileo.py" --verify-package "$sileo_deb"; then
+		pass "generated Sileo package metadata and payload"
+	else
+		fail "generated Sileo package verification"
+	fi
+}
+
+for tool in git awk grep shasum stat od plutil xcodebuild xcrun dpkg-deb tar make python3; do require_tool "$tool"; done
 
 baseline_commit=${BASELINE_COMMIT:-1b40dbdb17ff60e106d91ce87c0da249923aa31f}
 actual_head=$(git -C "$repo_root" rev-parse HEAD)
@@ -133,14 +149,14 @@ fi
 
 current_basebin_version=$(tr -d '\r\n' < "$repo_root/BaseBin/_external/basebin/.version" 2>/dev/null || true)
 current_roothide_version=$(tr -d '\r\n' < "$repo_root/BaseBin/_external/basebin/.version-roothide" 2>/dev/null || true)
-planned_release_version=${EXPECTED_RELEASE_VERSION:-3.0.12-28+opamine1}
+planned_release_version=${EXPECTED_RELEASE_VERSION:-3.0.12-29+opamine1}
 current_release_version="$current_basebin_version-$current_roothide_version"
 if [ "$current_basebin_version" = "3.0.12" ] &&
-	[ "$current_roothide_version" = "28+opamine1" ] &&
+	[ "$current_roothide_version" = "29+opamine1" ] &&
 	[ "$current_release_version" = "$planned_release_version" ]; then
 	pass "planned Opamine release version $current_release_version"
 else
-	fail "release version expected $planned_release_version (.version 3.0.12, .version-roothide 28+opamine1), got ${current_release_version:-missing}"
+	fail "release version expected $planned_release_version (.version 3.0.12, .version-roothide 29+opamine1), got ${current_release_version:-missing}"
 fi
 
 source_contains BaseBin/Makefile 'subprojects: roothidehooks libroothider jailbreakd bootstrapper'
@@ -153,24 +169,25 @@ done
 
 basebin_archive="$repo_root/BaseBin/basebin.tar"
 if [ -f "$basebin_archive" ]; then
-	archive_entries=$(tar -tf "$basebin_archive")
-	for runtime_image in libroothider.dylib \
-		dyldhook_merge.arm64e.iOS15.dylib dyldhook_merge.arm64.iOS15.dylib \
-		dyldhook_merge.arm64e.iOS16-17.dylib dyldhook_merge.arm64.iOS16-17.dylib \
-		dyldhook_merge.arm64e.iOS18+.dylib dyldhook_merge.arm64.iOS18+.dylib; do
-		if printf '%s\n' "$archive_entries" | awk -F/ -v image="$runtime_image" '$NF == image { found = 1 } END { exit !found }'; then
-			pass "basebin.tar contains $runtime_image"
-		else
-			fail "basebin.tar is missing required runtime image $runtime_image"
-		fi
-	done
+	if archive_entries=$(tar -tf "$basebin_archive"); then
+		for runtime_image in libroothider.dylib \
+			dyldhook_merge.arm64e.iOS15.dylib dyldhook_merge.arm64.iOS15.dylib \
+			dyldhook_merge.arm64e.iOS16-17.dylib dyldhook_merge.arm64.iOS16-17.dylib \
+			dyldhook_merge.arm64e.iOS18+.dylib dyldhook_merge.arm64.iOS18+.dylib; do
+			if printf '%s\n' "$archive_entries" | awk -F/ -v image="$runtime_image" '$NF == image { found = 1 } END { exit !found }'; then
+				pass "basebin.tar contains $runtime_image"
+			else
+				fail "basebin.tar is missing required runtime image $runtime_image"
+			fi
+		done
+	else
+		fail "cannot list BaseBin/basebin.tar"
+	fi
 else
 	note "BaseBin/basebin.tar is absent; runtime archive contents will be checked after BaseBin packaging"
 fi
 
-# Preserve the local Sileo rebuild whose URL registrations were stripped;
-# the metadata check and exact hash below pin that transformed package blob.
-check_deb Application/Dopamine/Resources/sileo.deb org.coolstar.sileo '2.5.1-13+opamine1' iphoneos-arm64e a26532c514eec10f4cf002d602c7ddc9b2c7ca9ab14963d0296e5c6f89f85db6
+check_vendored_sileo
 check_deb Application/Dopamine/Resources/roothideapp.deb com.roothide.manager '1.4.0' iphoneos-arm64e 51c2b92260921908bd281bc06285196a2ae73e4d51258fe5f2db10dd5d21dca7
 check_deb Application/Dopamine/Resources/zebra.deb xyz.willy.zebra '1.1.37-27+debug' iphoneos-arm64e 41aa4cd37d2397a4d22e549b6d3e3125fea417dd741d4efb31fd6d41b68f8caa
 # These three packages are rebuilt locally by the ordinary full build. Their
@@ -186,10 +203,6 @@ check_control_version Packages/libkrw-provider/control libkrw0-dopamine 2.0.4
 check_control_version Packages/libroot/control libroot-dopamine 1.0.1
 note "opainject is verified by its pinned source submodule; this upstream revision has no Debian control file"
 check_control_version BaseBin/roothidehooks/control com.roothide.dopamine.roothidehooks 0.0.1
-
-sileo_info=$(dpkg-deb --fsys-tarfile "$repo_root/Application/Dopamine/Resources/sileo.deb" | tar -xOf - ./Applications/Sileo.app/Info.plist | plutil -p -)
-if printf '%s\n' "$sileo_info" | grep -Eq 'CFBundleURLTypes|CFBundleURLSchemes'; then fail "Sileo package still declares URL-registration keys"; else pass "Sileo package Info.plist has no URL-registration keys"; fi
-if printf '%s\n' "$sileo_info" | grep -Fq 'LSApplicationQueriesSchemes' && printf '%s\n' "$sileo_info" | grep -Fq 'filza'; then pass "Sileo retains only the observed filza query scheme"; else fail "Sileo query-scheme characterization changed"; fi
 
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m '#define JB_ROOT_PREFIX ".jbroot-"'
 source_contains Application/Dopamine/Jailbreak/DOBootstrapper.m '#define JB_RAND_LENGTH  (sizeof(uint64_t)*sizeof(char)*2)'

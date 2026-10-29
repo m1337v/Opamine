@@ -8,6 +8,7 @@ DerivedData/
 /Package.resolved
 Dopamine/Dopamine/bootstrap/tmp/
 Application/Payload
+/Application/Dopamine/Resources/sileo.deb
 .idea
 Tools/fastPathSign/.build_*
 Exploits/kfd/kfd.framework/kfd
