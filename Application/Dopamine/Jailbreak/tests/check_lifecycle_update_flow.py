@@ -46,8 +46,8 @@ def main() -> None:
     ui_manager = UI_MANAGER.read_text(encoding="utf-8")
     update_view = UPDATE_VIEW.read_text(encoding="utf-8")
 
-    require(VERSION.read_text(encoding="utf-8").strip() == "3.0.12", "unexpected 3.x basebin version")
-    require(ROOTHIDE_VERSION.read_text(encoding="utf-8").strip() == "29+opamine1", "RootHide fork revision lost")
+    require(VERSION.read_text(encoding="utf-8").strip() == "3.0.13", "unexpected 3.x basebin version")
+    require(ROOTHIDE_VERSION.read_text(encoding="utf-8").strip() == "30+opamine1", "RootHide fork revision lost")
     require('JBROOT_PATH(@"/basebin/.version-roothide")' in environment,
             "app must read the RootHide revision from the active randomized root")
 

@@ -133,14 +133,14 @@ fi
 
 current_basebin_version=$(tr -d '\r\n' < "$repo_root/BaseBin/_external/basebin/.version" 2>/dev/null || true)
 current_roothide_version=$(tr -d '\r\n' < "$repo_root/BaseBin/_external/basebin/.version-roothide" 2>/dev/null || true)
-planned_release_version=${EXPECTED_RELEASE_VERSION:-3.0.12-29+opamine1}
+planned_release_version=${EXPECTED_RELEASE_VERSION:-3.0.13-30+opamine1}
 current_release_version="$current_basebin_version-$current_roothide_version"
-if [ "$current_basebin_version" = "3.0.12" ] &&
-	[ "$current_roothide_version" = "29+opamine1" ] &&
+if [ "$current_basebin_version" = "3.0.13" ] &&
+	[ "$current_roothide_version" = "30+opamine1" ] &&
 	[ "$current_release_version" = "$planned_release_version" ]; then
 	pass "planned Opamine release version $current_release_version"
 else
-	fail "release version expected $planned_release_version (.version 3.0.12, .version-roothide 29+opamine1), got ${current_release_version:-missing}"
+	fail "release version expected $planned_release_version (.version 3.0.13, .version-roothide 30+opamine1), got ${current_release_version:-missing}"
 fi
 
 source_contains BaseBin/Makefile 'subprojects: roothidehooks libroothider jailbreakd bootstrapper'

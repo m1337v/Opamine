@@ -83,8 +83,8 @@ def main() -> None:
     )
     require("libroothider.dylib" in makefile, "app packaging must include libroothider")
     require(".version-roothide" in makefile, "app version must include the RootHide revision")
-    require(BASEBIN_VERSION.read_text(encoding="utf-8").strip() == "3.0.12", "unexpected basebin version")
-    require(ROOTHIDE_VERSION.read_text(encoding="utf-8").strip() == "29+opamine1", "unexpected RootHide fork revision")
+    require(BASEBIN_VERSION.read_text(encoding="utf-8").strip() == "3.0.13", "unexpected basebin version")
+    require(ROOTHIDE_VERSION.read_text(encoding="utf-8").strip() == "30+opamine1", "unexpected RootHide fork revision")
 
     for mode in ("stock", "blacklist", "whitelist", "hiddenwhitelist", "blacklistallowlist"):
         require(f'@"{mode}"' in environment, f"missing RootHide injection mode: {mode}")

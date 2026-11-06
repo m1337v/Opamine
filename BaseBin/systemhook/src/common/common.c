@@ -753,6 +753,12 @@ int posix_spawn_hook_shared(pid_t *restrict pid,
 	int setupError = 0;
 
 	if (desc) attr = desc->attrp;
+	uint8_t *attrStruct = (uint8_t *)attr;
+	int memlimitActiveOrig = -1, memlimitInactiveOrig = -1;
+	if (attrStruct) {
+		memlimitActiveOrig = *(int *)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE);
+		memlimitInactiveOrig = *(int *)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE);
+	}
 	if (__builtin_available(iOS 17.6, *)) {
 	if (attr && getuid() != 0) {
 		short flags = 0;
@@ -788,9 +794,9 @@ int posix_spawn_hook_shared(pid_t *restrict pid,
 
 					if (setupError == 0) {
 						// iOS 17.6+ rejects this persona transition during spawn. Ask for
-						// mobile first, then repair the child's credentials while suspended.
-						if (restorePersonaUid) personaInfo->pspi_uid = 501;
-						if (restorePersonaGid) personaInfo->pspi_gid = 501;
+						// our uid/gid first, then repair the child's credentials while suspended.
+						if (restorePersonaUid) personaInfo->pspi_uid = getuid();
+						if (restorePersonaGid) personaInfo->pspi_gid = getgid();
 					}
 				}
 			}
@@ -805,6 +811,11 @@ int posix_spawn_hook_shared(pid_t *restrict pid,
 		r = spawn_exec_hook_common(path, argv, envp, desc, trust_binary, jetsamMultiplier, ENOMEM, ^int(char *const envp_patched[restrict]) {
 			return posix_spawn_orig(&childPid, path, desc, argv, envp_patched);
 		});
+	}
+
+	if (attrStruct) {
+		*(int *)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE) = memlimitActiveOrig;
+		*(int *)(attrStruct + POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE) = memlimitInactiveOrig;
 	}
 
 	// The spawn attributes and persona descriptor belong to the caller. Restore

@@ -77,15 +77,31 @@ HARNESS_PREFIX = r"""
 #define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 0x0001
 #define POSIX_SPAWN_PERSONA_UID 0x00010000
 #define POSIX_SPAWN_PERSONA_GID 0x00020000
+#define POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE 0x48
+#define POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE 0x4C
 #define POSIX_SPAWNATTR_OFF_PERSONA 0xD8
+#define TEST_CALLER_UID 501
+#define TEST_CALLER_GID 502
+#define TEST_MEMLIMIT_ACTIVE 100
+#define TEST_MEMLIMIT_INACTIVE 200
+#define TEST_JETSAM_ADDEND 15
 #define SIGKILL 9
 #define SIGCONT 18
 
 typedef struct fake_spawnattr *posix_spawnattr_t;
 struct fake_spawnattr {
-	uint8_t bytes[0x100];
+	_Alignas(16) uint8_t bytes[0x100];
 	short flags;
 };
+
+_Static_assert(POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE + sizeof(int) <=
+		POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE,
+		"active and inactive memlimit fields overlap");
+_Static_assert(POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE + sizeof(int) <=
+		POSIX_SPAWNATTR_OFF_PERSONA,
+		"memlimit fields overlap the persona pointer");
+_Static_assert(POSIX_SPAWNATTR_OFF_PERSONA + sizeof(void *) <= sizeof(((struct fake_spawnattr *)0)->bytes),
+		"persona pointer does not fit in the fixture attr bytes");
 
 struct _posix_spawn_persona_info {
 	uid_t pspi_id;
@@ -121,6 +137,8 @@ static bool g_orig_received_pid;
 static uid_t g_spawn_seen_uid;
 static gid_t g_spawn_seen_gid;
 static short g_spawn_seen_flags;
+static int g_spawn_seen_memlimit_active;
+static int g_spawn_seen_memlimit_inactive;
 static int g_last_kill_signal;
 static int g_events[8];
 static int g_event_count;
@@ -142,9 +160,26 @@ static int event_index(int event)
 	return -1;
 }
 
+static int attr_read_int(const uint8_t *attr, size_t offset)
+{
+	int value;
+	memcpy(&value, attr + offset, sizeof(value));
+	return value;
+}
+
+static void attr_write_int(uint8_t *attr, size_t offset, int value)
+{
+	memcpy(attr + offset, &value, sizeof(value));
+}
+
 int getuid(void)
 {
-	return 501;
+	return TEST_CALLER_UID;
+}
+
+int getgid(void)
+{
+	return TEST_CALLER_GID;
 }
 
 int posix_spawnattr_getflags(const posix_spawnattr_t *restrict attr, short *restrict flags)
@@ -207,6 +242,8 @@ static int posix_spawn_orig_stub(pid_t *restrict pid,
 	g_orig_calls++;
 	g_orig_received_pid = pid != NULL;
 	g_spawn_seen_flags = g_attr.flags;
+	g_spawn_seen_memlimit_active = attr_read_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE);
+	g_spawn_seen_memlimit_inactive = attr_read_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE);
 	if (g_has_persona) {
 		g_spawn_seen_uid = g_persona.pspi_uid;
 		g_spawn_seen_gid = g_persona.pspi_gid;
@@ -226,16 +263,28 @@ static int spawn_exec_hook_common(const char *path,
 {
 	(void)path;
 	(void)argv;
-	(void)desc;
 	(void)trust_binary;
-	(void)jetsamMultiplier;
 	g_common_calls++;
 	if (mutationErrorReturn != ENOMEM) return EINVAL;
+	if (desc && desc->attrp) {
+		uint8_t *attr = (uint8_t *)desc->attrp;
+		int jetsamAddend = (int)(jetsamMultiplier * 5.0);
+		int active = attr_read_int(attr, POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE);
+		int inactive = attr_read_int(attr, POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE);
+		if (active != -1 && jetsamAddend > 0) {
+			attr_write_int(attr, POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE, active + jetsamAddend);
+		}
+		if (inactive != -1 && jetsamAddend > 0) {
+			attr_write_int(attr, POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE, inactive + jetsamAddend);
+		}
+	}
 	if (g_has_persona) {
 		g_spawn_seen_uid = g_persona.pspi_uid;
 		g_spawn_seen_gid = g_persona.pspi_gid;
 	}
 	g_spawn_seen_flags = g_attr.flags;
+	g_spawn_seen_memlimit_active = attr_read_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE);
+	g_spawn_seen_memlimit_inactive = attr_read_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE);
 	if (g_common_early_return) return mutationErrorReturn;
 	return orig(envp);
 }
@@ -255,6 +304,8 @@ static void reset_case(short flags, bool persona, bool earlyReturn)
 	memset(&g_attr, 0, sizeof(g_attr));
 	memset(&g_persona, 0, sizeof(g_persona));
 	g_attr.flags = flags;
+	attr_write_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE, TEST_MEMLIMIT_ACTIVE);
+	attr_write_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE, TEST_MEMLIMIT_INACTIVE);
 	g_desc.attrp = &g_attr;
 	g_has_persona = persona;
 	if (persona) {
@@ -283,6 +334,8 @@ static void reset_case(short flags, bool persona, bool earlyReturn)
 	g_spawn_seen_uid = (uid_t)-1;
 	g_spawn_seen_gid = (gid_t)-1;
 	g_spawn_seen_flags = 0;
+	g_spawn_seen_memlimit_active = -1;
+	g_spawn_seen_memlimit_inactive = -1;
 	g_last_kill_signal = 0;
 	g_event_count = 0;
 	memset(g_events, 0, sizeof(g_events));
@@ -307,6 +360,10 @@ static int require(bool condition, const char *message)
 static int require_restored(short flags, bool persona)
 {
 	if (require(g_attr.flags == flags, "original spawn flags were not restored")) return 1;
+	if (require(attr_read_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_ACTIVE) == TEST_MEMLIMIT_ACTIVE,
+			"original active jetsam limit was not restored") ||
+		require(attr_read_int(g_attr.bytes, POSIX_SPAWNATTR_OFF_MEMLIMIT_INACTIVE) == TEST_MEMLIMIT_INACTIVE,
+			"original inactive jetsam limit was not restored")) return 1;
 	if (persona &&
 	    (require(g_persona.pspi_uid == 0, "original persona UID was not restored") ||
 	     require(g_persona.pspi_gid == 0, "original persona GID was not restored"))) return 1;
@@ -326,7 +383,7 @@ static int test_failed_spawn_does_not_fix_or_resume(void)
 	    require(g_common_calls == 1, "custom spawn function was bypassed") ||
 	    require(g_orig_calls == 1, "original spawn was not called") ||
 	    require(g_orig_received_pid, "wrapper did not provide storage for the child PID") ||
-	    require(g_spawn_seen_uid == 501 && g_spawn_seen_gid == 501,
+	    require(g_spawn_seen_uid == TEST_CALLER_UID && g_spawn_seen_gid == TEST_CALLER_GID,
 	            "root persona was not temporarily reduced during spawn") ||
 	    require((g_spawn_seen_flags & POSIX_SPAWN_START_SUSPENDED) != 0,
 	            "root persona spawn was not suspended") ||
@@ -384,7 +441,7 @@ static int test_caller_suspended_child_stays_suspended(void)
 	    require(g_common_calls == 1, "custom spawn function was bypassed") ||
 	    require(g_fix_calls == 1 && g_fix_pid == 4321,
 	            "suspended child was not repaired") ||
-	    require(g_spawn_seen_uid == 501 && g_spawn_seen_gid == 501,
+	    require(g_spawn_seen_uid == TEST_CALLER_UID && g_spawn_seen_gid == TEST_CALLER_GID,
 	            "persona was not temporarily reduced during suspended spawn") ||
 	    require((g_spawn_seen_flags & POSIX_SPAWN_START_SUSPENDED) != 0,
 	            "caller's suspended flag was not preserved") ||
@@ -403,10 +460,13 @@ static int test_enomem_restores_attributes_before_return(void)
 	if (require(result == ENOMEM, "custom ENOMEM result was changed") ||
 	    require(g_common_calls == 1, "custom spawn function was bypassed") ||
 	    require(g_orig_calls == 0, "original spawn ran after custom ENOMEM") ||
-	    require(g_spawn_seen_uid == 501 && g_spawn_seen_gid == 501,
+	    require(g_spawn_seen_uid == TEST_CALLER_UID && g_spawn_seen_gid == TEST_CALLER_GID,
 	            "environment error did not occur after persona substitution") ||
 	    require((g_spawn_seen_flags & POSIX_SPAWN_START_SUSPENDED) != 0,
 	            "environment error did not occur after forced suspension") ||
+	    require(g_spawn_seen_memlimit_active == TEST_MEMLIMIT_ACTIVE + TEST_JETSAM_ADDEND &&
+	            g_spawn_seen_memlimit_inactive == TEST_MEMLIMIT_INACTIVE + TEST_JETSAM_ADDEND,
+	            "environment error did not observe temporary jetsam limit increases") ||
 	    require(g_fix_calls == 0 && g_kill_calls == 0,
 	            "environment allocation error attempted child operations") ||
 	    require(callerPid == 77, "environment error overwrote caller PID")) return 1;
@@ -422,6 +482,9 @@ static int test_success_returns_caller_pid(void)
 	    require(g_common_calls == 1, "custom spawn function was bypassed") ||
 	    require(g_orig_calls == 1 && g_orig_received_pid,
 	            "original spawn did not receive local PID storage") ||
+	    require(g_spawn_seen_memlimit_active == TEST_MEMLIMIT_ACTIVE + TEST_JETSAM_ADDEND &&
+	            g_spawn_seen_memlimit_inactive == TEST_MEMLIMIT_INACTIVE + TEST_JETSAM_ADDEND,
+	            "successful spawn did not observe temporary jetsam limit increases") ||
 	    require(callerPid == 4321, "spawned PID was not copied to caller") ||
 	    require(g_fix_calls == 0 && g_kill_calls == 0,
 	            "ordinary spawn received persona operations")) return 1;

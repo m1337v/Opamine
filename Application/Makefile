@@ -1,5 +1,7 @@
 .PHONY: all clean build_clean
 
+APP_VERSION := $(shell cat ../BaseBin/_external/basebin/.version)-$(shell cat ../BaseBin/_external/basebin/.version-roothide)
+
 all: Dopamine.ipa
 
 Dopamine.ipa: ../BaseBin/basebin.tar build/Build/Products/Debug-iphoneos/Dopamine.app
@@ -29,7 +31,7 @@ endif
 	cp -f ../BaseBin/.build/.build_id build/Build/Products/Debug-iphoneos/Dopamine.app/basebin-build-id.txt
 	cp ../BaseBin/.build/libroothider.dylib build/Build/Products/Debug-iphoneos/Dopamine.app/
 	plutil -replace CFBundleIdentifier -string "com.m1337v.Opamine" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
-	plutil -replace CFBundleShortVersionString -string "$(shell cat ../BaseBin/_external/basebin/.version)-$(shell cat ../BaseBin/_external/basebin/.version-roothide)" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
+	plutil -replace CFBundleShortVersionString -string "$(APP_VERSION)" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
 # ifeq ($(PALEHIDE), 1)
 	make -C Dopamine/Exploits/palera1n package
 	cp -a Dopamine/Exploits/palera1n/.framework build/Build/Products/Debug-iphoneos/Dopamine.app/Frameworks/palera1n.framework

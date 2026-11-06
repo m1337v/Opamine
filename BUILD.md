@@ -68,7 +68,7 @@ URL/checksum in `Scripts/build-fork-packages.sh`.
 
 The dyld hook contributes six dylibs: arm64 and arm64e for iOS 15, iOS 16–17, and iOS 18+. These are added after trustcache generation, as configured in `BaseBin/Makefile`.
 
-The application embeds `basebin.tar`, `basebin.tc`, the built `.deb` packages, and the full `libroothider.dylib`. Its version is assembled from the BaseBin version files as `3.0.12-29+opamine1`.
+The application embeds `basebin.tar`, `basebin.tc`, the built `.deb` packages, and the full `libroothider.dylib`. Its version is assembled from the BaseBin version files as `3.0.13-30+opamine1`.
 
 ## Local platform status (2026-10-25)
 

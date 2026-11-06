@@ -60,7 +60,7 @@ def main() -> int:
             "rewritten signatures must attach before their cdhash is globally trusted")
 
     require('#include "hookd.h"' in txm and
-            "if (__builtin_available(iOS 26, *))" in txm and
+            "if (__builtin_available(iOS 19.0, *))" in txm and
             "kr = hookd_vm_protect(" in txm,
             "iOS 26+ TXM allocation must use the upstream hookd provider")
     require(txm.index("kr = hookd_vm_protect(") < txm.index("kr = vm_protect("),
