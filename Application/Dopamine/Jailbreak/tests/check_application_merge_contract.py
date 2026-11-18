@@ -74,12 +74,12 @@ def main() -> None:
     check_category_header_registration(PROJECT)
 
     require(
-        'plutil -replace CFBundleIdentifier -string "com.m1337v.Opamine"' in makefile,
-        "package step must retain the Opamine bundle identity",
+        'plutil -replace CFBundleIdentifier -string "com.opa334.Dopamine-roothide"' in makefile,
+        "package step must retain the upstream RootHide bundle identity",
     )
     require(
-        project.count("PRODUCT_BUNDLE_IDENTIFIER = com.m1337v.Opamine;") == 2,
-        "both Dopamine app configurations must retain the Opamine bundle identity",
+        project.count("PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine-roothide;") == 2,
+        "both Dopamine app configurations must retain the upstream RootHide bundle identity",
     )
     require("libroothider.dylib" in makefile, "app packaging must include libroothider")
     require(".version-roothide" in makefile, "app version must include the RootHide revision")

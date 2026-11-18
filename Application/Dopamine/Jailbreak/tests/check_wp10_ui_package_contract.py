@@ -52,7 +52,7 @@ def main() -> None:
     project = PROJECT.read_text(encoding="utf-8")
     info = plistlib.loads(INFO.read_bytes())
 
-    require("PRODUCT_BUNDLE_IDENTIFIER = com.m1337v.Opamine;" in project,
+    require("PRODUCT_BUNDLE_IDENTIFIER = com.opa334.Dopamine-roothide;" in project,
             "Opamine app bundle identity changed")
     require("selectCustomBootlogoPressed" in settings and "UIImagePickerController" in settings,
             "boot-logo photo picker was removed without an intentional replacement")

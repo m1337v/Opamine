@@ -30,7 +30,7 @@ endif
 	md5 -q ../BaseBin/basebin.tar > build/Build/Products/Debug-iphoneos/Dopamine.app/basebin.md5
 	cp -f ../BaseBin/.build/.build_id build/Build/Products/Debug-iphoneos/Dopamine.app/basebin-build-id.txt
 	cp ../BaseBin/.build/libroothider.dylib build/Build/Products/Debug-iphoneos/Dopamine.app/
-	plutil -replace CFBundleIdentifier -string "com.m1337v.Opamine" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
+	plutil -replace CFBundleIdentifier -string "com.opa334.Dopamine-roothide" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
 	plutil -replace CFBundleShortVersionString -string "$(APP_VERSION)" build/Build/Products/Debug-iphoneos/Dopamine.app/Info.plist
 # ifeq ($(PALEHIDE), 1)
 	make -C Dopamine/Exploits/palera1n package

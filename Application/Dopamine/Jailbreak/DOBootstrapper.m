@@ -835,7 +835,7 @@ int is_jbrand_value(uint64_t value)
 
 static NSString * const RootHidePrimaryJailbreakRootDirectory = @"/var/containers/Bundle/Application";
 static NSString * const RootHideSecondaryJailbreakRootDirectory = @"/var/mobile/Containers/Shared/AppGroup";
-static NSString * const RootHideLegacyBundleIdentifier = @"com.opa334.Dopamine-roothide";
+static NSString * const RootHideLegacyBundleIdentifier = @"com.m1337v.Opamine";
 
 typedef NS_ENUM(NSUInteger, RootHideJailbreakRootState) {
     // The entry has the randomized-root spelling but makes no claim to be ours.

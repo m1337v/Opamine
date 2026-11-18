@@ -19,8 +19,8 @@ REPO = Path(__file__).resolve().parents[4]
 SOURCE = REPO / "Application/Dopamine/Jailbreak/DOBootstrapper.m"
 PRIMARY_BASE = Path("/var/containers/Bundle/Application")
 SECONDARY_BASE = Path("/var/mobile/Containers/Shared/AppGroup")
-CURRENT_ID = "com.m1337v.Opamine"
-LEGACY_ID = "com.opa334.Dopamine-roothide"
+CURRENT_ID = "com.opa334.Dopamine-roothide"
+LEGACY_ID = "com.m1337v.Opamine"
 
 
 def branded_name(seed: int) -> str:
@@ -374,9 +374,9 @@ class IdentityRecoveryTests(unittest.TestCase):
         self.assertTrue(first.exists())
         self.assertTrue(second.exists())
 
-    def test_prior_roothide_identity_is_adopted_but_unknown_identity_is_not(self) -> None:
+    def test_prior_opamine_identity_is_adopted_but_unknown_identity_is_not(self) -> None:
         primary, _ = create_owned_pair(self.primary_base, self.secondary_base, 0x3333333333333300, identity=LEGACY_ID)
-        self.assertEqual(model_state(primary, self.secondary_base, current_id="com.m1337v.Opamine"), "ready")
+        self.assertEqual(model_state(primary, self.secondary_base, current_id=CURRENT_ID), "ready")
         identity = primary / "basebin/.AppIdentifier"
         identity.write_text("com.someone.else.root")
         self.assertEqual(model_state(primary, self.secondary_base), "foreign")
