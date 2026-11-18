@@ -940,7 +940,10 @@ setenv("DYLD_INSERT_LIBRARIES", JBROOT_PATH("/basebin/systemhook.dylib"), 1);
     self.activationPhase = DOJailbreakActivationPhaseFinalized;
     
     [[DOEnvironmentManager sharedManager] setIDownloadEnabled:idownloadEnabled needsUnsandbox:NO];
-    [[DOEnvironmentManager sharedManager] syncRootHideInjectionSettingsNeedsUnsandbox:NO];
+    if (![[DOEnvironmentManager sharedManager] syncRootHideInjectionSettingsNeedsUnsandbox:NO]) {
+        *errOut = [self errorRequiringFullRebootIfNeeded:[NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteUnknownError userInfo:@{NSLocalizedDescriptionKey:@"Could not save injection settings."}]];
+        return;
+    }
     
 /*
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Checking For Duplicate Apps") debug:NO];

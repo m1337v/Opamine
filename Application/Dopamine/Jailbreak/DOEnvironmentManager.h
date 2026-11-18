@@ -71,7 +71,7 @@ FOUNDATION_EXPORT NSString * const DORootHideInjectionModeBlacklistAllowlist;
 - (BOOL)isTweakInjectionEnabled;
 - (void)setTweakInjectionEnabled:(BOOL)enabled;
 - (NSString *)configuredTweakInjectionMode;
-- (void)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox;
+- (BOOL)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox;
 - (BOOL)isIDownloadEnabled;
 - (void)setIDownloadEnabled:(BOOL)enabled needsUnsandbox:(BOOL)needsUnsandbox;
 - (void)setIDownloadLoaded:(BOOL)loaded needsUnsandbox:(BOOL)needsUnsandbox;

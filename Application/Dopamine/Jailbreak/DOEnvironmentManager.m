@@ -47,7 +47,6 @@ NSString * const DORootHideInjectionModeWhitelist = @"whitelist";
 NSString * const DORootHideInjectionModeHiddenWhitelist = @"hiddenwhitelist";
 NSString * const DORootHideInjectionModeBlacklistAllowlist = @"blacklistallowlist";
 
-static NSString * const DOTweakInjectionModePreferenceKey = @"tweakInjectionMode";
 static NSString * const DORootHideDirectoryRelativePath = @"/var/mobile/Library/RootHide";
 static NSString * const DORootHideModeRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.mode.plist";
 static NSString * const DORootHideInjectRelativePath = @"/var/mobile/Library/RootHide/pro.m1337.inject.plist";
@@ -60,6 +59,7 @@ static NSString * const DORootHelperWaitProtocolMinimumBasebinVersion = @"2.4.9.
 
 static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
 {
+    if (![mode isKindOfClass:NSString.class]) return nil;
     if ([mode isEqualToString:DORootHideInjectionModeStock] ||
         [mode isEqualToString:DORootHideInjectionModeBlacklist] ||
         [mode isEqualToString:DORootHideInjectionModeWhitelist] ||
@@ -73,14 +73,9 @@ static NSString *DONormalizeRootHideInjectionMode(NSString *mode)
 static NSDictionary *DORootHideDictionaryAtPath(NSString *relativePath)
 {
     NSString *path = JBROOT_PATH(relativePath);
+    if (!path.length) return nil;
     NSDictionary *dictionary = [NSDictionary dictionaryWithContentsOfFile:path];
     return [dictionary isKindOfClass:NSDictionary.class] ? dictionary : nil;
-}
-
-static BOOL DORootHidePathExists(NSString *relativePath)
-{
-    NSString *path = JBROOT_PATH(relativePath);
-    return path.length > 0 && [NSFileManager.defaultManager fileExistsAtPath:path];
 }
 
 static NSString *DOFileMD5AtPath(NSString *path)
@@ -839,31 +834,24 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
 - (NSString *)configuredTweakInjectionMode
 {
     NSString *mode = DONormalizeRootHideInjectionMode(DORootHideDictionaryAtPath(DORootHideModeRelativePath)[@"mode"]);
-    if (mode) {
-        return mode;
-    }
-    if (DORootHidePathExists(DORootHideUninjectRelativePath)) {
-        return DORootHideInjectionModeBlacklist;
-    }
-    if (DORootHidePathExists(DORootHideInjectRelativePath)) {
-        return DORootHideInjectionModeWhitelist;
-    }
-    NSString *preferredMode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]);
-    return preferredMode ?: DORootHideInjectionModeStock;
+    return mode ?: DORootHideInjectionModeStock;
 }
 
-- (void)ensureRootHideDictionaryExistsAtPath:(NSString *)path defaults:(NSDictionary *)defaults
+- (BOOL)ensureRootHideDictionaryExistsAtPath:(NSString *)path defaults:(NSDictionary *)defaults
 {
     if (path.length > 0 && ![NSFileManager.defaultManager fileExistsAtPath:path]) {
-        [defaults writeToFile:path atomically:YES];
+        return [defaults writeToFile:path atomically:YES];
     }
+    return path.length && [NSDictionary dictionaryWithContentsOfFile:path] != nil;
 }
 
-- (void)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox
+- (BOOL)syncRootHideInjectionSettingsNeedsUnsandbox:(BOOL)needsUnsandbox
 {
-    NSString *mode = DONormalizeRootHideInjectionMode([[DOPreferenceManager sharedManager] preferenceValueForKey:DOTweakInjectionModePreferenceKey]) ?: DORootHideInjectionModeStock;
-
+    DOPreferenceManager *prefs = DOPreferenceManager.sharedManager;
+    NSString *pending = DONormalizeRootHideInjectionMode([prefs preferenceValueForKey:@"pendingTweakInjectionMode"]);
+    __block BOOL saved = NO;
     void (^syncBlock)(void) = ^{
+        NSString *mode = pending ?: self.configuredTweakInjectionMode;
         NSFileManager *fileManager = NSFileManager.defaultManager;
         NSString *rootHidePath = JBROOT_PATH(DORootHideDirectoryRelativePath);
         if (rootHidePath.length == 0) {
@@ -873,9 +861,9 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         NSDictionary *directoryAttributes = @{ NSFilePosixPermissions : @0755, NSFileOwnerAccountID : @501, NSFileGroupOwnerAccountID : @501 };
         NSDictionary *fileAttributes = @{ NSFilePosixPermissions : @0644, NSFileOwnerAccountID : @501, NSFileGroupOwnerAccountID : @501 };
         if (![fileManager fileExistsAtPath:rootHidePath]) {
-            [fileManager createDirectoryAtPath:rootHidePath withIntermediateDirectories:YES attributes:directoryAttributes error:nil];
+            if (![fileManager createDirectoryAtPath:rootHidePath withIntermediateDirectories:YES attributes:directoryAttributes error:nil]) return;
         }
-        [fileManager setAttributes:directoryAttributes ofItemAtPath:rootHidePath error:nil];
+        if (![fileManager setAttributes:directoryAttributes ofItemAtPath:rootHidePath error:nil]) return;
 
         NSString *modePath = JBROOT_PATH(DORootHideModeRelativePath);
         NSString *injectPath = JBROOT_PATH(DORootHideInjectRelativePath);
@@ -884,28 +872,36 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
         NSString *jetsamAddendPath = JBROOT_PATH(DORootHideJetsamAddendRelativePath);
         NSString *uninjectPath = JBROOT_PATH(DORootHideUninjectRelativePath);
 
-        [@{ @"mode" : mode } writeToFile:modePath atomically:YES];
-        [self ensureRootHideDictionaryExistsAtPath:jetsamAddendPath defaults:DODefaultRootHideJetsamAddend()];
+        if (![self ensureRootHideDictionaryExistsAtPath:jetsamAddendPath defaults:DODefaultRootHideJetsamAddend()]) return;
 
         if ([mode isEqualToString:DORootHideInjectionModeWhitelist] ||
             [mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] ||
             [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
-            [self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}];
-            [self ensureRootHideDictionaryExistsAtPath:injectSystemPath defaults:DODefaultRootHideSystemInjection()];
-            [self ensureRootHideDictionaryExistsAtPath:injectWantsBlacklistPath defaults:DODefaultRootHideWantsBlacklist()];
+            if (![self ensureRootHideDictionaryExistsAtPath:injectPath defaults:@{}]) return;
+            if (![self ensureRootHideDictionaryExistsAtPath:injectSystemPath defaults:DODefaultRootHideSystemInjection()]) return;
+            if (![self ensureRootHideDictionaryExistsAtPath:injectWantsBlacklistPath defaults:DODefaultRootHideWantsBlacklist()]) return;
             if ([mode isEqualToString:DORootHideInjectionModeHiddenWhitelist] || [mode isEqualToString:DORootHideInjectionModeBlacklistAllowlist]) {
-                [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];
+                if (![self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}]) return;
             }
         }
         else if ([mode isEqualToString:DORootHideInjectionModeBlacklist]) {
-            [self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}];
+            if (![self ensureRootHideDictionaryExistsAtPath:uninjectPath defaults:@{}]) return;
         }
 
-        for (NSString *path in @[modePath, injectPath, injectSystemPath, injectWantsBlacklistPath, jetsamAddendPath, uninjectPath]) {
+        for (NSString *path in @[injectPath, injectSystemPath, injectWantsBlacklistPath, jetsamAddendPath, uninjectPath]) {
             if ([fileManager fileExistsAtPath:path]) {
-                [fileManager setAttributes:fileAttributes ofItemAtPath:path error:nil];
+                if (![fileManager setAttributes:fileAttributes ofItemAtPath:path error:nil]) return;
             }
         }
+        if (!pending && [fileManager fileExistsAtPath:modePath]) {
+            saved = DONormalizeRootHideInjectionMode(DORootHideDictionaryAtPath(DORootHideModeRelativePath)[@"mode"]) != nil;
+            return;
+        }
+        NSString *stage = [rootHidePath stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+        if (![@{@"mode":mode} writeToFile:stage atomically:YES]) return;
+        saved = [fileManager setAttributes:fileAttributes ofItemAtPath:stage error:nil] &&
+            rename(stage.fileSystemRepresentation, modePath.fileSystemRepresentation) == 0;
+        if (!saved) [fileManager removeItemAtPath:stage error:nil];
     };
 
     if (needsUnsandbox) {
@@ -914,6 +910,8 @@ static NSDictionary *DODefaultRootHideJetsamAddend(void)
     else {
         syncBlock();
     }
+    if (saved && pending) [prefs removePreferenceValueForKey:@"pendingTweakInjectionMode"];
+    return saved;
 }
 
 - (BOOL)isIDownloadEnabled

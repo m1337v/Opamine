@@ -523,16 +523,25 @@
 - (id)readTweakInjectionMode:(PSSpecifier *)specifier
 {
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
-    return envManager.isJailbroken ? envManager.configuredTweakInjectionMode : [self readPreferenceValue:specifier];
+    return (!envManager.isJailbroken ? [DOPreferenceManager.sharedManager preferenceValueForKey:@"pendingTweakInjectionMode"] : nil) ?: envManager.configuredTweakInjectionMode;
 }
 
 - (void)setTweakInjectionMode:(id)value specifier:(PSSpecifier *)specifier
 {
     NSString *previousMode = [self readTweakInjectionMode:specifier];
-    [self setPreferenceValue:value specifier:specifier];
+    DOPreferenceManager *prefs = DOPreferenceManager.sharedManager;
+    if (![self.tweakInjectionModeIdentifiers containsObject:value]) return;
+    BOOL queued = [prefs setPreferenceValue:value forKey:@"pendingTweakInjectionMode"];
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
-    if (envManager.isJailbroken) {
-        [envManager syncRootHideInjectionSettingsNeedsUnsandbox:YES];
+    if (!queued || envManager.isJailbroken) {
+        if (!queued || ![envManager syncRootHideInjectionSettingsNeedsUnsandbox:YES]) {
+            if (queued) [prefs removePreferenceValueForKey:@"pendingTweakInjectionMode"];
+            [self reloadSpecifiers];
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Could not save mode" message:nil preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        }
         if (![previousMode isEqual:value]) {
             [self presentUserspaceRebootAlert];
         }

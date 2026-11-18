@@ -53,16 +53,18 @@
     return fallback;
 }
 
-- (void)setPreferenceValue:(NSObject *)obj forKey:(NSString *)key
+- (BOOL)setPreferenceValue:(NSObject *)obj forKey:(NSString *)key
 {
-    [_preferences setObject:obj forKey:key];
-    [self savePreferences];
+    NSMutableDictionary *updated = [_preferences mutableCopy];
+    updated[key] = obj;
+    if (![updated writeToFile:_preferencesPath atomically:YES]) return NO;
+    _preferences = updated;
+    return YES;
 }
 
-- (void)removePreferenceValueForKey:(NSString *)key
+- (BOOL)removePreferenceValueForKey:(NSString *)key
 {
-    [_preferences removeObjectForKey:key];
-    [self savePreferences];
+    return [self setPreferenceValue:nil forKey:key];
 }
 
 @end
