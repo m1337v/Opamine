@@ -1112,16 +1112,21 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *RootHideCollectNestedRoo
             return nil;
         }
 
-        NSString *rootPrefix = [rootPath stringByAppendingString:@"/"];
+        NSString *rootPrefix = [rootPath.stringByStandardizingPath stringByAppendingString:@"/"];
+        // Foundation may report /private/var for a root opened through /var.
+        // Resolve only the root prefix so entry links remain visible to lstat.
+        NSString *resolvedRootPrefix = [rootPath.stringByResolvingSymlinksInPath.stringByStandardizingPath stringByAppendingString:@"/"];
         for (NSURL *entryURL in enumerator) {
             NSString *path = entryURL.path;
-            if (![path hasPrefix:rootPrefix]) {
+            NSString *standardizedPath = path.stringByStandardizingPath;
+            NSString *matchingPrefix = [standardizedPath hasPrefix:rootPrefix] ? rootPrefix : resolvedRootPrefix;
+            if (![standardizedPath hasPrefix:matchingPrefix]) {
                 if (errorOut) {
                     *errorOut = RootHideRootError([NSString stringWithFormat:@"Nested RootHide enumeration escaped its owned root: %@.", path]);
                 }
                 return nil;
             }
-            NSString *relativePath = [path substringFromIndex:rootPrefix.length];
+            NSString *relativePath = [standardizedPath substringFromIndex:matchingPrefix.length];
             struct stat st = {0};
             if (lstat(path.fileSystemRepresentation, &st) != 0) {
                 if (errorOut) {
